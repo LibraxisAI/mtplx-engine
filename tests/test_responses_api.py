@@ -1,0 +1,283 @@
+"""Contract tests for the native, ephemeral Responses adapter."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+
+import pytest
+from fastapi.testclient import TestClient
+
+from mtplx.server import openai
+from mtplx.server.openai import create_app
+from mtplx.server.protocols.responses import (
+    ResponsesProtocolError,
+    ResponsesRequest,
+    response_from_chat_completion,
+    responses_request_to_chat,
+    responses_stream_from_chat_sse,
+)
+from test_server_openai import _fake_generation, _fake_state, _fake_streaming_generation
+
+
+def _event_payloads(response_text: str) -> list[dict]:
+    return [
+        json.loads(line.removeprefix("data: "))
+        for line in response_text.splitlines()
+        if line.startswith("data: {")
+    ]
+
+
+def _ready_client(monkeypatch, *, text: str = "Hello") -> TestClient:
+    state = _fake_state()
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(openai, "_run_generation", lambda *_a, **_kw: _fake_generation(text))
+    return TestClient(create_app(state))
+
+
+def test_request_translation_accepts_messages_controls_tools_and_images():
+    request = ResponsesRequest.model_validate(
+        {
+            "model": "buddy",
+            "instructions": "Be concise.",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Describe it"},
+                        {
+                            "type": "input_image",
+                            "image_url": "https://example.test/cat.png",
+                        },
+                    ],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": '{"q":"cat"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "found",
+                },
+            ],
+            "max_output_tokens": 64,
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "top_k": 20,
+            "presence_penalty": 0.1,
+            "frequency_penalty": 0.2,
+            "reasoning": {"effort": "medium", "summary": "auto"},
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "description": "Look something up",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            "tool_choice": {"type": "function", "name": "lookup"},
+        }
+    )
+
+    chat = responses_request_to_chat(request)
+
+    assert chat["messages"][0] == {"role": "system", "content": "Be concise."}
+    assert chat["messages"][1]["content"][0] == {
+        "type": "text",
+        "text": "Describe it",
+    }
+    assert chat["messages"][1]["content"][1]["image_url"]["url"].startswith("https:")
+    assert chat["messages"][2]["tool_calls"][0]["id"] == "call_1"
+    assert chat["messages"][3] == {
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "content": "found",
+    }
+    assert chat["max_tokens"] == 64
+    assert chat["reasoning_effort"] == "medium"
+    assert chat["tools"][0]["function"]["name"] == "lookup"
+    assert chat["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "lookup"},
+    }
+
+
+@pytest.mark.parametrize(
+    ("body", "param"),
+    [
+        ({"input": "hi", "store": True}, "store"),
+        ({"input": "hi", "previous_response_id": "resp_old"}, "previous_response_id"),
+        (
+            {
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_file", "file_id": "file_1"}],
+                    }
+                ]
+            },
+            "input[0].content[0]",
+        ),
+        (
+            {"input": "hi", "text": {"format": {"type": "json_schema"}}},
+            "text.format",
+        ),
+        ({"input": "hi", "background": True}, "background"),
+        (
+            {"input": "hi", "tools": [{"type": "web_search_preview"}]},
+            "tools[0].type",
+        ),
+        (
+            {"input": "hi", "tool_choice": {"type": "web_search_preview"}},
+            "tool_choice.type",
+        ),
+    ],
+)
+def test_unsupported_semantics_fail_with_exact_parameter(body, param):
+    with pytest.raises(ResponsesProtocolError) as raised:
+        responses_request_to_chat(ResponsesRequest.model_validate(body))
+    assert raised.value.param == param
+
+
+def test_nonstream_encoder_separates_reasoning_text_and_function_calls():
+    payload = response_from_chat_completion(
+        {
+            "model": "buddy",
+            "choices": [
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "reasoning_content": "private chain",
+                        "content": "Visible preamble.",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": '{"q":"cat"}'},
+                            }
+                        ],
+                    },
+                }
+            ],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
+            "mtplx_stats": {"generation_mode": "mtp", "mtp_depth": 3},
+        },
+        request=ResponsesRequest(input="hi"),
+        response_id="resp_test",
+        created_at=123,
+    )
+
+    assert [item["type"] for item in payload["output"]] == [
+        "reasoning",
+        "message",
+        "function_call",
+    ]
+    assert payload["output"][0]["content"][0]["text"] == "private chain"
+    assert payload["output"][1]["content"][0]["text"] == "Visible preamble."
+    assert payload["output"][2]["arguments"] == '{"q":"cat"}'
+    assert payload["usage"]["input_tokens"] == 3
+    assert payload["store"] is False
+
+
+def test_post_responses_nonstream_calls_existing_generation_once(monkeypatch):
+    calls = 0
+    state = _fake_state()
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+
+    def generate(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _fake_generation("Native response")
+
+    monkeypatch.setattr(openai, "_run_generation", generate)
+    response = TestClient(create_app(state)).post(
+        "/v1/responses",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "model": "buddy",
+            "instructions": "Answer directly.",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "Hi"}]}],
+            "store": False,
+            "max_output_tokens": 16,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert calls == 1
+    assert payload["object"] == "response"
+    assert payload["status"] == "completed"
+    assert payload["output"][0]["content"][0]["text"] == "Native response"
+    assert payload["instructions"] == "Answer directly."
+
+
+def test_post_responses_stream_orders_native_events_and_sequences(monkeypatch):
+    state = _fake_state()
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(openai, "_run_generation", _fake_streaming_generation("Hello"))
+    response = TestClient(create_app(state)).post(
+        "/v1/responses",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={"input": "Hi", "stream": True, "max_output_tokens": 16},
+    )
+
+    assert response.status_code == 200, response.text
+    events = _event_payloads(response.text)
+    event_types = [event["type"] for event in events]
+    assert event_types[:2] == ["response.created", "response.in_progress"]
+    assert "response.output_item.added" in event_types
+    assert "response.content_part.added" in event_types
+    assert "response.output_text.delta" in event_types
+    assert event_types[-1] == "response.completed"
+    assert [event["sequence_number"] for event in events] == list(range(len(events)))
+    assert events[-1]["response"]["output"][0]["content"][0]["text"] == "Hello"
+
+
+def test_stream_translator_delivers_first_delta_before_completion():
+    async def chat_frames():
+        yield 'data: {"model":"buddy","choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
+        await asyncio.sleep(0.02)
+        yield 'data: {"choices":[{"delta":{"content":"early"},"finish_reason":null}]}\n\n'
+        await asyncio.sleep(0.08)
+        yield 'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def collect():
+        observed: list[tuple[float, dict]] = []
+        started = time.monotonic()
+        async for frame in responses_stream_from_chat_sse(
+            chat_frames(),
+            request=ResponsesRequest(input="hi", stream=True),
+            response_id="resp_temporal",
+            model="buddy",
+            created_at=123,
+        ):
+            data_line = next(line for line in frame.splitlines() if line.startswith("data: "))
+            observed.append((time.monotonic() - started, json.loads(data_line[6:])))
+        return observed
+
+    observed = asyncio.run(collect())
+    delta_time = next(at for at, event in observed if event["type"] == "response.output_text.delta")
+    completed_time = next(at for at, event in observed if event["type"] == "response.completed")
+    assert delta_time < 0.07
+    assert completed_time >= 0.09
+    assert delta_time < completed_time
+
+
+def test_stateful_response_lifecycle_fails_explicitly(monkeypatch):
+    client = _ready_client(monkeypatch)
+    create = client.post("/v1/responses", json={"input": "hi", "store": True})
+    assert create.status_code == 400
+    assert create.json()["error"]["param"] == "store"
+    for response in (
+        client.get("/v1/responses/resp_missing"),
+        client.delete("/v1/responses/resp_missing"),
+        client.post("/v1/responses/resp_missing/cancel"),
+    ):
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "not_implemented"

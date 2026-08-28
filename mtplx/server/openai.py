@@ -123,6 +123,13 @@ from mtplx.server.request_policy import (
     BackgroundBusyBypass,
     resolve_request_policy,
 )
+from mtplx.server.protocols.responses import (
+    ResponsesProtocolError,
+    ResponsesRequest,
+    response_from_chat_completion,
+    responses_request_to_chat,
+    responses_stream_from_chat_sse,
+)
 from mtplx.server.response_envelope import build_generation_result
 from mtplx.profiles import (
     DEFAULT_HF_MODEL_ID,
@@ -30818,6 +30825,82 @@ def create_app(state: ServerState) -> FastAPI:
                 "timings": _build_timings(generated),
             }
         )
+
+    @app.post("/v1/responses")
+    async def responses(raw_request: Request, request: ResponsesRequest) -> Any:
+        """Render the existing Chat turn through the ephemeral Responses wire."""
+
+        try:
+            chat_request = ChatCompletionRequest.model_validate(
+                responses_request_to_chat(request)
+            )
+        except ResponsesProtocolError as exc:
+            return JSONResponse(exc.payload(), status_code=400)
+
+        response_id = f"resp_{uuid.uuid4().hex}"
+        created_at = int(time.time())
+        chat_response = await chat_completions(raw_request, chat_request)
+        if request.stream:
+            if not isinstance(chat_response, StreamingResponse):
+                return chat_response
+            return StreamingResponse(
+                responses_stream_from_chat_sse(
+                    chat_response.body_iterator,
+                    request=request,
+                    response_id=response_id,
+                    model=state.model_id,
+                    created_at=created_at,
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        if not isinstance(chat_response, JSONResponse):
+            return chat_response
+        if chat_response.status_code >= 400:
+            return chat_response
+        try:
+            chat_payload = json.loads(chat_response.body)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500, detail=f"failed to translate response: {exc}"
+            ) from exc
+        return JSONResponse(
+            response_from_chat_completion(
+                chat_payload,
+                request=request,
+                response_id=response_id,
+                created_at=created_at,
+            ),
+            status_code=chat_response.status_code,
+        )
+
+    def _unsupported_response_lifecycle(operation: str) -> JSONResponse:
+        error = ResponsesProtocolError(
+            message=(
+                f"response {operation} is unavailable until the response "
+                "lineage store is implemented"
+            ),
+            code="not_implemented",
+        )
+        return JSONResponse(error.payload(), status_code=400)
+
+    @app.get("/v1/responses/{response_id}")
+    async def get_response(response_id: str) -> JSONResponse:
+        del response_id
+        return _unsupported_response_lifecycle("retrieval")
+
+    @app.delete("/v1/responses/{response_id}")
+    async def delete_response(response_id: str) -> JSONResponse:
+        del response_id
+        return _unsupported_response_lifecycle("deletion")
+
+    @app.post("/v1/responses/{response_id}/cancel")
+    async def cancel_response(response_id: str) -> JSONResponse:
+        del response_id
+        return _unsupported_response_lifecycle("cancellation")
 
     @app.post("/v1/messages")
     async def anthropic_messages(

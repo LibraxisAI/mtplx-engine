@@ -33,7 +33,12 @@ def _generation_ready_state():
 
 def test_empty_bodies_get_clean_400s():
     client = _client(_generation_ready_state())
-    for path in ("/v1/chat/completions", "/v1/completions", "/v1/messages"):
+    for path in (
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/messages",
+        "/v1/responses",
+    ):
         r = client.post(path, json={})
         assert r.status_code == 400, (path, r.status_code, r.text)
         assert "must not be empty" in r.text
@@ -49,7 +54,7 @@ def test_malformed_types_get_422_not_500():
 
 def test_unknown_endpoints_are_404():
     client = _client(_generation_ready_state())
-    for path in ("/v1/embeddings", "/v1/responses", "/v1/images/generations"):
+    for path in ("/v1/embeddings", "/v1/images/generations"):
         assert client.post(path, json={}).status_code == 404
 
 
