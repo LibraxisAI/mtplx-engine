@@ -35,6 +35,19 @@ def _usage(chat_usage: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def _response_error(chat_error: Any) -> dict[str, str]:
+    """Normalize Chat-only failures to the Responses wire contract."""
+
+    if isinstance(chat_error, dict):
+        message = chat_error.get("message")
+    else:
+        message = chat_error
+    return {
+        "code": "server_error",
+        "message": str(message or "Response generation failed"),
+    }
+
+
 def _reasoning_item(text: str, *, item_id: str | None = None, status: str = "completed") -> dict[str, Any]:
     return {
         "id": item_id or _item_id("rs"),
@@ -240,14 +253,16 @@ class _StreamState:
                 )
         return items
 
-    def response(self, *, status: str) -> dict[str, Any]:
+    def response(
+        self, *, status: str, output_status: str | None = None
+    ) -> dict[str, Any]:
         response = _base_response(
             response_id=self.response_id,
             request=self.request,
             model=self.model,
             created_at=self.created_at,
             status=status,
-            output=self.output(status=status),
+            output=self.output(status=output_status or status),
             usage=self.usage,
             mtplx_stats=self.mtplx_stats,
         )
@@ -277,8 +292,8 @@ async def responses_stream_from_chat_sse(
     try:
         async for chat in _chat_payloads(body_iterator):
             if chat.get("error"):
-                failed = state.response(status="failed")
-                failed["error"] = chat["error"]
+                failed = state.response(status="failed", output_status="incomplete")
+                failed["error"] = _response_error(chat["error"])
                 yield state.event("response.failed", response=failed)
                 return
             if chat.get("model"):
