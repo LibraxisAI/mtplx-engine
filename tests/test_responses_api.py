@@ -237,6 +237,20 @@ def test_post_responses_nonstream_calls_existing_generation_once(monkeypatch):
     assert payload["instructions"] == "Answer directly."
 
 
+def test_post_responses_id_shares_validated_request_hint(monkeypatch):
+    response = _ready_client(monkeypatch).post(
+        "/v1/responses",
+        headers={
+            "x-mtplx-cache-mode": "bypass",
+            "x-mtplx-request-id": "trace123",
+        },
+        json={"input": "Hi"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["id"] == "resp-trace123"
+
+
 def test_post_responses_stream_orders_native_events_and_sequences(monkeypatch):
     state = _fake_state()
     monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
@@ -257,6 +271,85 @@ def test_post_responses_stream_orders_native_events_and_sequences(monkeypatch):
     assert event_types[-1] == "response.completed"
     assert [event["sequence_number"] for event in events] == list(range(len(events)))
     assert events[-1]["response"]["output"][0]["content"][0]["text"] == "Hello"
+
+
+def test_post_responses_stream_separates_reasoning_text_and_function_call(monkeypatch):
+    state = _fake_state()
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(
+        openai,
+        "_run_generation",
+        _fake_streaming_generation(
+            "<think>Private plan</think>\n"
+            "Visible preamble.\n"
+            "<tool_call>\n"
+            "<function=lookup>\n"
+            "<parameter=q>\ncat\n</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        ),
+    )
+    response = TestClient(create_app(state)).post(
+        "/v1/responses",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "input": "Use the tool",
+            "stream": True,
+            "max_output_tokens": 128,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "description": "Look up a value",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"q": {"type": "string"}},
+                        "required": ["q"],
+                    },
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    events = _event_payloads(response.text)
+    reasoning = "".join(
+        event["delta"]
+        for event in events
+        if event["type"] == "response.reasoning_text.delta"
+    )
+    visible = "".join(
+        event["delta"]
+        for event in events
+        if event["type"] == "response.output_text.delta"
+    )
+    argument_deltas = [
+        event
+        for event in events
+        if event["type"] == "response.function_call_arguments.delta"
+    ]
+    argument_done = next(
+        event
+        for event in events
+        if event["type"] == "response.function_call_arguments.done"
+    )
+    completed = events[-1]["response"]
+
+    assert reasoning == "Private plan"
+    assert reasoning not in visible
+    assert visible.strip() == "Visible preamble."
+    assert "".join(event["delta"] for event in argument_deltas) == '{"q":"cat"}'
+    assert argument_done["name"] == "lookup"
+    assert argument_done["arguments"] == '{"q":"cat"}'
+    assert [item["type"] for item in completed["output"]] == [
+        "reasoning",
+        "message",
+        "function_call",
+    ]
+    assert completed["output"][0]["content"][0]["text"] == "Private plan"
+    assert completed["output"][1]["content"][0]["text"].strip() == "Visible preamble."
+    assert completed["output"][2]["name"] == "lookup"
+    assert completed["output"][2]["arguments"] == '{"q":"cat"}'
 
 
 def test_stream_translator_delivers_first_delta_before_completion():
@@ -355,6 +448,7 @@ def test_stream_translator_keeps_item_indices_stable_in_arrival_order():
         if event["type"] == "response.function_call_arguments.done"
     ]
     assert [event["output_index"] for event in argument_done] == [0, 3]
+    assert [event["name"] for event in argument_done] == ["lookup", "save"]
 
 
 def test_stateful_response_lifecycle_fails_explicitly(monkeypatch):
