@@ -279,6 +279,11 @@ def responses_request_to_chat(request: ResponsesRequest) -> dict[str, Any]:
         if unsupported_text:
             param = f"text.{sorted(unsupported_text)[0]}"
             _reject(param, f"{param} is not supported")
+        if request.text.get("verbosity") is not None:
+            _reject(
+                "text.verbosity",
+                "text.verbosity is not supported by the ephemeral Responses adapter",
+            )
 
     reasoning = request.reasoning or {}
     unsupported_reasoning = set(reasoning) - {"effort", "summary"}
@@ -287,8 +292,11 @@ def responses_request_to_chat(request: ResponsesRequest) -> dict[str, Any]:
         _reject(param, f"{param} is not supported")
     effort = reasoning.get("effort")
     summary = reasoning.get("summary")
-    if summary not in (None, "auto", "concise", "detailed"):
-        _reject("reasoning.summary", f"unsupported reasoning summary mode {summary!r}")
+    if summary is not None:
+        _reject(
+            "reasoning.summary",
+            "reasoning.summary is not supported by the ephemeral Responses adapter",
+        )
 
     return {
         "model": request.model,
