@@ -30837,7 +30837,11 @@ def create_app(state: ServerState) -> FastAPI:
         except ResponsesProtocolError as exc:
             return JSONResponse(exc.payload(), status_code=400)
 
-        response_id = f"resp_{uuid.uuid4().hex}"
+        response_id = _response_id_from_client_hint(
+            prefix="resp",
+            headers=dict(raw_request.headers),
+            metadata=_request_metadata(chat_request),
+        )
         created_at = int(time.time())
         chat_response = await chat_completions(raw_request, chat_request)
         if request.stream:

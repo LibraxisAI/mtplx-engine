@@ -435,6 +435,7 @@ async def responses_stream_from_chat_sse(
                 "response.function_call_arguments.done",
                 item_id=tool["id"],
                 output_index=output_index,
+                name=tool["name"],
                 arguments=tool["arguments"],
             )
             yield state.event(
