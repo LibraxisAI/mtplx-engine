@@ -29,6 +29,29 @@ def _event_payloads(response_text: str) -> list[dict]:
     ]
 
 
+def _translated_events(chat_payloads: list[dict]) -> list[dict]:
+    async def chat_frames():
+        for payload in chat_payloads:
+            yield f"data: {json.dumps(payload)}\n\n"
+
+    async def collect():
+        events: list[dict] = []
+        async for frame in responses_stream_from_chat_sse(
+            chat_frames(),
+            request=ResponsesRequest(input="hi", stream=True),
+            response_id="resp_failure",
+            model="buddy",
+            created_at=123,
+        ):
+            data_line = next(
+                line for line in frame.splitlines() if line.startswith("data: ")
+            )
+            events.append(json.loads(data_line[6:]))
+        return events
+
+    return asyncio.run(collect())
+
+
 def _ready_client(monkeypatch, *, text: str = "Hello") -> TestClient:
     state = _fake_state()
     monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
@@ -449,6 +472,115 @@ def test_stream_translator_keeps_item_indices_stable_in_arrival_order():
     ]
     assert [event["output_index"] for event in argument_done] == [0, 3]
     assert [event["name"] for event in argument_done] == ["lookup", "save"]
+
+
+def test_stream_translator_normalizes_failure_before_output():
+    events = _translated_events(
+        [
+            {
+                "choices": [{"delta": {}, "finish_reason": "error"}],
+                "error": {
+                    "message": "generation failed",
+                    "type": "server_error",
+                    "code": "RuntimeError",
+                    "param": None,
+                },
+            }
+        ]
+    )
+
+    failed = events[-1]
+    assert failed["type"] == "response.failed"
+    assert failed["response"]["status"] == "failed"
+    assert failed["response"]["output"] == []
+    assert failed["response"]["error"] == {
+        "code": "server_error",
+        "message": "generation failed",
+    }
+
+
+def test_stream_translator_marks_partial_outputs_incomplete_on_failure():
+    events = _translated_events(
+        [
+            {
+                "choices": [
+                    {
+                        "delta": {"reasoning_content": "Private"},
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {"delta": {"content": "Visible"}, "finish_reason": None}
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "function": {
+                                        "name": "lookup",
+                                        "arguments": '{"q":',
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            {
+                "choices": [{"delta": {}, "finish_reason": "error"}],
+                "error": {
+                    "message": "generation failed after partial output",
+                    "type": "server_error",
+                    "code": "RuntimeError",
+                    "param": None,
+                },
+            },
+        ]
+    )
+
+    failed = events[-1]
+    assert failed["type"] == "response.failed"
+    assert [item["type"] for item in failed["response"]["output"]] == [
+        "reasoning",
+        "message",
+        "function_call",
+    ]
+    assert {item["status"] for item in failed["response"]["output"]} == {
+        "incomplete"
+    }
+    assert failed["response"]["output"][2]["arguments"] == '{"q":'
+    assert failed["response"]["error"]["code"] == "server_error"
+
+
+def test_stream_translator_normalizes_server_side_cancellation_failure():
+    events = _translated_events(
+        [
+            {
+                "choices": [{"delta": {}, "finish_reason": "error"}],
+                "error": {
+                    "message": "request cancelled",
+                    "type": "server_error",
+                    "code": "CancelledError",
+                    "param": None,
+                },
+            }
+        ]
+    )
+
+    failed = events[-1]
+    assert failed["type"] == "response.failed"
+    assert failed["response"]["error"] == {
+        "code": "server_error",
+        "message": "request cancelled",
+    }
 
 
 def test_stateful_response_lifecycle_fails_explicitly(monkeypatch):
