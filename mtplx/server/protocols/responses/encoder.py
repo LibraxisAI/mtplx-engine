@@ -187,6 +187,8 @@ class _StreamState:
     reasoning_id: str | None = None
     reasoning: str = ""
     tools: dict[int, dict[str, Any]] = field(default_factory=dict)
+    output_order: list[tuple[str, int]] = field(default_factory=list)
+    output_indices: dict[tuple[str, int], int] = field(default_factory=dict)
     usage: dict[str, Any] = field(default_factory=lambda: _usage(None))
     mtplx_stats: dict[str, Any] = field(default_factory=dict)
     finish_reason: str | None = None
@@ -196,24 +198,46 @@ class _StreamState:
         self.sequence += 1
         return f"event: {event_type}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
 
+    def register_output(self, kind: str, key: int = 0) -> int:
+        identity = (kind, key)
+        if identity not in self.output_indices:
+            self.output_indices[identity] = len(self.output_order)
+            self.output_order.append(identity)
+        return self.output_indices[identity]
+
+    def output_index(self, kind: str, key: int = 0) -> int:
+        return self.output_indices[(kind, key)]
+
     def output(self, *, status: str = "completed") -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
-        if self.reasoning_id is not None:
-            items.append(_reasoning_item(self.reasoning, item_id=self.reasoning_id, status=status))
-        if self.text_id is not None:
-            items.append(_message_item(self.text, item_id=self.text_id, status=status))
-        for index in sorted(self.tools):
-            tool = self.tools[index]
-            items.append(
-                _function_item(
-                    {
-                        "id": tool["call_id"],
-                        "function": {"name": tool["name"], "arguments": tool["arguments"]},
-                    },
-                    item_id=tool["id"],
-                    status=status,
+        for kind, key in self.output_order:
+            if kind == "reasoning" and self.reasoning_id is not None:
+                items.append(
+                    _reasoning_item(
+                        self.reasoning,
+                        item_id=self.reasoning_id,
+                        status=status,
+                    )
                 )
-            )
+            elif kind == "text" and self.text_id is not None:
+                items.append(
+                    _message_item(self.text, item_id=self.text_id, status=status)
+                )
+            elif kind == "tool":
+                tool = self.tools[key]
+                items.append(
+                    _function_item(
+                        {
+                            "id": tool["call_id"],
+                            "function": {
+                                "name": tool["name"],
+                                "arguments": tool["arguments"],
+                            },
+                        },
+                        item_id=tool["id"],
+                        status=status,
+                    )
+                )
         return items
 
     def response(self, *, status: str) -> dict[str, Any]:
@@ -268,25 +292,27 @@ async def responses_stream_from_chat_sse(
             if reasoning_delta:
                 if state.reasoning_id is None:
                     state.reasoning_id = _item_id("rs")
+                    output_index = state.register_output("reasoning")
                     item = _reasoning_item("", item_id=state.reasoning_id, status="in_progress")
                     yield state.event(
                         "response.output_item.added",
-                        output_index=0,
+                        output_index=output_index,
                         item=item,
                     )
+                output_index = state.output_index("reasoning")
                 state.reasoning += reasoning_delta
                 yield state.event(
                     "response.reasoning_text.delta",
                     item_id=state.reasoning_id,
-                    output_index=0,
+                    output_index=output_index,
                     content_index=0,
                     delta=reasoning_delta,
                 )
             text_delta = str(delta.get("content") or "")
             if text_delta:
-                output_index = 1 if state.reasoning_id is not None else 0
                 if state.text_id is None:
                     state.text_id = _item_id("msg")
+                    output_index = state.register_output("text")
                     item = _message_item("", item_id=state.text_id, status="in_progress")
                     yield state.event(
                         "response.output_item.added",
@@ -300,6 +326,7 @@ async def responses_stream_from_chat_sse(
                         content_index=0,
                         part=item["content"][0],
                     )
+                output_index = state.output_index("text")
                 state.text += text_delta
                 yield state.event(
                     "response.output_text.delta",
@@ -321,11 +348,10 @@ async def responses_stream_from_chat_sse(
                         "arguments": "",
                     }
                     state.tools[index] = tool
+                    output_index = state.register_output("tool", index)
                     yield state.event(
                         "response.output_item.added",
-                        output_index=(1 if state.reasoning_id is not None else 0)
-                        + (1 if state.text_id is not None else 0)
-                        + index,
+                        output_index=output_index,
                         item=_function_item(
                             {
                                 "id": tool["call_id"],
@@ -337,15 +363,14 @@ async def responses_stream_from_chat_sse(
                     )
                 if function.get("name"):
                     tool["name"] = str(function["name"])
+                output_index = state.output_index("tool", index)
                 arguments_delta = str(function.get("arguments") or "")
                 if arguments_delta:
                     tool["arguments"] += arguments_delta
                     yield state.event(
                         "response.function_call_arguments.delta",
                         item_id=tool["id"],
-                        output_index=(1 if state.reasoning_id is not None else 0)
-                        + (1 if state.text_id is not None else 0)
-                        + index,
+                        output_index=output_index,
                         delta=arguments_delta,
                     )
             if chat.get("usage"):
@@ -358,57 +383,65 @@ async def responses_stream_from_chat_sse(
         if hasattr(body_iterator, "aclose"):
             await body_iterator.aclose()
 
-    output_index = 0
-    if state.reasoning_id is not None:
-        yield state.event(
-            "response.reasoning_text.done",
-            item_id=state.reasoning_id,
-            output_index=output_index,
-            content_index=0,
-            text=state.reasoning,
-        )
-        yield state.event(
-            "response.output_item.done",
-            output_index=output_index,
-            item=_reasoning_item(state.reasoning, item_id=state.reasoning_id),
-        )
-        output_index += 1
-    if state.text_id is not None:
-        item = _message_item(state.text, item_id=state.text_id)
-        yield state.event(
-            "response.output_text.done",
-            item_id=state.text_id,
-            output_index=output_index,
-            content_index=0,
-            text=state.text,
-            logprobs=[],
-        )
-        yield state.event(
-            "response.content_part.done",
-            item_id=state.text_id,
-            output_index=output_index,
-            content_index=0,
-            part=item["content"][0],
-        )
-        yield state.event("response.output_item.done", output_index=output_index, item=item)
-        output_index += 1
-    for index in sorted(state.tools):
-        tool = state.tools[index]
-        item = _function_item(
-            {
-                "id": tool["call_id"],
-                "function": {"name": tool["name"], "arguments": tool["arguments"]},
-            },
-            item_id=tool["id"],
-        )
-        yield state.event(
-            "response.function_call_arguments.done",
-            item_id=tool["id"],
-            output_index=output_index,
-            arguments=tool["arguments"],
-        )
-        yield state.event("response.output_item.done", output_index=output_index, item=item)
-        output_index += 1
+    for output_index, (kind, key) in enumerate(state.output_order):
+        if kind == "reasoning" and state.reasoning_id is not None:
+            yield state.event(
+                "response.reasoning_text.done",
+                item_id=state.reasoning_id,
+                output_index=output_index,
+                content_index=0,
+                text=state.reasoning,
+            )
+            yield state.event(
+                "response.output_item.done",
+                output_index=output_index,
+                item=_reasoning_item(state.reasoning, item_id=state.reasoning_id),
+            )
+        elif kind == "text" and state.text_id is not None:
+            item = _message_item(state.text, item_id=state.text_id)
+            yield state.event(
+                "response.output_text.done",
+                item_id=state.text_id,
+                output_index=output_index,
+                content_index=0,
+                text=state.text,
+                logprobs=[],
+            )
+            yield state.event(
+                "response.content_part.done",
+                item_id=state.text_id,
+                output_index=output_index,
+                content_index=0,
+                part=item["content"][0],
+            )
+            yield state.event(
+                "response.output_item.done",
+                output_index=output_index,
+                item=item,
+            )
+        elif kind == "tool":
+            tool = state.tools[key]
+            item = _function_item(
+                {
+                    "id": tool["call_id"],
+                    "function": {
+                        "name": tool["name"],
+                        "arguments": tool["arguments"],
+                    },
+                },
+                item_id=tool["id"],
+            )
+            yield state.event(
+                "response.function_call_arguments.done",
+                item_id=tool["id"],
+                output_index=output_index,
+                arguments=tool["arguments"],
+            )
+            yield state.event(
+                "response.output_item.done",
+                output_index=output_index,
+                item=item,
+            )
     terminal_status = "incomplete" if state.finish_reason == "length" else "completed"
     yield state.event(
         "response.incomplete" if terminal_status == "incomplete" else "response.completed",

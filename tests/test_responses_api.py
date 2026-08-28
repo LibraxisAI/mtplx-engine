@@ -70,7 +70,7 @@ def test_request_translation_accepts_messages_controls_tools_and_images():
             "top_k": 20,
             "presence_penalty": 0.1,
             "frequency_penalty": 0.2,
-            "reasoning": {"effort": "medium", "summary": "auto"},
+            "reasoning": {"effort": "medium"},
             "tools": [
                 {
                     "type": "function",
@@ -126,6 +126,11 @@ def test_request_translation_accepts_messages_controls_tools_and_images():
             {"input": "hi", "text": {"format": {"type": "json_schema"}}},
             "text.format",
         ),
+        ({"input": "hi", "text": {"verbosity": "high"}}, "text.verbosity"),
+        (
+            {"input": "hi", "reasoning": {"summary": "detailed"}},
+            "reasoning.summary",
+        ),
         ({"input": "hi", "background": True}, "background"),
         (
             {"input": "hi", "tools": [{"type": "web_search_preview"}]},
@@ -141,6 +146,22 @@ def test_unsupported_semantics_fail_with_exact_parameter(body, param):
     with pytest.raises(ResponsesProtocolError) as raised:
         responses_request_to_chat(ResponsesRequest.model_validate(body))
     assert raised.value.param == param
+
+
+@pytest.mark.parametrize(
+    ("body", "param"),
+    [
+        ({"input": "hi", "text": {"verbosity": "high"}}, "text.verbosity"),
+        (
+            {"input": "hi", "reasoning": {"summary": "detailed"}},
+            "reasoning.summary",
+        ),
+    ],
+)
+def test_post_responses_rejects_unimplemented_controls(monkeypatch, body, param):
+    response = _ready_client(monkeypatch).post("/v1/responses", json=body)
+    assert response.status_code == 400
+    assert response.json()["error"]["param"] == param
 
 
 def test_nonstream_encoder_separates_reasoning_text_and_function_calls():
@@ -267,6 +288,73 @@ def test_stream_translator_delivers_first_delta_before_completion():
     assert delta_time < 0.07
     assert completed_time >= 0.09
     assert delta_time < completed_time
+
+
+def test_stream_translator_keeps_item_indices_stable_in_arrival_order():
+    async def chat_frames():
+        yield 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"lookup","arguments":"{\\"q\\":"}}]},"finish_reason":null}]}\n\n'
+        yield 'data: {"choices":[{"delta":{"content":"Visible"},"finish_reason":null}]}\n\n'
+        yield 'data: {"choices":[{"delta":{"reasoning_content":"Private"},"finish_reason":null}]}\n\n'
+        yield 'data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_2","function":{"name":"save","arguments":"{}"}},{"index":0,"function":{"arguments":"\\"cat\\"}"}}]},"finish_reason":null}]}\n\n'
+        yield 'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def collect():
+        events: list[dict] = []
+        async for frame in responses_stream_from_chat_sse(
+            chat_frames(),
+            request=ResponsesRequest(input="hi", stream=True),
+            response_id="resp_reordered",
+            model="buddy",
+            created_at=123,
+        ):
+            data_line = next(line for line in frame.splitlines() if line.startswith("data: "))
+            events.append(json.loads(data_line[6:]))
+        return events
+
+    events = asyncio.run(collect())
+    added = [event for event in events if event["type"] == "response.output_item.added"]
+    assert [(event["item"]["type"], event["output_index"]) for event in added] == [
+        ("function_call", 0),
+        ("message", 1),
+        ("reasoning", 2),
+        ("function_call", 3),
+    ]
+    argument_deltas = [
+        event
+        for event in events
+        if event["type"] == "response.function_call_arguments.delta"
+    ]
+    assert [(event["output_index"], event["delta"]) for event in argument_deltas] == [
+        (0, '{"q":'),
+        (3, "{}"),
+        (0, '"cat"}'),
+    ]
+
+    indices_by_item = {event["item"]["id"]: event["output_index"] for event in added}
+    for event in events:
+        item_id = event.get("item_id")
+        if item_id in indices_by_item:
+            assert event["output_index"] == indices_by_item[item_id]
+        item = event.get("item")
+        if isinstance(item, dict) and item.get("id") in indices_by_item:
+            assert event["output_index"] == indices_by_item[item["id"]]
+
+    completed = events[-1]
+    assert completed["type"] == "response.completed"
+    assert [item["type"] for item in completed["response"]["output"]] == [
+        "function_call",
+        "message",
+        "reasoning",
+        "function_call",
+    ]
+    assert completed["response"]["output"][0]["arguments"] == '{"q":"cat"}'
+    argument_done = [
+        event
+        for event in events
+        if event["type"] == "response.function_call_arguments.done"
+    ]
+    assert [event["output_index"] for event in argument_done] == [0, 3]
 
 
 def test_stateful_response_lifecycle_fails_explicitly(monkeypatch):
