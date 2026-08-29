@@ -174,6 +174,16 @@ def _messages(request: ResponsesRequest) -> list[dict[str, Any]]:
             ]
         else:
             messages = []
+            pending_tool_calls: list[dict[str, Any]] = []
+
+            def flush_tool_calls() -> None:
+                if not pending_tool_calls:
+                    return
+                messages.append(
+                    {"role": "assistant", "content": "", "tool_calls": list(pending_tool_calls)}
+                )
+                pending_tool_calls.clear()
+
             for index, raw_item in enumerate(raw_input):
                 if not isinstance(raw_item, Mapping):
                     _reject(
@@ -183,18 +193,23 @@ def _messages(request: ResponsesRequest) -> list[dict[str, Any]]:
                     )
                 item_type = str(raw_item.get("type") or "message")
                 if item_type == "message":
+                    flush_tool_calls()
                     messages.append(_message(raw_item, index=index))
                 elif item_type == "function_call":
-                    messages.append(_function_call(raw_item, index=index))
+                    pending_tool_calls.extend(_function_call(raw_item, index=index)["tool_calls"])
                 elif item_type == "function_call_output":
+                    flush_tool_calls()
                     messages.append(_function_call_output(raw_item, index=index))
                 elif item_type in {"input_file", "file"}:
+                    flush_tool_calls()
                     _reject(f"input[{index}]", "file inputs are not supported")
                 else:
+                    flush_tool_calls()
                     _reject(
                         f"input[{index}].type",
                         f"unsupported Responses input item type {item_type!r}",
                     )
+            flush_tool_calls()
     else:
         _reject("input", "input must be a string or an array", code="invalid_type")
     if request.instructions:
