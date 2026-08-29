@@ -296,6 +296,11 @@ async def responses_stream_from_chat_sse(
                 failed["error"] = _response_error(chat["error"])
                 yield state.event("response.failed", response=failed)
                 return
+            if isinstance(chat.get("mtplx_progress"), dict):
+                # Preserve Chat's liveness signal as an SSE comment. SDKs
+                # ignore comments, while proxies keep a long burst alive.
+                yield ": mtplx-heartbeat\n\n"
+                continue
             if chat.get("model"):
                 state.model = str(chat["model"])
             choices = chat.get("choices") or []

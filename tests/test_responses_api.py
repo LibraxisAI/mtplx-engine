@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 import time
 
@@ -120,6 +121,7 @@ def test_request_translation_accepts_messages_controls_tools_and_images():
         "tool_call_id": "call_1",
         "content": "found",
     }
+    assert len(chat["messages"]) == 4
     assert chat["max_tokens"] == 64
     assert chat["reasoning_effort"] == "medium"
     assert chat["tools"][0]["function"]["name"] == "lookup"
@@ -127,6 +129,34 @@ def test_request_translation_accepts_messages_controls_tools_and_images():
         "type": "function",
         "function": {"name": "lookup"},
     }
+
+
+def test_request_translation_keeps_parallel_tool_calls_in_one_burst():
+    chat = responses_request_to_chat(
+        ResponsesRequest.model_validate(
+            {
+                "input": [
+                    {"role": "user", "content": "Check both sources"},
+                    {"type": "function_call", "call_id": "call_search", "name": "web_search", "arguments": '{"query":"loctree"}'},
+                    {"type": "function_call", "call_id": "call_image", "name": "inspect_image", "arguments": '{"url":"https://example.test/image.png"}'},
+                    {"type": "function_call_output", "call_id": "call_search", "output": "search result"},
+                    {"type": "function_call_output", "call_id": "call_image", "output": "image result"},
+                ]
+            }
+        )
+    )
+
+    assert [message["role"] for message in chat["messages"]] == [
+        "user", "assistant", "tool", "tool"
+    ]
+    assert [call["id"] for call in chat["messages"][1]["tool_calls"]] == [
+        "call_search", "call_image"
+    ]
+    assert [
+        message["tool_call_id"]
+        for message in chat["messages"]
+        if message["role"] == "tool"
+    ] == ["call_search", "call_image"]
 
 
 @pytest.mark.parametrize(
@@ -293,7 +323,65 @@ def test_post_responses_stream_orders_native_events_and_sequences(monkeypatch):
     assert "response.output_text.delta" in event_types
     assert event_types[-1] == "response.completed"
     assert [event["sequence_number"] for event in events] == list(range(len(events)))
+    assert events[0]["response"]["model"] == state.model_id
+    assert events[-1]["response"]["model"] == state.model_id
     assert events[-1]["response"]["output"][0]["content"][0]["text"] == "Hello"
+
+
+def test_post_responses_stream_keeps_long_live_generation_observable(monkeypatch):
+    state = _fake_state()
+    state.args.stats_footer = False
+    state.generation_executor = ThreadPoolExecutor(max_workers=1)
+    tokens = [ord("o"), ord("k")]
+
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(openai, "STREAM_HEARTBEAT_INTERVAL_S", 0.0)
+    monkeypatch.setattr(openai, "STREAM_SILENCE_WARN_S", 0.01)
+    monkeypatch.setattr(openai, "STREAM_SILENCE_WARN_INTERVAL_S", 60.0)
+
+    def generate(_state, _prompt_ids, **kwargs):
+        time.sleep(1.25)
+        kwargs["token_callback"](tokens)
+        return {
+            "text": "ok",
+            "tokens": tokens,
+            "stats": {
+                "generation_mode": kwargs["generation_mode"],
+                "mtp_depth": kwargs["depth"],
+                "completion_tokens": len(tokens),
+            },
+            "prompt_tokens": 3,
+            "completion_tokens": len(tokens),
+            "finish_reason": "stop",
+        }
+
+    monkeypatch.setattr(openai, "_run_generation", generate)
+
+    try:
+        response = TestClient(create_app(state)).post(
+            "/v1/responses",
+            headers={
+                "x-mtplx-cache-mode": "bypass",
+                "x-mtplx-allow-client-controls": "1",
+            },
+            json={
+                "input": "Say ok.",
+                "stream": True,
+                "max_output_tokens": 16,
+            },
+        )
+    finally:
+        state.generation_executor.shutdown(wait=True)
+
+    assert response.status_code == 200, response.text
+    assert ": mtplx-heartbeat\n\n" in response.text
+    events = _event_payloads(response.text)
+    assert [
+        event["delta"]
+        for event in events
+        if event["type"] == "response.output_text.delta"
+    ] == ["ok"]
+    assert events[-1]["type"] == "response.completed"
 
 
 def test_post_responses_stream_separates_reasoning_text_and_function_call(monkeypatch):
@@ -404,6 +492,48 @@ def test_stream_translator_delivers_first_delta_before_completion():
     assert delta_time < 0.07
     assert completed_time >= 0.09
     assert delta_time < completed_time
+
+
+def test_stream_translator_preserves_bursts_and_idle_heartbeats():
+    async def chat_frames():
+        yield 'data: {"choices":[{"delta":{"content":"first"},"finish_reason":null}]}\n\n'
+        await asyncio.sleep(0.02)
+        yield 'data: {"mtplx_progress":{"heartbeat":true,"phase":"generating"}}\n\n'
+        await asyncio.sleep(0.02)
+        yield 'data: {"choices":[{"delta":{"content":" second"},"finish_reason":null}]}\n\n'
+        yield 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def collect():
+        frames: list[str] = []
+        async for frame in responses_stream_from_chat_sse(
+            chat_frames(),
+            request=ResponsesRequest(input="hi", stream=True),
+            response_id="resp_bursts",
+            model="buddy",
+            created_at=123,
+        ):
+            frames.append(frame)
+        return frames
+
+    frames = asyncio.run(collect())
+    heartbeat_index = frames.index(": mtplx-heartbeat\n\n")
+    events = [
+        json.loads(line[6:])
+        for frame in frames
+        for line in frame.splitlines()
+        if line.startswith("data: {")
+    ]
+    deltas = [event["delta"] for event in events if event["type"] == "response.output_text.delta"]
+    delta_indices = [
+        index
+        for index, frame in enumerate(frames)
+        if '"type": "response.output_text.delta"' in frame
+    ]
+
+    assert deltas == ["first", " second"]
+    assert delta_indices[0] < heartbeat_index < delta_indices[1]
+    assert events[-1]["type"] == "response.completed"
 
 
 def test_stream_translator_keeps_item_indices_stable_in_arrival_order():
