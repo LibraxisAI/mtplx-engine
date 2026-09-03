@@ -162,8 +162,6 @@ def test_request_translation_keeps_parallel_tool_calls_in_one_burst():
 @pytest.mark.parametrize(
     ("body", "param"),
     [
-        ({"input": "hi", "store": True}, "store"),
-        ({"input": "hi", "previous_response_id": "resp_old"}, "previous_response_id"),
         (
             {
                 "input": [
@@ -713,15 +711,12 @@ def test_stream_translator_normalizes_server_side_cancellation_failure():
     }
 
 
-def test_stateful_response_lifecycle_fails_explicitly(monkeypatch):
+def test_missing_response_lifecycle_is_structured(monkeypatch):
     client = _ready_client(monkeypatch)
-    create = client.post("/v1/responses", json={"input": "hi", "store": True})
-    assert create.status_code == 400
-    assert create.json()["error"]["param"] == "store"
     for response in (
         client.get("/v1/responses/resp_missing"),
         client.delete("/v1/responses/resp_missing"),
         client.post("/v1/responses/resp_missing/cancel"),
     ):
-        assert response.status_code == 400
-        assert response.json()["error"]["code"] == "not_implemented"
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "response_not_found"

@@ -143,9 +143,13 @@ from mtplx.server.core import (
     UsageUpdate,
 )
 from mtplx.server.protocols.responses import (
+    ResponseRegistry,
+    ResponseStoreError,
     ResponsesProtocolError,
     ResponsesRequest,
+    response_failure_envelope,
     response_from_chat_completion,
+    response_output_to_chat_messages,
     responses_request_to_chat,
     responses_stream_from_turn_events,
 )
@@ -27260,6 +27264,11 @@ def _as_text_list(value: Any, *, field: str) -> list[str]:
 
 
 def create_app(state: ServerState) -> FastAPI:
+    response_registry = getattr(state, "response_registry", None)
+    if not isinstance(response_registry, ResponseRegistry):
+        response_registry = ResponseRegistry.from_env()
+        state.response_registry = response_registry
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         # Bind the running asyncio loop to the dashboard bus so generation
@@ -27297,6 +27306,7 @@ def create_app(state: ServerState) -> FastAPI:
                 await _aime_runner.stop_runs()
             except Exception:
                 pass
+            await asyncio.to_thread(response_registry.shutdown, 1.0)
             for task in bg_tasks:
                 task.cancel()
             # Issue #290: BEFORE the scheduler shutdown cancels queued
@@ -27546,6 +27556,7 @@ def create_app(state: ServerState) -> FastAPI:
             "dashboard_active_requests": dashboard_active,
             "active_requests": active_requests,
             "scheduler": scheduler_state,
+            "response_store": response_registry.stats(),
             "session_bank": (
                 state.sessions.bank.to_dict()
                 if hasattr(getattr(state, "sessions", None), "bank")
@@ -28602,6 +28613,7 @@ def create_app(state: ServerState) -> FastAPI:
             "tool_parse_counters": dict(
                 getattr(state, "tool_parse_counters", {}) or {}
             ),
+            "response_store": response_registry.stats(),
         }
 
     @app.get("/admin/sessions")
@@ -33344,86 +33356,210 @@ def create_app(state: ServerState) -> FastAPI:
 
     @app.post("/v1/responses")
     async def responses(raw_request: Request, request: ResponsesRequest) -> Any:
-        """Render the existing Chat turn through the ephemeral Responses wire."""
+        """Render one existing Chat turn with bounded local Responses state."""
 
         try:
-            chat_request = ChatCompletionRequest.model_validate(
-                responses_request_to_chat(request)
+            chat_kwargs = responses_request_to_chat(request)
+            current_messages = list(chat_kwargs["messages"])
+            instruction_messages: list[dict[str, Any]] = []
+            if (
+                request.instructions
+                and current_messages
+                and current_messages[0]
+                == {"role": "system", "content": request.instructions}
+            ):
+                instruction_messages = [current_messages.pop(0)]
+            parent_messages = (
+                response_registry.parent_messages(request.previous_response_id)
+                if request.previous_response_id is not None
+                else []
             )
+            materialized_messages = [*parent_messages, *current_messages]
+            chat_kwargs["messages"] = [
+                *instruction_messages,
+                *materialized_messages,
+            ]
+            chat_request = ChatCompletionRequest.model_validate(chat_kwargs)
         except ResponsesProtocolError as exc:
             return JSONResponse(exc.payload(), status_code=400)
+        except ResponseStoreError as exc:
+            return JSONResponse(exc.payload(), status_code=exc.status_code)
 
-        response_id = _response_id_from_client_hint(
+        headers = dict(raw_request.headers)
+        response_hint = _response_id_from_client_hint(
             prefix="resp",
-            headers=dict(raw_request.headers),
+            headers=headers,
+            metadata=_request_metadata(chat_request),
+        )
+        response_id = response_registry.allocate_id(
+            response_hint if request.store is not True else None
+        )
+        chat_response_id = _response_id_from_client_hint(
+            prefix="chatcmpl",
+            headers=headers,
             metadata=_request_metadata(chat_request),
         )
         created_at = int(time.time())
-        if request.stream:
-            chat_response = await _chat_completions_impl(
-                raw_request, chat_request, return_turn=True
+        turn_holder: dict[str, GenerationTurn] = {}
+
+        def cancel_generation() -> None:
+            state.dashboard.in_flight.cancel(chat_response_id)
+            turn = turn_holder.get("turn")
+            if turn is not None:
+                turn.cancel_driver()
+
+        try:
+            response_registry.begin(
+                response_id,
+                store=request.store is True,
+                materialized_messages=materialized_messages,
+                cancel=cancel_generation,
             )
-            if not isinstance(chat_response, _GenerationTurnStream):
-                return chat_response
-            return StreamingResponse(
-                responses_stream_from_turn_events(
-                    chat_response.events(),
+        except ResponseStoreError as exc:
+            return JSONResponse(exc.payload(), status_code=exc.status_code)
+
+        def commit_terminal(envelope: dict[str, Any]) -> None:
+            response_registry.commit(
+                response_id,
+                envelope,
+                materialized_messages=[
+                    *materialized_messages,
+                    *response_output_to_chat_messages(envelope.get("output") or []),
+                ],
+            )
+
+        def commit_bridge_failure(response: Any) -> None:
+            message = "response generation failed"
+            if isinstance(response, BaseException):
+                message = str(response) or type(response).__name__
+            elif isinstance(response, JSONResponse):
+                try:
+                    payload = json.loads(response.body)
+                    error = payload.get("error") or payload.get("detail")
+                    message = (
+                        str(error.get("message") or error)
+                        if isinstance(error, dict)
+                        else str(error or message)
+                    )
+                except Exception:
+                    pass
+            commit_terminal(
+                response_failure_envelope(
                     request=request,
                     response_id=response_id,
                     model=state.model_id,
                     created_at=created_at,
-                ),
+                    message=message,
+                    code="generation_error",
+                )
+            )
+
+        if request.stream:
+            try:
+                chat_response = await _chat_completions_impl(
+                    raw_request, chat_request, return_turn=True
+                )
+            except BaseException as exc:
+                commit_bridge_failure(exc)
+                raise
+            if not isinstance(chat_response, _GenerationTurnStream):
+                commit_bridge_failure(chat_response)
+                return chat_response
+            turn_holder["turn"] = chat_response.turn
+
+            async def response_events() -> AsyncIterator[str]:
+                try:
+                    async for frame in responses_stream_from_turn_events(
+                        chat_response.events(),
+                        request=request,
+                        response_id=response_id,
+                        model=state.model_id,
+                        created_at=created_at,
+                        on_terminal=commit_terminal,
+                    ):
+                        yield frame
+                finally:
+                    if response_registry.is_in_flight(response_id):
+                        commit_terminal(
+                            response_failure_envelope(
+                                request=request,
+                                response_id=response_id,
+                                model=state.model_id,
+                                created_at=created_at,
+                                message="response renderer disconnected",
+                                code="request_cancelled",
+                            )
+                        )
+
+            return StreamingResponse(
+                response_events(),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
                     "X-Accel-Buffering": "no",
                 },
             )
-        chat_response = await chat_completions(raw_request, chat_request)
+        try:
+            chat_response = await chat_completions(raw_request, chat_request)
+        except BaseException as exc:
+            commit_bridge_failure(exc)
+            raise
         if not isinstance(chat_response, JSONResponse):
+            commit_bridge_failure(chat_response)
             return chat_response
         if chat_response.status_code >= 400:
+            commit_bridge_failure(chat_response)
             return chat_response
         try:
             chat_payload = json.loads(chat_response.body)
         except Exception as exc:
+            commit_bridge_failure(exc)
             raise HTTPException(
                 status_code=500, detail=f"failed to translate response: {exc}"
             ) from exc
-        return JSONResponse(
-            response_from_chat_completion(
-                chat_payload,
-                request=request,
-                response_id=response_id,
-                created_at=created_at,
-            ),
-            status_code=chat_response.status_code,
+        envelope = response_from_chat_completion(
+            chat_payload,
+            request=request,
+            response_id=response_id,
+            created_at=created_at,
         )
-
-    def _unsupported_response_lifecycle(operation: str) -> JSONResponse:
-        error = ResponsesProtocolError(
-            message=(
-                f"response {operation} is unavailable until the response "
-                "lineage store is implemented"
-            ),
-            code="not_implemented",
-        )
-        return JSONResponse(error.payload(), status_code=400)
+        commit_terminal(envelope)
+        return JSONResponse(envelope, status_code=chat_response.status_code)
 
     @app.get("/v1/responses/{response_id}")
     async def get_response(response_id: str) -> JSONResponse:
-        del response_id
-        return _unsupported_response_lifecycle("retrieval")
+        try:
+            return JSONResponse(response_registry.get(response_id))
+        except ResponseStoreError as exc:
+            return JSONResponse(exc.payload(), status_code=exc.status_code)
 
     @app.delete("/v1/responses/{response_id}")
     async def delete_response(response_id: str) -> JSONResponse:
-        del response_id
-        return _unsupported_response_lifecycle("deletion")
+        try:
+            return JSONResponse(response_registry.delete(response_id))
+        except ResponseStoreError as exc:
+            return JSONResponse(exc.payload(), status_code=exc.status_code)
 
     @app.post("/v1/responses/{response_id}/cancel")
     async def cancel_response(response_id: str) -> JSONResponse:
-        del response_id
-        return _unsupported_response_lifecycle("cancellation")
+        try:
+            inflight = response_registry.request_cancel(response_id)
+        except ResponseStoreError as exc:
+            return JSONResponse(exc.payload(), status_code=exc.status_code)
+        terminal = await asyncio.to_thread(
+            response_registry.wait_terminal, inflight, 2.0
+        )
+        if terminal is None:
+            return JSONResponse(
+                {
+                    "id": response_id,
+                    "object": "response",
+                    "status": "in_progress",
+                    "cancellation_requested": True,
+                },
+                status_code=202,
+            )
+        return JSONResponse(terminal)
 
     @app.post("/v1/messages")
     async def anthropic_messages(
