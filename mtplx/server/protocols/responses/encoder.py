@@ -7,7 +7,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from mtplx.server.core.events import (
     OutputItemStarted,
@@ -127,9 +127,9 @@ def _base_response(
         "parallel_tool_calls": (
             True if request.parallel_tool_calls is None else request.parallel_tool_calls
         ),
-        "previous_response_id": None,
+        "previous_response_id": request.previous_response_id,
         "reasoning": request.reasoning,
-        "store": False,
+        "store": bool(request.store),
         "temperature": request.temperature,
         "text": request.text or {"format": {"type": "text"}},
         "tool_choice": request.tool_choice or "auto",
@@ -178,6 +178,30 @@ def response_from_chat_completion(
     )
     if incomplete:
         payload["incomplete_details"] = {"reason": "max_output_tokens"}
+    return payload
+
+
+def response_failure_envelope(
+    *,
+    request: ResponsesRequest,
+    response_id: str,
+    model: str,
+    created_at: int,
+    message: str,
+    code: str,
+) -> dict[str, Any]:
+    """Build a terminal failure when a renderer closes before projection."""
+
+    payload = _base_response(
+        response_id=response_id,
+        request=request,
+        model=model,
+        created_at=created_at,
+        status="failed",
+        output=[],
+        usage=_usage(None),
+    )
+    payload["error"] = {"code": code, "message": message}
     return payload
 
 
@@ -491,6 +515,7 @@ async def responses_stream_from_turn_events(
     response_id: str,
     model: str,
     created_at: int | None = None,
+    on_terminal: Callable[[dict[str, Any]], None] | None = None,
 ) -> AsyncIterator[str]:
     """Render Responses SSE directly from protocol-neutral TurnEvents."""
 
@@ -672,13 +697,17 @@ async def responses_stream_from_turn_events(
             terminal_seen = True
             failed = state.response(status="failed", output_status="incomplete")
             failed["error"] = {"code": ev.code or "server_error", "message": ev.error}
+            if on_terminal is not None:
+                on_terminal(failed)
             yield state.event("response.failed", response=failed)
             return
 
         if isinstance(ev, TurnCancelled):
             terminal_seen = True
-            failed = state.response(status="failed", output_status="incomplete")
+            failed = state.response(status="cancelled", output_status="incomplete")
             failed["error"] = {"code": "request_cancelled", "message": ev.reason}
+            if on_terminal is not None:
+                on_terminal(failed)
             yield state.event("response.failed", response=failed)
             return
 
@@ -688,6 +717,8 @@ async def responses_stream_from_turn_events(
             "code": "driver_eof_without_terminal",
             "message": "generation event stream ended without a terminal event",
         }
+        if on_terminal is not None:
+            on_terminal(failed)
         yield state.event("response.failed", response=failed)
         return
 
@@ -752,7 +783,10 @@ async def responses_stream_from_turn_events(
                 item=item,
             )
     terminal_status = "incomplete" if state.finish_reason == "length" else "completed"
+    terminal_response = state.response(status=terminal_status)
+    if on_terminal is not None:
+        on_terminal(terminal_response)
     yield state.event(
         "response.incomplete" if terminal_status == "incomplete" else "response.completed",
-        response=state.response(status=terminal_status),
+        response=terminal_response,
     )

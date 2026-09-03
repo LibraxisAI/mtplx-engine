@@ -219,6 +219,48 @@ def _messages(request: ResponsesRequest) -> list[dict[str, Any]]:
     return messages
 
 
+def response_output_to_chat_messages(
+    output: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Materialize one terminal Responses output as one assistant turn."""
+
+    content = ""
+    reasoning = ""
+    tool_calls: list[dict[str, Any]] = []
+    for item in output:
+        item_type = str(item.get("type") or "")
+        if item_type == "message":
+            for part in item.get("content") or []:
+                if isinstance(part, Mapping) and part.get("type") in {
+                    "output_text",
+                    "text",
+                }:
+                    content += str(part.get("text") or "")
+        elif item_type == "reasoning":
+            for part in item.get("content") or []:
+                if isinstance(part, Mapping):
+                    reasoning += str(part.get("text") or "")
+        elif item_type == "function_call":
+            tool_calls.append(
+                {
+                    "id": str(item.get("call_id") or item.get("id") or ""),
+                    "type": "function",
+                    "function": {
+                        "name": str(item.get("name") or ""),
+                        "arguments": str(item.get("arguments") or ""),
+                    },
+                }
+            )
+    if not content and not reasoning and not tool_calls:
+        return []
+    message: dict[str, Any] = {"role": "assistant", "content": content}
+    if reasoning:
+        message["reasoning_content"] = reasoning
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    return [message]
+
+
 def _tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
     if not tools:
         return None
@@ -279,13 +321,6 @@ def responses_request_to_chat(request: ResponsesRequest) -> dict[str, Any]:
     if extras:
         param = sorted(extras)[0]
         _reject(param, f"unknown Responses parameter {param!r}", code="unknown_parameter")
-    if request.store is True:
-        _reject("store", "store:true is unavailable until response storage is implemented")
-    if request.previous_response_id is not None:
-        _reject(
-            "previous_response_id",
-            "previous_response_id is unavailable until response lineage is implemented",
-        )
     if request.text:
         text_format = request.text.get("format")
         if text_format not in (None, {"type": "text"}):
