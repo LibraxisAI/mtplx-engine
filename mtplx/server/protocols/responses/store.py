@@ -23,6 +23,7 @@ DEFAULT_MAX_IN_FLIGHT = 64
 DEFAULT_MAX_BYTES = 32 * 1024 * 1024
 DEFAULT_MAX_ENTRY_BYTES = 4 * 1024 * 1024
 DEFAULT_IDLE_TTL_S = 3600.0
+DEFAULT_IN_FLIGHT_TTL_S = 900.0
 DEFAULT_TOMBSTONE_ENTRIES = 512
 
 
@@ -68,18 +69,20 @@ class _InFlightResponse:
     response_id: str
     store: bool
     materialized_messages: list[dict[str, Any]]
-    cancel: Callable[[], Any]
+    cancel: Callable[[], Any] | None
     started_at: float
     size_bytes: int
     cancel_requested: bool = False
+    cancel_delivered: bool = False
     done: threading.Event = field(default_factory=threading.Event)
     terminal_envelope: dict[str, Any] | None = None
 
 
-@dataclass(frozen=True)
+@dataclass
 class _Tombstone:
     reason: str
     created_at: float
+    cancel_pending: bool = False
 
 
 def _json_clone(value: Any) -> Any:
@@ -136,6 +139,7 @@ class ResponseRegistry:
         max_bytes: int = DEFAULT_MAX_BYTES,
         max_entry_bytes: int = DEFAULT_MAX_ENTRY_BYTES,
         idle_ttl_s: float = DEFAULT_IDLE_TTL_S,
+        in_flight_ttl_s: float = DEFAULT_IN_FLIGHT_TTL_S,
         max_tombstones: int = DEFAULT_TOMBSTONE_ENTRIES,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -150,13 +154,14 @@ class ResponseRegistry:
             <= 0
         ):
             raise ValueError("response registry bounds must be positive")
-        if idle_ttl_s <= 0:
-            raise ValueError("response registry idle_ttl_s must be positive")
+        if idle_ttl_s <= 0 or in_flight_ttl_s <= 0:
+            raise ValueError("response registry TTLs must be positive")
         self.max_entries = int(max_entries)
         self.max_in_flight = int(max_in_flight)
         self.max_bytes = int(max_bytes)
         self.max_entry_bytes = int(max_entry_bytes)
         self.idle_ttl_s = float(idle_ttl_s)
+        self.in_flight_ttl_s = float(in_flight_ttl_s)
         self.max_tombstones = int(max_tombstones)
         self._clock = clock
         self._lock = threading.RLock()
@@ -172,6 +177,7 @@ class ResponseRegistry:
             "expired_total": 0,
             "cancel_requests_total": 0,
             "cancel_settled_total": 0,
+            "timed_out_total": 0,
         }
 
     @classmethod
@@ -192,6 +198,10 @@ class ResponseRegistry:
             idle_ttl_s=_positive_float_env(
                 "MTPLX_RESPONSE_STORE_IDLE_TTL_S", DEFAULT_IDLE_TTL_S
             ),
+            in_flight_ttl_s=_positive_float_env(
+                "MTPLX_RESPONSE_STORE_IN_FLIGHT_TTL_S",
+                DEFAULT_IN_FLIGHT_TTL_S,
+            ),
             max_tombstones=_positive_env(
                 "MTPLX_RESPONSE_STORE_MAX_TOMBSTONES",
                 DEFAULT_TOMBSTONE_ENTRIES,
@@ -201,8 +211,8 @@ class ResponseRegistry:
     def allocate_id(self, preferred: str | None = None) -> str:
         """Return a collision-safe local id, retaining a safe unused hint."""
 
+        self._prune()
         with self._lock:
-            self._prune_locked()
             if preferred and not self._known_locked(preferred):
                 return preferred
             while True:
@@ -216,13 +226,13 @@ class ResponseRegistry:
         *,
         store: bool,
         materialized_messages: Sequence[Mapping[str, Any]],
-        cancel: Callable[[], Any],
+        cancel: Callable[[], Any] | None = None,
     ) -> None:
         messages = _json_clone(list(materialized_messages))
         size_bytes = _json_size(messages)
         now = self._clock()
+        self._prune(now)
         with self._lock:
-            self._prune_locked(now)
             if self._known_locked(response_id):
                 raise ResponseStoreError(
                     f"response id {response_id!r} already exists",
@@ -252,6 +262,39 @@ class ResponseRegistry:
             )
             self._in_flight_bytes += size_bytes
 
+    def bind_cancel(
+        self,
+        response_id: str,
+        cancel: Callable[[], Any],
+    ) -> bool:
+        """Bind the real generation handle and replay an earlier claim once."""
+
+        self._prune()
+        callback: Callable[[], Any] | None = None
+        with self._lock:
+            inflight = self._in_flight.get(response_id)
+            if inflight is not None:
+                if inflight.cancel is not None:
+                    raise RuntimeError(
+                        f"response {response_id!r} cancellation handle already bound"
+                    )
+                inflight.cancel = cancel
+                if inflight.cancel_requested and not inflight.cancel_delivered:
+                    inflight.cancel_delivered = True
+                    tombstone = self._tombstones.get(response_id)
+                    if tombstone is not None:
+                        tombstone.cancel_pending = False
+                    callback = cancel
+            else:
+                tombstone = self._tombstones.get(response_id)
+                if tombstone is None or not tombstone.cancel_pending:
+                    return False
+                tombstone.cancel_pending = False
+                callback = cancel
+        if callback is not None:
+            callback()
+        return True
+
     def commit(
         self,
         response_id: str,
@@ -262,8 +305,8 @@ class ResponseRegistry:
         terminal = _json_clone(dict(envelope))
         messages = _json_clone(list(materialized_messages))
         now = self._clock()
+        self._prune(now)
         with self._lock:
-            self._prune_locked(now)
             inflight = self._in_flight.pop(response_id, None)
             if inflight is None:
                 stored = self._stored.get(response_id)
@@ -274,7 +317,7 @@ class ResponseRegistry:
             inflight.terminal_envelope = terminal
             inflight.done.set()
             tombstone = self._tombstones.get(response_id)
-            if tombstone is not None and tombstone.reason == "deleted":
+            if tombstone is not None:
                 return terminal
             if inflight.cancel_requested:
                 self._counters["cancel_settled_total"] += 1
@@ -299,8 +342,8 @@ class ResponseRegistry:
 
     def get(self, response_id: str) -> dict[str, Any]:
         now = self._clock()
+        self._prune(now)
         with self._lock:
-            self._prune_locked(now)
             stored = self._stored.get(response_id)
             if stored is not None:
                 stored.last_access_at = now
@@ -310,8 +353,8 @@ class ResponseRegistry:
 
     def parent_messages(self, response_id: str) -> list[dict[str, Any]]:
         now = self._clock()
+        self._prune(now)
         with self._lock:
-            self._prune_locked(now)
             stored = self._stored.get(response_id)
             if stored is not None:
                 stored.last_access_at = now
@@ -320,8 +363,8 @@ class ResponseRegistry:
         raise AssertionError("unreachable")
 
     def request_cancel(self, response_id: str) -> _InFlightResponse:
+        self._prune()
         with self._lock:
-            self._prune_locked()
             inflight = self._in_flight.get(response_id)
             if inflight is None:
                 stored = self._stored.get(response_id)
@@ -350,7 +393,10 @@ class ResponseRegistry:
             inflight.cancel_requested = True
             if first_request:
                 self._counters["cancel_requests_total"] += 1
-            cancel = inflight.cancel if first_request else None
+            cancel = None
+            if inflight.cancel is not None and not inflight.cancel_delivered:
+                inflight.cancel_delivered = True
+                cancel = inflight.cancel
         if cancel is not None:
             cancel()
         return inflight
@@ -366,8 +412,8 @@ class ResponseRegistry:
     def delete(self, response_id: str) -> dict[str, Any]:
         cancel: Callable[[], Any] | None = None
         now = self._clock()
+        self._prune(now)
         with self._lock:
-            self._prune_locked(now)
             tombstone = self._tombstones.get(response_id)
             if tombstone is not None and tombstone.reason == "deleted":
                 return self._deleted_payload(response_id)
@@ -377,21 +423,38 @@ class ResponseRegistry:
             inflight = self._in_flight.get(response_id)
             if inflight is not None and not inflight.cancel_requested:
                 inflight.cancel_requested = True
-                cancel = inflight.cancel
                 self._counters["cancel_requests_total"] += 1
+            if (
+                inflight is not None
+                and inflight.cancel is not None
+                and not inflight.cancel_delivered
+            ):
+                inflight.cancel_delivered = True
+                cancel = inflight.cancel
             if stored is None and inflight is None:
                 self._raise_lookup_locked(response_id)
-            self._add_tombstone_locked(response_id, "deleted", now)
+            self._add_tombstone_locked(
+                response_id,
+                "deleted",
+                now,
+                cancel_pending=bool(
+                    inflight is not None
+                    and inflight.cancel_requested
+                    and not inflight.cancel_delivered
+                ),
+            )
             self._counters["deleted_total"] += 1
         if cancel is not None:
             cancel()
         return self._deleted_payload(response_id)
 
     def is_in_flight(self, response_id: str) -> bool:
+        self._prune()
         with self._lock:
             return response_id in self._in_flight
 
     def terminal_for(self, response_id: str) -> dict[str, Any] | None:
+        self._prune()
         with self._lock:
             stored = self._stored.get(response_id)
             if stored is not None:
@@ -402,8 +465,8 @@ class ResponseRegistry:
             return None
 
     def stats(self) -> dict[str, Any]:
+        self._prune()
         with self._lock:
-            self._prune_locked()
             return {
                 "entries": len(self._stored),
                 "bytes": self._bytes,
@@ -415,17 +478,19 @@ class ResponseRegistry:
                 "max_bytes": self.max_bytes,
                 "max_entry_bytes": self.max_entry_bytes,
                 "idle_ttl_s": self.idle_ttl_s,
+                "in_flight_ttl_s": self.in_flight_ttl_s,
                 **self._counters,
             }
 
     def shutdown(self, timeout_s: float = 1.0) -> None:
         with self._lock:
             inflight = list(self._in_flight.values())
-            callbacks = [
-                item.cancel for item in inflight if not item.cancel_requested
-            ]
+            callbacks: list[Callable[[], Any]] = []
             for item in inflight:
                 item.cancel_requested = True
+                if item.cancel is not None and not item.cancel_delivered:
+                    item.cancel_delivered = True
+                    callbacks.append(item.cancel)
         for cancel in callbacks:
             try:
                 cancel()
@@ -470,8 +535,52 @@ class ResponseRegistry:
             param=param,
         )
 
-    def _prune_locked(self, now: float | None = None) -> None:
+    def _prune(self, now: float | None = None) -> None:
+        with self._lock:
+            callbacks = self._prune_locked(now)
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                pass
+
+    def _prune_locked(
+        self, now: float | None = None
+    ) -> list[Callable[[], Any]]:
         current = self._clock() if now is None else now
+        callbacks: list[Callable[[], Any]] = []
+        stale_in_flight = [
+            response_id
+            for response_id, inflight in self._in_flight.items()
+            if current - inflight.started_at >= self.in_flight_ttl_s
+        ]
+        for response_id in stale_in_flight:
+            inflight = self._in_flight.pop(response_id)
+            self._in_flight_bytes -= inflight.size_bytes
+            already_requested = inflight.cancel_requested
+            inflight.cancel_requested = True
+            if inflight.cancel is not None and not inflight.cancel_delivered:
+                inflight.cancel_delivered = True
+                callbacks.append(inflight.cancel)
+            inflight.terminal_envelope = {
+                "id": response_id,
+                "object": "response",
+                "status": "failed",
+                "error": {
+                    "code": "response_timeout",
+                    "message": "response exceeded the local in-flight lifetime",
+                },
+            }
+            inflight.done.set()
+            self._add_tombstone_locked(
+                response_id,
+                "timeout",
+                current,
+                cancel_pending=not inflight.cancel_delivered,
+            )
+            self._counters["timed_out_total"] += 1
+            if already_requested:
+                self._counters["cancel_settled_total"] += 1
         expired = [
             response_id
             for response_id, stored in self._stored.items()
@@ -490,6 +599,7 @@ class ResponseRegistry:
         ]
         for response_id in stale_tombstones:
             self._tombstones.pop(response_id, None)
+        return callbacks
 
     def _evict_pressure_locked(self, now: float) -> None:
         while len(self._stored) > self.max_entries or self._bytes > self.max_bytes:
@@ -499,10 +609,19 @@ class ResponseRegistry:
             self._counters["evicted_total"] += 1
 
     def _add_tombstone_locked(
-        self, response_id: str, reason: str, now: float
+        self,
+        response_id: str,
+        reason: str,
+        now: float,
+        *,
+        cancel_pending: bool = False,
     ) -> None:
         self._tombstones.pop(response_id, None)
-        self._tombstones[response_id] = _Tombstone(reason=reason, created_at=now)
+        self._tombstones[response_id] = _Tombstone(
+            reason=reason,
+            created_at=now,
+            cancel_pending=cancel_pending,
+        )
         while len(self._tombstones) > self.max_tombstones:
             self._tombstones.popitem(last=False)
 

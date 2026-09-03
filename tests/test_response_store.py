@@ -186,6 +186,129 @@ def test_registry_bounds_in_flight_count_and_lineage_bytes():
     assert too_large.value.status_code == 413
 
 
+def test_stale_in_flight_reclaims_capacity_and_replays_cancel_on_bind():
+    now = [100.0]
+    calls = Counter()
+    registry = ResponseRegistry(
+        max_in_flight=1,
+        in_flight_ttl_s=5,
+        idle_ttl_s=60,
+        clock=lambda: now[0],
+    )
+    registry.begin(
+        "resp_stale",
+        store=True,
+        materialized_messages=[{"role": "user", "content": "wait"}],
+    )
+    now[0] += 6
+
+    stats = registry.stats()
+    assert stats["in_flight"] == 0
+    assert stats["in_flight_bytes"] == 0
+    assert stats["timed_out_total"] == 1
+    with pytest.raises(ResponseStoreError) as timed_out:
+        registry.get("resp_stale")
+    assert timed_out.value.code == "response_timeout"
+
+    assert registry.bind_cancel(
+        "resp_stale", lambda: calls.update(cancel=1)
+    ) is True
+    assert registry.bind_cancel(
+        "resp_stale", lambda: calls.update(cancel=1)
+    ) is False
+    assert calls["cancel"] == 1
+
+    registry.begin(
+        "resp_reclaimed",
+        store=False,
+        materialized_messages=[],
+    )
+    assert registry.stats()["in_flight"] == 1
+
+
+def test_cancel_before_and_after_binding_deliver_once():
+    for response_id, bind_first in (
+        ("resp_cancel_before_bind", False),
+        ("resp_cancel_after_bind", True),
+    ):
+        calls = Counter()
+        registry = ResponseRegistry()
+        registry.begin(
+            response_id,
+            store=True,
+            materialized_messages=[],
+        )
+        if bind_first:
+            assert registry.bind_cancel(
+                response_id, lambda: calls.update(cancel=1)
+            )
+        inflight = registry.request_cancel(response_id)
+        if not bind_first:
+            assert calls["cancel"] == 0
+            assert registry.bind_cancel(
+                response_id, lambda: calls.update(cancel=1)
+            )
+        registry.request_cancel(response_id)
+        assert calls["cancel"] == 1
+        registry.commit(
+            response_id,
+            {
+                **_envelope(response_id),
+                "status": "cancelled",
+                "error": {
+                    "code": "request_cancelled",
+                    "message": "cancelled",
+                },
+            },
+            materialized_messages=[],
+        )
+        assert registry.wait_terminal(inflight, 0)["status"] == "cancelled"
+        assert registry.stats()["cancel_requests_total"] == 1
+        assert registry.stats()["cancel_settled_total"] == 1
+
+
+def test_cancel_bind_terminal_race_never_double_delivers_or_leaks():
+    for index in range(20):
+        response_id = f"resp_race_{index}"
+        calls = Counter()
+        registry = ResponseRegistry()
+        registry.begin(
+            response_id,
+            store=True,
+            materialized_messages=[],
+        )
+        barrier = threading.Barrier(3)
+
+        def bind() -> None:
+            barrier.wait()
+            registry.bind_cancel(response_id, lambda: calls.update(cancel=1))
+
+        def cancel() -> None:
+            barrier.wait()
+            try:
+                registry.request_cancel(response_id)
+            except ResponseStoreError as exc:
+                assert exc.code == "response_not_cancellable"
+
+        bind_thread = threading.Thread(target=bind)
+        cancel_thread = threading.Thread(target=cancel)
+        bind_thread.start()
+        cancel_thread.start()
+        barrier.wait()
+        registry.commit(
+            response_id,
+            _envelope(response_id),
+            materialized_messages=[],
+        )
+        bind_thread.join()
+        cancel_thread.join()
+
+        assert calls["cancel"] <= 1
+        assert registry.stats()["in_flight"] == 0
+        assert registry.stats()["in_flight_bytes"] == 0
+        assert registry.get(response_id)["status"] == "completed"
+
+
 def test_cancel_and_delete_races_settle_once_without_resurrection():
     calls = Counter()
     registry = ResponseRegistry()
@@ -302,7 +425,7 @@ def test_api_store_roundtrip_chain_and_health(monkeypatch):
 
 
 def _run_streaming_cancel_test(monkeypatch, *, with_client_hint: bool):
-    """Shared cancel proof: exactly one cancel transition through turn.cancel_driver()."""
+    """Shared proof: one cancel transition through the real worker event."""
     state = _fake_streaming_session_state()
     state.response_registry = ResponseRegistry()
     driver_started = threading.Event()
@@ -378,9 +501,88 @@ def test_cancel_without_client_hint_uses_turn_cancel_driver(monkeypatch):
     _run_streaming_cancel_test(monkeypatch, with_client_hint=False)
 
 
+def test_cancel_after_created_before_handle_bind_is_replayed(monkeypatch):
+    state = _fake_streaming_session_state()
+    state.response_registry = ResponseRegistry()
+    bind_entered = threading.Event()
+    allow_bind = threading.Event()
+    handle_deliveries = Counter()
+    worker_cancelled = Counter()
+    original_bind = state.response_registry.bind_cancel
+
+    def delayed_bind(response_id, cancel):
+        bind_entered.set()
+        assert allow_bind.wait(1.0)
+
+        def tracked_cancel():
+            handle_deliveries.update(cancel=1)
+            cancel()
+
+        return original_bind(response_id, tracked_cancel)
+
+    def generate(_state, _prompt_ids, **kwargs):
+        cancel_event = kwargs["cancel_event"]
+        while not cancel_event.wait(0.01):
+            pass
+        worker_cancelled.update(worker=1)
+        raise openai._StreamCancelled("cancelled_before_bind")
+
+    state.response_registry.bind_cancel = delayed_bind
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_a, **_kw: [1, 2, 3])
+    monkeypatch.setattr(openai, "_run_generation", generate)
+    monkeypatch.setattr(
+        state.response_registry,
+        "allocate_id",
+        lambda _preferred=None: "resp-deferred-bind",
+    )
+    client = TestClient(create_app(state))
+    stream_result: dict[str, object] = {}
+    cancel_result: dict[str, object] = {}
+
+    def consume_stream() -> None:
+        response = client.post(
+            "/v1/responses",
+            json={"input": "wait", "stream": True, "store": True},
+        )
+        stream_result["status"] = response.status_code
+
+    def cancel_response() -> None:
+        response = client.post("/v1/responses/resp-deferred-bind/cancel")
+        cancel_result["status"] = response.status_code
+        cancel_result["json"] = response.json()
+
+    stream_thread = threading.Thread(target=consume_stream)
+    stream_thread.start()
+    assert bind_entered.wait(1.0)
+    cancel_thread = threading.Thread(target=cancel_response)
+    cancel_thread.start()
+    deadline = time.monotonic() + 1.0
+    while (
+        state.response_registry.stats()["cancel_requests_total"] != 1
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.01)
+    assert state.response_registry.stats()["cancel_requests_total"] == 1
+    allow_bind.set()
+    stream_thread.join(timeout=2.0)
+    cancel_thread.join(timeout=2.0)
+    state.generation_executor.shutdown(wait=True)
+
+    assert not stream_thread.is_alive()
+    assert not cancel_thread.is_alive()
+    assert stream_result["status"] == 200
+    assert cancel_result["status"] == 200
+    assert cancel_result["json"]["status"] == "cancelled"
+    assert handle_deliveries["cancel"] == 1
+    assert worker_cancelled["worker"] <= 1
+    stats = state.response_registry.stats()
+    assert stats["in_flight"] == 0
+    assert stats["cancel_requests_total"] == 1
+    assert stats["cancel_settled_total"] == 1
+
+
 def test_cancel_uses_actual_turn_handle_not_phantom_dashboard_id(monkeypatch):
-    """Prove the cancel path goes through turn.cancel_driver(), not
-    dashboard.in_flight.cancel() with a regenerated chat ID."""
+    """Prove Responses never looks up a regenerated dashboard request ID."""
     state = _fake_streaming_session_state()
     state.response_registry = ResponseRegistry()
     driver_started = threading.Event()
@@ -433,6 +635,59 @@ def test_cancel_uses_actual_turn_handle_not_phantom_dashboard_id(monkeypatch):
         if call_id.startswith("chatcmpl-")
     ]
     assert phantom_calls == [], (
-        f"cancel_generation() called dashboard.in_flight.cancel() "
-        f"with phantom chatcmpl ID(s): {phantom_calls}"
+        "Responses cancellation looked up phantom chatcmpl ID(s): "
+        f"{phantom_calls}"
     )
+
+
+def test_nonstream_cancel_reaches_actual_worker_handle(monkeypatch):
+    state = _fake_streaming_session_state()
+    state.response_registry = ResponseRegistry()
+    driver_started = threading.Event()
+    cancel_transitions = Counter()
+
+    def generate(_state, _prompt_ids, **kwargs):
+        driver_started.set()
+        cancel_event = kwargs["cancel_event"]
+        while not cancel_event.wait(0.01):
+            pass
+        cancel_transitions.update(worker=1)
+        raise openai._StreamCancelled("cancelled_by_response_endpoint")
+
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_a, **_kw: [1, 2, 3])
+    monkeypatch.setattr(openai, "_run_generation", generate)
+    monkeypatch.setattr(
+        state.response_registry,
+        "allocate_id",
+        lambda _preferred=None: "resp-nonstream-cancel",
+    )
+    client = TestClient(create_app(state))
+    create_result: dict[str, object] = {}
+
+    def create_response() -> None:
+        response = client.post(
+            "/v1/responses",
+            json={"input": "wait", "store": True},
+        )
+        create_result["status"] = response.status_code
+        create_result["json"] = response.json()
+
+    thread = threading.Thread(target=create_response)
+    thread.start()
+    assert driver_started.wait(1.0)
+    cancelled = client.post("/v1/responses/resp-nonstream-cancel/cancel")
+    thread.join(timeout=2.0)
+    state.generation_executor.shutdown(wait=True)
+
+    assert not thread.is_alive()
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["status"] == "cancelled"
+    assert cancelled.json()["error"]["code"] == "request_cancelled"
+    assert create_result["status"] == 499
+    assert create_result["json"]["status"] == "cancelled"
+    assert cancel_transitions["worker"] == 1
+    stats = state.response_registry.stats()
+    assert stats["in_flight"] == 0
+    assert stats["in_flight_bytes"] == 0
+    assert stats["cancel_requests_total"] == 1
+    assert stats["cancel_settled_total"] == 1
