@@ -4,12 +4,11 @@ The taxonomy covers the temporal lifecycle of a single generation turn:
 TurnStarted, deltas (text, reasoning, tool-call), usage, and exactly one
 terminal event (completed, failed, or cancelled).
 
-Transition invariants:
+Transition invariants (enforced by GenerationTurn state machine):
   1. Exactly one TurnStarted, always first.
-  2. OutputItemStarted before deltas of a new output kind (optional;
-     encoders may infer boundaries from first-delta).
-  3. No deltas after the terminal event.
-  4. Exactly one terminal: TurnCompleted | TurnFailed | TurnCancelled.
+  2. Deltas only between start and terminal.
+  3. Exactly one terminal: TurnCompleted | TurnFailed | TurnCancelled.
+  4. Terminal closes the event stream — no separate finish required.
 """
 
 from __future__ import annotations
@@ -25,12 +24,6 @@ class TurnStarted:
     model: str
     created: int
     timestamp_s: float = field(default_factory=time.perf_counter)
-
-
-@dataclass(frozen=True)
-class OutputItemStarted:
-    item_type: str
-    output_index: int
 
 
 @dataclass(frozen=True)
@@ -74,9 +67,10 @@ class TurnCancelled:
     reason: str
 
 
+TerminalEvent = Union[TurnCompleted, TurnFailed, TurnCancelled]
+
 TurnEvent = Union[
     TurnStarted,
-    OutputItemStarted,
     TextDelta,
     ReasoningDelta,
     ToolCallDelta,
