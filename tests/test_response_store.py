@@ -301,16 +301,19 @@ def test_api_store_roundtrip_chain_and_health(monkeypatch):
     assert client.delete(f"/v1/responses/{first_payload['id']}").status_code == 200
 
 
-def test_cancel_endpoint_reaches_live_generation_turn(monkeypatch):
+def _run_streaming_cancel_test(monkeypatch, *, with_client_hint: bool):
+    """Shared cancel proof: exactly one cancel transition through turn.cancel_driver()."""
     state = _fake_streaming_session_state()
     state.response_registry = ResponseRegistry()
     driver_started = threading.Event()
+    cancel_transitions = Counter()
 
     def generate(_state, _prompt_ids, **kwargs):
         driver_started.set()
         cancel_event = kwargs["cancel_event"]
         while not cancel_event.wait(0.01):
             pass
+        cancel_transitions.update(worker=1)
         raise openai._StreamCancelled("cancelled_by_response_endpoint")
 
     monkeypatch.setattr(openai, "_encode_messages", lambda *_a, **_kw: [1, 2, 3])
@@ -322,15 +325,20 @@ def test_cancel_endpoint_reaches_live_generation_turn(monkeypatch):
     )
     client = TestClient(create_app(state))
     stream_result: dict[str, object] = {}
+    headers: dict[str, str] = {}
+    if with_client_hint:
+        headers["x-mtplx-request-id"] = "cancel-test"
 
     def consume_stream() -> None:
         response = client.post(
             "/v1/responses",
-            headers={"x-mtplx-request-id": "cancel-test"},
+            headers=headers,
             json={"input": "wait", "stream": True, "store": True},
         )
         stream_result["status"] = response.status_code
         stream_result["text"] = response.text
+
+    dashboard_before = state.dashboard.in_flight.count()
 
     thread = threading.Thread(target=consume_stream)
     thread.start()
@@ -347,5 +355,84 @@ def test_cancel_endpoint_reaches_live_generation_turn(monkeypatch):
     assert cancelled.json()["error"]["code"] == "request_cancelled"
     assert stream_result["status"] == 200
     assert '"type": "response.failed"' in str(stream_result["text"])
-    assert state.response_registry.stats()["in_flight"] == 0
-    assert client.get("/v1/responses/resp-cancel-test").json()["status"] == "cancelled"
+
+    stats = state.response_registry.stats()
+    assert stats["in_flight"] == 0
+    assert stats["cancel_requests_total"] == 1
+    assert stats["cancel_settled_total"] == 1
+    assert cancel_transitions["worker"] == 1
+
+    assert state.dashboard.in_flight.count() == dashboard_before
+
+    stored = client.get("/v1/responses/resp-cancel-test").json()
+    assert stored["status"] == "cancelled"
+
+    return state, client
+
+
+def test_cancel_endpoint_reaches_live_generation_turn(monkeypatch):
+    _run_streaming_cancel_test(monkeypatch, with_client_hint=True)
+
+
+def test_cancel_without_client_hint_uses_turn_cancel_driver(monkeypatch):
+    _run_streaming_cancel_test(monkeypatch, with_client_hint=False)
+
+
+def test_cancel_uses_actual_turn_handle_not_phantom_dashboard_id(monkeypatch):
+    """Prove the cancel path goes through turn.cancel_driver(), not
+    dashboard.in_flight.cancel() with a regenerated chat ID."""
+    state = _fake_streaming_session_state()
+    state.response_registry = ResponseRegistry()
+    driver_started = threading.Event()
+    dashboard_cancel_calls: list[str] = []
+    original_dashboard_cancel = state.dashboard.in_flight.cancel
+
+    def tracking_dashboard_cancel(request_id: str) -> bool:
+        dashboard_cancel_calls.append(request_id)
+        return original_dashboard_cancel(request_id)
+
+    state.dashboard.in_flight.cancel = tracking_dashboard_cancel
+
+    def generate(_state, _prompt_ids, **kwargs):
+        driver_started.set()
+        cancel_event = kwargs["cancel_event"]
+        while not cancel_event.wait(0.01):
+            pass
+        raise openai._StreamCancelled("cancelled")
+
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_a, **_kw: [1, 2, 3])
+    monkeypatch.setattr(openai, "_run_generation", generate)
+    monkeypatch.setattr(
+        state.response_registry,
+        "allocate_id",
+        lambda _preferred=None: "resp-phantom-test",
+    )
+    client = TestClient(create_app(state))
+    stream_result: dict[str, object] = {}
+
+    def consume_stream() -> None:
+        response = client.post(
+            "/v1/responses",
+            json={"input": "wait", "stream": True, "store": True},
+        )
+        stream_result["status"] = response.status_code
+        stream_result["text"] = response.text
+
+    thread = threading.Thread(target=consume_stream)
+    thread.start()
+    assert driver_started.wait(1.0)
+    cancelled = client.post("/v1/responses/resp-phantom-test/cancel")
+    thread.join(timeout=2.0)
+    state.generation_executor.shutdown(wait=True)
+
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
+
+    phantom_calls = [
+        call_id for call_id in dashboard_cancel_calls
+        if call_id.startswith("chatcmpl-")
+    ]
+    assert phantom_calls == [], (
+        f"cancel_generation() called dashboard.in_flight.cancel() "
+        f"with phantom chatcmpl ID(s): {phantom_calls}"
+    )
