@@ -9,6 +9,19 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from mtplx.server.core.events import (
+    OutputItemStarted,
+    ReasoningDelta,
+    TextDelta,
+    ToolCallDelta,
+    TurnCancelled,
+    TurnCompleted,
+    TurnEvent,
+    TurnFailed,
+    TurnStarted,
+    UsageUpdate,
+)
+
 from .schema import ResponsesRequest
 
 
@@ -402,6 +415,211 @@ async def responses_stream_from_chat_sse(
     finally:
         if hasattr(body_iterator, "aclose"):
             await body_iterator.aclose()
+
+    for output_index, (kind, key) in enumerate(state.output_order):
+        if kind == "reasoning" and state.reasoning_id is not None:
+            yield state.event(
+                "response.reasoning_text.done",
+                item_id=state.reasoning_id,
+                output_index=output_index,
+                content_index=0,
+                text=state.reasoning,
+            )
+            yield state.event(
+                "response.output_item.done",
+                output_index=output_index,
+                item=_reasoning_item(state.reasoning, item_id=state.reasoning_id),
+            )
+        elif kind == "text" and state.text_id is not None:
+            item = _message_item(state.text, item_id=state.text_id)
+            yield state.event(
+                "response.output_text.done",
+                item_id=state.text_id,
+                output_index=output_index,
+                content_index=0,
+                text=state.text,
+                logprobs=[],
+            )
+            yield state.event(
+                "response.content_part.done",
+                item_id=state.text_id,
+                output_index=output_index,
+                content_index=0,
+                part=item["content"][0],
+            )
+            yield state.event(
+                "response.output_item.done",
+                output_index=output_index,
+                item=item,
+            )
+        elif kind == "tool":
+            tool = state.tools[key]
+            item = _function_item(
+                {
+                    "id": tool["call_id"],
+                    "function": {
+                        "name": tool["name"],
+                        "arguments": tool["arguments"],
+                    },
+                },
+                item_id=tool["id"],
+            )
+            yield state.event(
+                "response.function_call_arguments.done",
+                item_id=tool["id"],
+                output_index=output_index,
+                name=tool["name"],
+                arguments=tool["arguments"],
+            )
+            yield state.event(
+                "response.output_item.done",
+                output_index=output_index,
+                item=item,
+            )
+    terminal_status = "incomplete" if state.finish_reason == "length" else "completed"
+    yield state.event(
+        "response.incomplete" if terminal_status == "incomplete" else "response.completed",
+        response=state.response(status=terminal_status),
+    )
+
+
+async def responses_stream_from_turn_events(
+    events: AsyncIterator[TurnEvent],
+    *,
+    request: ResponsesRequest,
+    response_id: str,
+    model: str,
+    created_at: int | None = None,
+) -> AsyncIterator[str]:
+    """Render Responses SSE directly from protocol-neutral TurnEvents."""
+
+    state = _StreamState(
+        response_id=response_id,
+        request=request,
+        model=model,
+        created_at=int(created_at or time.time()),
+    )
+    yield state.event("response.created", response=state.response(status="in_progress"))
+    yield state.event("response.in_progress", response=state.response(status="in_progress"))
+
+    async for ev in events:
+        if isinstance(ev, TurnStarted):
+            state.model = ev.model
+            continue
+
+        if isinstance(ev, ReasoningDelta):
+            if state.reasoning_id is None:
+                state.reasoning_id = _item_id("rs")
+                output_index = state.register_output("reasoning")
+                item = _reasoning_item("", item_id=state.reasoning_id, status="in_progress")
+                yield state.event(
+                    "response.output_item.added",
+                    output_index=output_index,
+                    item=item,
+                )
+            output_index = state.output_index("reasoning")
+            state.reasoning += ev.delta
+            yield state.event(
+                "response.reasoning_text.delta",
+                item_id=state.reasoning_id,
+                output_index=output_index,
+                content_index=0,
+                delta=ev.delta,
+            )
+            continue
+
+        if isinstance(ev, TextDelta):
+            if state.text_id is None:
+                state.text_id = _item_id("msg")
+                output_index = state.register_output("text")
+                item = _message_item("", item_id=state.text_id, status="in_progress")
+                yield state.event(
+                    "response.output_item.added",
+                    output_index=output_index,
+                    item=item,
+                )
+                yield state.event(
+                    "response.content_part.added",
+                    item_id=state.text_id,
+                    output_index=output_index,
+                    content_index=0,
+                    part=item["content"][0],
+                )
+            output_index = state.output_index("text")
+            state.text += ev.delta
+            yield state.event(
+                "response.output_text.delta",
+                item_id=state.text_id,
+                output_index=output_index,
+                content_index=0,
+                delta=ev.delta,
+                logprobs=[],
+            )
+            continue
+
+        if isinstance(ev, ToolCallDelta):
+            tool = state.tools.get(ev.index)
+            if tool is None:
+                tool = {
+                    "id": _item_id("fc"),
+                    "call_id": str(ev.call_id or _item_id("call")),
+                    "name": str(ev.name or ""),
+                    "arguments": "",
+                }
+                state.tools[ev.index] = tool
+                output_index = state.register_output("tool", ev.index)
+                yield state.event(
+                    "response.output_item.added",
+                    output_index=output_index,
+                    item=_function_item(
+                        {
+                            "id": tool["call_id"],
+                            "function": {"name": tool["name"], "arguments": ""},
+                        },
+                        item_id=tool["id"],
+                        status="in_progress",
+                    ),
+                )
+            if ev.name:
+                tool["name"] = str(ev.name)
+            output_index = state.output_index("tool", ev.index)
+            if ev.arguments_delta:
+                tool["arguments"] += ev.arguments_delta
+                yield state.event(
+                    "response.function_call_arguments.delta",
+                    item_id=tool["id"],
+                    output_index=output_index,
+                    delta=ev.arguments_delta,
+                )
+            continue
+
+        if isinstance(ev, UsageUpdate):
+            state.usage = _usage({
+                "prompt_tokens": ev.prompt_tokens,
+                "completion_tokens": ev.completion_tokens,
+            })
+            continue
+
+        if isinstance(ev, TurnCompleted):
+            state.finish_reason = ev.finish_reason
+            if ev.usage is not None:
+                state.usage = _usage({
+                    "prompt_tokens": ev.usage.prompt_tokens,
+                    "completion_tokens": ev.usage.completion_tokens,
+                })
+            break
+
+        if isinstance(ev, TurnFailed):
+            failed = state.response(status="failed", output_status="incomplete")
+            failed["error"] = {"code": ev.code or "server_error", "message": ev.error}
+            yield state.event("response.failed", response=failed)
+            return
+
+        if isinstance(ev, TurnCancelled):
+            failed = state.response(status="failed", output_status="incomplete")
+            failed["error"] = {"code": "request_cancelled", "message": ev.reason}
+            yield state.event("response.failed", response=failed)
+            return
 
     for output_index, (kind, key) in enumerate(state.output_order):
         if kind == "reasoning" and state.reasoning_id is not None:
