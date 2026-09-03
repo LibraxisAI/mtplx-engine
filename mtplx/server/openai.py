@@ -27035,6 +27035,7 @@ def create_app(state: ServerState) -> FastAPI:
         request: ChatCompletionRequest,
         *,
         return_turn: bool,
+        bind_cancel: Callable[[Callable[[], Any]], Any] | None = None,
     ) -> Any:
         if not request.messages:
             raise HTTPException(status_code=400, detail="messages must not be empty")
@@ -28112,6 +28113,8 @@ def create_app(state: ServerState) -> FastAPI:
                     prompt_tokens=len(prompt_ids),
                 )
                 state.dashboard.in_flight.register(in_flight_handle)
+                if bind_cancel is not None:
+                    bind_cancel(cancel_event.set)
                 _flight(state).begin(
                     response_id,
                     session_id=session_id,
@@ -30988,6 +30991,8 @@ def create_app(state: ServerState) -> FastAPI:
             prompt_tokens=len(prompt_ids),
         )
         state.dashboard.in_flight.register(nonstream_handle)
+        if bind_cancel is not None:
+            bind_cancel(nonstream_cancel_event.set)
         _flight(state).begin(
             response_id,
             session_id=session_id,
@@ -31329,19 +31334,12 @@ def create_app(state: ServerState) -> FastAPI:
             response_hint if request.store is not True else None
         )
         created_at = int(time.time())
-        turn_holder: dict[str, GenerationTurn] = {}
-
-        def cancel_generation() -> None:
-            turn = turn_holder.get("turn")
-            if turn is not None:
-                turn.cancel_driver()
 
         try:
             response_registry.begin(
                 response_id,
                 store=request.store is True,
                 materialized_messages=materialized_messages,
-                cancel=cancel_generation,
             )
         except ResponseStoreError as exc:
             return JSONResponse(exc.payload(), status_code=exc.status_code)
@@ -31356,14 +31354,19 @@ def create_app(state: ServerState) -> FastAPI:
                 ],
             )
 
-        def commit_bridge_failure(response: Any) -> None:
+        def commit_bridge_failure(response: Any) -> dict[str, Any]:
             message = "response generation failed"
+            code = "generation_error"
+            cancelled = False
             if isinstance(response, BaseException):
                 message = str(response) or type(response).__name__
             elif isinstance(response, JSONResponse):
                 try:
                     payload = json.loads(response.body)
                     error = payload.get("error") or payload.get("detail")
+                    if isinstance(error, dict):
+                        code = str(error.get("code") or code)
+                        cancelled = code == "request_cancelled"
                     message = (
                         str(error.get("message") or error)
                         if isinstance(error, dict)
@@ -31371,21 +31374,28 @@ def create_app(state: ServerState) -> FastAPI:
                     )
                 except Exception:
                     pass
-            commit_terminal(
-                response_failure_envelope(
-                    request=request,
-                    response_id=response_id,
-                    model=state.model_id,
-                    created_at=created_at,
-                    message=message,
-                    code="generation_error",
-                )
+            envelope = response_failure_envelope(
+                request=request,
+                response_id=response_id,
+                model=state.model_id,
+                created_at=created_at,
+                message=message,
+                code=code,
             )
+            if cancelled:
+                envelope["status"] = "cancelled"
+            commit_terminal(envelope)
+            return envelope
 
         if request.stream:
             try:
                 chat_response = await _chat_completions_impl(
-                    raw_request, chat_request, return_turn=True
+                    raw_request,
+                    chat_request,
+                    return_turn=True,
+                    bind_cancel=lambda cancel: response_registry.bind_cancel(
+                        response_id, cancel
+                    ),
                 )
             except BaseException as exc:
                 commit_bridge_failure(exc)
@@ -31393,8 +31403,6 @@ def create_app(state: ServerState) -> FastAPI:
             if not isinstance(chat_response, _GenerationTurnStream):
                 commit_bridge_failure(chat_response)
                 return chat_response
-            turn_holder["turn"] = chat_response.turn
-
             async def response_events() -> AsyncIterator[str]:
                 try:
                     async for frame in responses_stream_from_turn_events(
@@ -31428,7 +31436,14 @@ def create_app(state: ServerState) -> FastAPI:
                 },
             )
         try:
-            chat_response = await chat_completions(raw_request, chat_request)
+            chat_response = await _chat_completions_impl(
+                raw_request,
+                chat_request,
+                return_turn=False,
+                bind_cancel=lambda cancel: response_registry.bind_cancel(
+                    response_id, cancel
+                ),
+            )
         except BaseException as exc:
             commit_bridge_failure(exc)
             raise
@@ -31436,8 +31451,11 @@ def create_app(state: ServerState) -> FastAPI:
             commit_bridge_failure(chat_response)
             return chat_response
         if chat_response.status_code >= 400:
-            commit_bridge_failure(chat_response)
-            return chat_response
+            terminal = commit_bridge_failure(chat_response)
+            return JSONResponse(
+                terminal,
+                status_code=chat_response.status_code,
+            )
         try:
             chat_payload = json.loads(chat_response.body)
         except Exception as exc:
