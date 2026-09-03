@@ -5184,6 +5184,221 @@ async def _anthropic_stream_from_openai_sse(body_iterator: Any, *, model: str):
     yield _anthropic_sse("message_stop", {"type": "message_stop"})
 
 
+async def _anthropic_stream_from_turn_events(
+    events: AsyncIterator[Any], *, model: str
+) -> AsyncIterator[str]:
+    message_id = "msg_" + uuid.uuid4().hex
+    next_block_index = 0
+    active_text_index: int | None = None
+    active_thinking_index: int | None = None
+    opened_any_block = False
+    opened_tool_block = False
+    stop_reason = "end_turn"
+    usage = _anthropic_usage_from_openai_usage(None)
+    tool_blocks: dict[int, dict[str, Any]] = {}
+
+    yield _anthropic_sse(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": usage,
+            },
+        },
+    )
+
+    def start_content_block(index: int, block: dict[str, Any]) -> str:
+        return _anthropic_sse(
+            "content_block_start",
+            {"type": "content_block_start", "index": index, "content_block": block},
+        )
+
+    def stop_content_block(index: int) -> str:
+        return _anthropic_sse(
+            "content_block_stop", {"type": "content_block_stop", "index": index}
+        )
+
+    async for ev in events:
+        if isinstance(ev, TurnStarted):
+            continue
+
+        if isinstance(ev, ReasoningDelta):
+            if active_text_index is not None:
+                yield stop_content_block(active_text_index)
+                active_text_index = None
+            if active_thinking_index is None:
+                active_thinking_index = next_block_index
+                next_block_index += 1
+                opened_any_block = True
+                yield start_content_block(
+                    active_thinking_index,
+                    {"type": "thinking", "thinking": "", "signature": "mtplx-reasoning"},
+                )
+            yield _anthropic_sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": active_thinking_index,
+                    "delta": {"type": "thinking_delta", "thinking": ev.delta},
+                },
+            )
+            continue
+
+        if isinstance(ev, TextDelta):
+            if active_thinking_index is not None:
+                yield stop_content_block(active_thinking_index)
+                active_thinking_index = None
+            if active_text_index is None:
+                active_text_index = next_block_index
+                next_block_index += 1
+                opened_any_block = True
+                yield start_content_block(
+                    active_text_index, {"type": "text", "text": ""}
+                )
+            yield _anthropic_sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": active_text_index,
+                    "delta": {"type": "text_delta", "text": ev.delta},
+                },
+            )
+            continue
+
+        if isinstance(ev, ToolCallDelta):
+            if active_text_index is not None:
+                yield stop_content_block(active_text_index)
+                active_text_index = None
+            if active_thinking_index is not None:
+                yield stop_content_block(active_thinking_index)
+                active_thinking_index = None
+            tool = tool_blocks.get(ev.index)
+            if tool is None:
+                tool = {
+                    "id": ev.call_id,
+                    "name": ev.name,
+                    "block_index": None,
+                    "pending_arguments": "",
+                }
+                tool_blocks[ev.index] = tool
+            if ev.call_id:
+                tool["id"] = ev.call_id
+            if ev.name:
+                tool["name"] = ev.name
+            if tool["block_index"] is None:
+                if not tool.get("name"):
+                    tool["pending_arguments"] += ev.arguments_delta
+                    continue
+                tool["block_index"] = next_block_index
+                next_block_index += 1
+                opened_any_block = True
+                opened_tool_block = True
+                yield start_content_block(
+                    int(tool["block_index"]),
+                    {
+                        "type": "tool_use",
+                        "id": tool.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                        "name": tool["name"],
+                        "input": {},
+                    },
+                )
+                pending = str(tool.get("pending_arguments") or "")
+                if pending:
+                    yield _anthropic_sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": tool["block_index"],
+                            "delta": {"type": "input_json_delta", "partial_json": pending},
+                        },
+                    )
+                    tool["pending_arguments"] = ""
+            if ev.arguments_delta:
+                yield _anthropic_sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": tool["block_index"],
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": ev.arguments_delta,
+                        },
+                    },
+                )
+            continue
+
+        if isinstance(ev, UsageUpdate):
+            usage = _anthropic_usage_from_openai_usage(
+                {"prompt_tokens": ev.prompt_tokens, "completion_tokens": ev.completion_tokens}
+            )
+            continue
+
+        if isinstance(ev, TurnCompleted):
+            if ev.usage is not None:
+                usage = _anthropic_usage_from_openai_usage(
+                    {
+                        "prompt_tokens": ev.usage.prompt_tokens,
+                        "completion_tokens": ev.usage.completion_tokens,
+                    }
+                )
+            stop_reason = _anthropic_stop_reason(
+                ev.finish_reason, has_tool_calls=opened_tool_block
+            )
+            break
+
+        if isinstance(ev, TurnFailed):
+            yield _anthropic_sse(
+                "error",
+                {
+                    "type": "error",
+                    "error": {
+                        "type": ev.code or "api_error",
+                        "message": ev.error,
+                    },
+                },
+            )
+            return
+
+        if isinstance(ev, TurnCancelled):
+            yield _anthropic_sse(
+                "error",
+                {
+                    "type": "error",
+                    "error": {"type": "api_error", "message": ev.reason},
+                },
+            )
+            return
+
+    if active_text_index is not None:
+        yield stop_content_block(active_text_index)
+    if active_thinking_index is not None:
+        yield stop_content_block(active_thinking_index)
+    for tool_state in tool_blocks.values():
+        block_index = tool_state.get("block_index")
+        if block_index is not None:
+            yield stop_content_block(int(block_index))
+    if not opened_any_block:
+        empty_index = next_block_index
+        yield start_content_block(empty_index, {"type": "text", "text": ""})
+        yield stop_content_block(empty_index)
+    yield _anthropic_sse(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+            "usage": dict(usage),
+        },
+    )
+    yield _anthropic_sse("message_stop", {"type": "message_stop"})
+
+
 def _strip_stats_footer(text: str) -> str:
     marker_index = text.rfind(STATS_FOOTER_MARKER)
     if marker_index < 0:
@@ -29509,7 +29724,7 @@ def create_app(state: ServerState) -> FastAPI:
                     ],
                 }
                 yield mark_sse_sent(f"data: {json.dumps(first)}\n\n")
-                _generation_turn.emit(TurnStarted(
+                _generation_turn.start(TurnStarted(
                     response_id=response_id,
                     model=model,
                     created=created,
@@ -31569,11 +31784,10 @@ def create_app(state: ServerState) -> FastAPI:
                                                 )
                                             )
                                         )
-                                        _generation_turn.emit(TurnFailed(
+                                        _generation_turn.fail(TurnFailed(
                                             error="malformed tool_call: unterminated stream",
                                             code="tool_parse_error",
                                         ))
-                                        _generation_turn.finish()
                                         yield mark_sse_sent("data: [DONE]\n\n")
                                         return
                             else:
@@ -32339,8 +32553,7 @@ def create_app(state: ServerState) -> FastAPI:
                         elif kind == "error":
                             if isinstance(item, BaseException):
                                 stream_error_item = item
-                            _generation_turn.emit(TurnFailed(error=str(item)))
-                            _generation_turn.finish()
+                            _generation_turn.fail(TurnFailed(error=str(item)))
                             yield mark_sse_sent(error_chunk(item))
                             yield mark_sse_sent("data: [DONE]\n\n")
                             return
@@ -32419,10 +32632,9 @@ def create_app(state: ServerState) -> FastAPI:
                                     state, generated["stats"]
                                 )
                                 break
-                            _generation_turn.emit(TurnCancelled(
+                            _generation_turn.cancel(TurnCancelled(
                                 reason=str(item),
                             ))
-                            _generation_turn.finish()
                             if await raw_request.is_disconnected():
                                 stream_cancelled_by_client = True
                             else:
@@ -32439,10 +32651,9 @@ def create_app(state: ServerState) -> FastAPI:
                                 yield mark_sse_sent("data: [DONE]\n\n")
                             return
                         else:
-                            _generation_turn.emit(TurnFailed(
+                            _generation_turn.fail(TurnFailed(
                                 error=f"unexpected stream event: {kind}",
                             ))
-                            _generation_turn.finish()
                             yield mark_sse_sent(
                                 error_chunk(
                                     RuntimeError(f"unexpected stream event: {kind}")
@@ -32460,13 +32671,15 @@ def create_app(state: ServerState) -> FastAPI:
                     stream_cancelled_by_client = True
                     raise
                 except BaseException as exc:
-                    _generation_turn.emit(TurnFailed(error=str(exc)))
-                    _generation_turn.finish()
+                    _generation_turn.fail(TurnFailed(error=str(exc)))
                     yield mark_sse_sent(error_chunk(exc))
                     yield mark_sse_sent("data: [DONE]\n\n")
                     return
                 finally:
-                    _generation_turn.finish()
+                    if stream_cancelled_by_client:
+                        _generation_turn.cancel(
+                            TurnCancelled(reason="client_disconnected")
+                        )
                     nonlocal_cancel_reason = (
                         "client_disconnected"
                         if stream_cancelled_by_client
@@ -32536,10 +32749,9 @@ def create_app(state: ServerState) -> FastAPI:
                     state.dashboard.progress_events.forget(response_id)
 
                 if generated is None:
-                    _generation_turn.emit(TurnFailed(
+                    _generation_turn.fail(TurnFailed(
                         error="generation ended without a result",
                     ))
-                    _generation_turn.finish()
                     yield mark_sse_sent(
                         error_chunk(RuntimeError("generation ended without a result"))
                     )
@@ -32551,7 +32763,7 @@ def create_app(state: ServerState) -> FastAPI:
                 _merge_final_bridge_stats_into_latest_metrics(
                     state, {"finish_reason": finish_reason}
                 )
-                _generation_turn.emit(TurnCompleted(
+                _generation_turn.complete(TurnCompleted(
                     finish_reason=finish_reason,
                     usage=UsageUpdate(
                         prompt_tokens=int(generated.get("prompt_tokens") or 0),
@@ -32560,7 +32772,6 @@ def create_app(state: ServerState) -> FastAPI:
                         ),
                     ),
                 ))
-                _generation_turn.finish()
                 done = {
                     "id": response_id,
                     "object": "chat.completion.chunk",
@@ -32954,16 +33165,17 @@ def create_app(state: ServerState) -> FastAPI:
                 return chat_response
             turn = getattr(chat_response, "_generation_turn", None)
             if turn is not None:
+                subscriber = turn.subscribe()
 
                 async def _drive_and_render():
-                    async def _drain() -> None:
+                    async def _drive_generation() -> None:
                         async for _ in chat_response.body_iterator:
                             pass
 
-                    driver = asyncio.ensure_future(_drain())
+                    driver = asyncio.ensure_future(_drive_generation())
                     try:
                         async for chunk in responses_stream_from_turn_events(
-                            turn,
+                            subscriber,
                             request=request,
                             response_id=response_id,
                             model=state.model_id,
@@ -33057,6 +33269,33 @@ def create_app(state: ServerState) -> FastAPI:
         if request.stream:
             if not isinstance(response, StreamingResponse):
                 return response
+            turn = getattr(response, "_generation_turn", None)
+            if turn is not None:
+                subscriber = turn.subscribe()
+
+                async def _drive_and_render_anthropic():
+                    async def _drive_generation() -> None:
+                        async for _ in response.body_iterator:
+                            pass
+
+                    driver = asyncio.ensure_future(_drive_generation())
+                    try:
+                        async for chunk in _anthropic_stream_from_turn_events(
+                            subscriber, model=state.model_id,
+                        ):
+                            yield chunk
+                    finally:
+                        if not driver.done():
+                            driver.cancel()
+                        try:
+                            await driver
+                        except (asyncio.CancelledError, Exception):
+                            pass
+
+                return StreamingResponse(
+                    _drive_and_render_anthropic(),
+                    media_type="text/event-stream",
+                )
             return StreamingResponse(
                 _anthropic_stream_from_openai_sse(
                     response.body_iterator,
