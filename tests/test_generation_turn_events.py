@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
@@ -689,3 +690,123 @@ class TestThreeProtocolsShareLifecycle:
         ]
         assert any("event: error" in frame for frame in frames)
         assert not any("event: message_stop" in frame for frame in frames)
+
+
+class TestW1dCommonDriverArchitecture:
+    """The common producer is event-typed and no protocol drives another."""
+
+    def test_forbidden_protocol_driver_shapes_are_absent(self) -> None:
+        source = inspect.getsource(openai)
+        assert "_TurnEventStreamResponse" not in source
+        assert "_mtplx_stream_projection" not in source
+        assert "Callable[[], AsyncIterator[str]]" not in source
+        stream_source = inspect.getsource(openai._GenerationTurnStream)
+        assert "async for _ in" not in stream_source
+        assert "body_iterator" not in stream_source
+
+    def test_all_streaming_routes_select_the_common_turn(self) -> None:
+        source = inspect.getsource(openai.create_app)
+        responses = source[source.index('@app.post("/v1/responses")'):]
+        anthropic = source[source.index('@app.post("/v1/messages")'):]
+        assert "_chat_stream_from_turn_events(turn_stream.events())" in source
+        assert "responses_stream_from_turn_events(" in responses
+        assert "_anthropic_stream_from_turn_events(" in anthropic
+        assert responses.count("return_turn=True") >= 2
+
+    def test_all_renderer_inputs_are_turn_event_iterators(self) -> None:
+        for renderer in (
+            openai._chat_stream_from_turn_events,
+            responses_stream_from_turn_events,
+            openai._anthropic_stream_from_turn_events,
+        ):
+            annotation = inspect.signature(renderer).parameters["events"].annotation
+            assert "AsyncIterator[TurnEvent]" in str(annotation)
+
+    def test_live_driver_emits_complete_claimed_taxonomy(self) -> None:
+        source = inspect.getsource(openai.create_app)
+        driver = source[source.index("async def drive_turn()"):]
+        driver = driver[:driver.index("turn_stream = _GenerationTurnStream")]
+        for event_type in (
+            "TurnStarted",
+            "OutputItemStarted",
+            "TextDelta",
+            "ReasoningDelta",
+            "ToolCallDelta",
+            "TurnHeartbeat",
+            "UsageUpdate",
+            "TurnCompleted",
+            "TurnFailed",
+            "TurnCancelled",
+        ):
+            assert event_type in driver
+
+    @pytest.mark.anyio
+    async def test_chat_renderer_consumes_synthetic_turn_events(self) -> None:
+        async def synthetic() -> AsyncIterator[TurnEvent]:
+            yield TurnStarted(response_id="chatcmpl-test", model="m", created=1)
+            yield ReasoningDelta(delta="think")
+            yield TextDelta(delta="answer")
+            yield ToolCallDelta(
+                index=0,
+                call_id="call_1",
+                name="lookup",
+                arguments_delta="{}",
+            )
+            yield TurnCompleted(
+                finish_reason="tool_calls",
+                usage=UsageUpdate(prompt_tokens=2, completion_tokens=3),
+                mtplx_stats={"finish_reason": "tool_calls"},
+                timings={"generation_time": 0.1},
+            )
+
+        frames = [
+            frame async for frame in openai._chat_stream_from_turn_events(synthetic())
+        ]
+        payloads = [
+            json.loads(frame.removeprefix("data: "))
+            for frame in frames
+            if frame.startswith("data: {")
+        ]
+        assert payloads[0]["choices"][0]["delta"] == {"role": "assistant"}
+        assert any(
+            payload["choices"][0]["delta"].get("content") == "answer"
+            for payload in payloads
+        )
+        assert payloads[-1]["choices"][0]["finish_reason"] == "tool_calls"
+        assert frames[-1] == "data: [DONE]\n\n"
+
+    @pytest.mark.anyio
+    async def test_renderer_exit_cancels_common_driver(self) -> None:
+        turn = GenerationTurn()
+        cancelled = asyncio.Event()
+
+        async def drive() -> None:
+            turn.start(TurnStarted(response_id="r", model="m", created=1))
+            try:
+                while True:
+                    await asyncio.sleep(1)
+            finally:
+                cancelled.set()
+
+        stream = openai._GenerationTurnStream(turn, drive)
+        events = stream.events()
+        assert isinstance(await events.__anext__(), TurnStarted)
+        task = turn.driver_task
+        assert task is not None and not task.done()
+        await events.aclose()
+        await asyncio.wait_for(cancelled.wait(), timeout=1)
+        assert task.done()
+
+    @pytest.mark.anyio
+    async def test_driver_eof_becomes_explicit_failure(self) -> None:
+        turn = GenerationTurn()
+
+        async def drive() -> None:
+            turn.start(TurnStarted(response_id="r", model="m", created=1))
+
+        events = [
+            event
+            async for event in openai._GenerationTurnStream(turn, drive).events()
+        ]
+        assert isinstance(events[-1], TurnFailed)
+        assert events[-1].code == "driver_eof_without_terminal"

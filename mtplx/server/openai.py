@@ -45,7 +45,7 @@ from enum import Enum
 from pathlib import Path
 from queue import Empty
 from threading import Condition, Event, Lock, Thread, Timer
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -132,6 +132,7 @@ from mtplx.server.core import (
     ToolCallDelta,
     TurnCancelled,
     TurnCompleted,
+    TurnEvent,
     TurnFailed,
     TurnHeartbeat,
     TurnStarted,
@@ -637,43 +638,186 @@ async def _monitor_request_disconnect(
     return False
 
 
-class _TurnEventStreamResponse:
-    """Internal streaming turn handle for non-Chat protocol projections."""
+class _GenerationTurnStream:
+    """One protocol-neutral driver observed by exactly one wire renderer."""
 
     def __init__(
         self,
         turn: GenerationTurn,
-        driver_factory: Callable[[], AsyncIterator[str]],
+        driver_factory: Callable[[], Awaitable[None]],
     ) -> None:
         self.turn = turn
         self._driver_factory = driver_factory
 
-    async def events(self) -> AsyncIterator[Any]:
+    async def events(self) -> AsyncIterator[TurnEvent]:
         subscriber = self.turn.subscribe()
         driver = self._driver_factory()
-        drain = getattr(subscriber, "drain_nowait", None)
-        try:
-            async for _ in driver:
-                if drain is not None:
-                    for event in drain():
-                        yield event
-            if getattr(getattr(self.turn, "state", None), "value", None) != "terminal":
-                with suppress(RuntimeError):
-                    self.turn.fail(
-                        TurnFailed(
-                            error="generation driver ended without a terminal event",
-                            code="driver_eof_without_terminal",
+        driver_task = asyncio.create_task(driver)
+        self.turn.attach_driver(driver_task)
+
+        def close_unterminated_driver(task: asyncio.Task[None]) -> None:
+            if getattr(getattr(self.turn, "state", None), "value", None) == "terminal":
+                return
+            if task.cancelled():
+                terminal: TurnEvent = TurnCancelled(reason="generation_driver_cancelled")
+            else:
+                exception = task.exception()
+                terminal = TurnFailed(
+                    error=(
+                        str(exception)
+                        if exception is not None
+                        else "generation driver ended without a terminal event"
+                    ),
+                    code=(
+                        "generation_driver_error"
+                        if exception is not None
+                        else "driver_eof_without_terminal"
+                    ),
+                )
+            with suppress(RuntimeError):
+                if isinstance(terminal, TurnCancelled):
+                    if getattr(self.turn.state, "value", None) == "idle":
+                        self.turn.fail(
+                            TurnFailed(
+                                error=terminal.reason,
+                                code="generation_driver_cancelled",
+                            )
                         )
-                    )
-            if drain is not None:
-                for event in drain():
-                    yield event
+                    else:
+                        self.turn.cancel(terminal)
+                else:
+                    self.turn.fail(terminal)
+
+        driver_task.add_done_callback(close_unterminated_driver)
+        try:
             async for event in subscriber:
                 yield event
         finally:
-            if hasattr(driver, "aclose"):
-                with suppress(Exception):
-                    await driver.aclose()
+            if getattr(getattr(self.turn, "state", None), "value", None) != "terminal":
+                with suppress(RuntimeError):
+                    self.turn.cancel(TurnCancelled(reason="renderer_disconnected"))
+            self.turn.cancel_driver()
+            with suppress(asyncio.CancelledError):
+                await driver_task
+
+
+async def _chat_stream_from_turn_events(
+    events: AsyncIterator[TurnEvent],
+) -> AsyncIterator[str]:
+    """Project the common turn lifecycle onto Chat Completions SSE."""
+
+    started: TurnStarted | None = None
+    terminal_seen = False
+
+    def payload(delta: dict[str, Any], *, finish_reason: str | None = None) -> dict[str, Any]:
+        if started is None:
+            raise RuntimeError("turn delta arrived before TurnStarted")
+        return {
+            "id": started.response_id,
+            "object": "chat.completion.chunk",
+            "created": started.created,
+            "model": started.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": finish_reason,
+                }
+            ],
+        }
+
+    async for event in events:
+        if isinstance(event, TurnStarted):
+            if started is not None:
+                raise RuntimeError("duplicate TurnStarted")
+            started = event
+            yield f"data: {json.dumps(payload({'role': 'assistant'}))}\n\n"
+            continue
+        if isinstance(event, OutputItemStarted):
+            continue
+        if isinstance(event, TurnHeartbeat):
+            heartbeat = payload({})
+            heartbeat["mtplx_progress"] = _json_safe(event.payload or {})
+            yield f"data: {json.dumps(heartbeat)}\n\n"
+            continue
+        if isinstance(event, ReasoningDelta):
+            yield f"data: {json.dumps(payload({'reasoning_content': event.delta}))}\n\n"
+            continue
+        if isinstance(event, TextDelta):
+            yield f"data: {json.dumps(payload({'content': event.delta}))}\n\n"
+            continue
+        if isinstance(event, ToolCallDelta):
+            function: dict[str, Any] = {}
+            if event.name is not None:
+                function["name"] = event.name
+                function["arguments"] = event.arguments_delta
+            elif event.arguments_delta:
+                function["arguments"] = event.arguments_delta
+            tool_call: dict[str, Any] = {
+                "index": event.index,
+                "type": "function",
+                "function": function,
+            }
+            if event.call_id is not None:
+                tool_call["id"] = event.call_id
+            yield f"data: {json.dumps(payload({'tool_calls': [tool_call]}))}\n\n"
+            continue
+        if isinstance(event, UsageUpdate):
+            continue
+        if isinstance(event, TurnCompleted):
+            terminal_seen = True
+            completed = payload({}, finish_reason=event.finish_reason)
+            usage = event.usage
+            completed["usage"] = {
+                "prompt_tokens": int(usage.prompt_tokens if usage else 0),
+                "completion_tokens": int(usage.completion_tokens if usage else 0),
+                "total_tokens": int(
+                    (usage.prompt_tokens + usage.completion_tokens) if usage else 0
+                ),
+            }
+            completed["mtplx_stats"] = event.mtplx_stats or {}
+            completed["timings"] = event.timings or {}
+            yield f"data: {json.dumps(completed)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+        if isinstance(event, TurnFailed):
+            terminal_seen = True
+            failed = payload({}, finish_reason="error")
+            failed.update(
+                _openai_error_content(
+                    event.error,
+                    status_code=event.status_code,
+                    code=event.code or "server_error",
+                )
+            )
+            yield f"data: {json.dumps(failed)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+        if isinstance(event, TurnCancelled):
+            terminal_seen = True
+            cancelled = payload({}, finish_reason="error")
+            cancelled.update(
+                _openai_error_content(
+                    event.reason,
+                    status_code=499,
+                    code="request_cancelled",
+                )
+            )
+            yield f"data: {json.dumps(cancelled)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+    if not terminal_seen and started is not None:
+        failed = payload({}, finish_reason="error")
+        failed.update(
+            _openai_error_content(
+                "generation event stream ended without a terminal event",
+                status_code=500,
+                code="driver_eof_without_terminal",
+            )
+        )
+        yield f"data: {json.dumps(failed)}\n\n"
+        yield "data: [DONE]\n\n"
 
 
 def _comma_floats(value: str) -> tuple[float, ...]:
@@ -4637,7 +4781,7 @@ async def _anthropic_stream_from_openai_sse(body_iterator: Any, *, model: str):
 
 
 async def _anthropic_stream_from_turn_events(
-    events: AsyncIterator[Any], *, model: str
+    events: AsyncIterator[TurnEvent], *, model: str
 ) -> AsyncIterator[str]:
     message_id = "msg_" + uuid.uuid4().hex
     next_block_index = 0
@@ -26874,9 +27018,11 @@ def create_app(state: ServerState) -> FastAPI:
             "usage": {"total_tokens": prompt_tokens},
         }
 
-    @app.post("/v1/chat/completions")
-    async def chat_completions(
-        raw_request: Request, request: ChatCompletionRequest
+    async def _chat_completions_impl(
+        raw_request: Request,
+        request: ChatCompletionRequest,
+        *,
+        return_turn: bool,
     ) -> Any:
         if not request.messages:
             raise HTTPException(status_code=400, detail="messages must not be empty")
@@ -27919,46 +28065,17 @@ def create_app(state: ServerState) -> FastAPI:
         if request.stream:
             _generation_turn = GenerationTurn()
 
-            async def event_stream():
+            async def drive_turn():
                 stream_started_s = time.perf_counter()
-                last_sse_sent_s = stream_started_s
+                last_event_sent_s = stream_started_s
                 last_token_s: float | None = None
-                # Enqueue stamp of the token item currently being drained
-                # (generation-thread perf_counter). The census subtracts it
-                # to expose queue residency — the direct starvation receipt.
-                latest_token_enqueue_s: float | None = None
                 next_silence_warn_s = stream_started_s + STREAM_SILENCE_WARN_S
                 owner_stall_probe = _OwnerStallProbe(deadline_s=STREAM_STALL_DEADLINE_S)
 
-                def mark_sse_sent(chunk: str) -> str:
-                    nonlocal last_sse_sent_s
-                    last_sse_sent_s = time.perf_counter()
-                    if _STREAM_CENSUS_DIR is not None:
-                        _stream_census_record(
-                            response_id,
-                            chunk,
-                            queue_age_ms=(
-                                (last_sse_sent_s - latest_token_enqueue_s) * 1000
-                                if latest_token_enqueue_s is not None
-                                else None
-                            ),
-                        )
-                    return chunk
+                def mark_stream_activity(_event: object = None) -> None:
+                    nonlocal last_event_sent_s
+                    last_event_sent_s = time.perf_counter()
 
-                first = {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"role": "assistant"},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
-                yield mark_sse_sent(f"data: {json.dumps(first)}\n\n")
                 _generation_turn.start(TurnStarted(
                     response_id=response_id,
                     model=model,
@@ -29149,75 +29266,36 @@ def create_app(state: ServerState) -> FastAPI:
                     daemon=True,
                 ).start()
 
-                # The envelope around each delta is constant for the whole
-                # stream; serialize it once instead of rebuilding and
-                # re-serializing the full payload dict per token chunk.
-                # Byte-identical to json.dumps of the equivalent dict
-                # (default separators and key order).
-                _delta_envelope_prefix = (
-                    'data: {"id": '
-                    + json.dumps(response_id)
-                    + ', "object": "chat.completion.chunk", "created": '
-                    + json.dumps(created)
-                    + ', "model": '
-                    + json.dumps(model)
-                    + ', "choices": [{"index": 0, "delta": '
-                )
-                _delta_envelope_suffix = ', "finish_reason": null}]}\n\n'
+                # Helpers return semantic deltas only. Wire serialization is
+                # owned exclusively by the selected protocol renderer.
+                def delta_payload_chunk(delta: dict[str, Any]) -> dict[str, Any]:
+                    return delta
 
-                def delta_payload_chunk(delta: dict[str, Any]) -> str:
-                    return (
-                        _delta_envelope_prefix
-                        + json.dumps(delta)
-                        + _delta_envelope_suffix
-                    )
-
-                def delta_chunk(field: str, text: str) -> str:
+                def delta_chunk(field: str, text: str) -> dict[str, Any]:
                     return delta_payload_chunk({field: text})
 
-                def progress_chunk(progress: dict[str, Any]) -> str:
+                def progress_chunk(progress: dict[str, Any]) -> dict[str, Any]:
                     with suppress(RuntimeError):
                         _generation_turn.emit(
                             TurnHeartbeat(payload=_json_safe(progress))
                         )
-                    payload = {
-                        "id": response_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": None,
-                            }
-                        ],
-                        "mtplx_progress": _json_safe(progress),
-                    }
-                    return f"data: {json.dumps(payload)}\n\n"
+                    return progress
 
-                def error_chunk(exc: BaseException) -> str:
+                def error_chunk(exc: BaseException) -> None:
                     if isinstance(exc, HTTPException):
                         message = str(exc.detail)
                         status_code = exc.status_code
                     else:
                         message = str(exc)
                         status_code = 500
-                    payload = {
-                        "id": response_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [
-                            {"index": 0, "delta": {}, "finish_reason": "error"}
-                        ],
-                        **_openai_error_content(
-                            message,
-                            status_code=status_code,
-                            code=type(exc).__name__,
-                        ),
-                    }
-                    return f"data: {json.dumps(payload)}\n\n"
+                    with suppress(RuntimeError):
+                        _generation_turn.fail(
+                            TurnFailed(
+                                error=message,
+                                code=type(exc).__name__,
+                                status_code=int(status_code),
+                            )
+                        )
 
                 def maybe_log_stream_silence(now_s: float) -> None:
                     nonlocal next_silence_warn_s
@@ -29380,7 +29458,7 @@ def create_app(state: ServerState) -> FastAPI:
                     use_orphan_guard: bool = True,
                     use_tool_translator: bool = True,
                     monitor_stop: bool = True,
-                ) -> list[str]:
+                ) -> list[dict[str, Any]]:
                     nonlocal streamed_assistant_tool_calls
                     nonlocal streamed_tool_deltas_emitted
                     nonlocal early_tool_cancel_used
@@ -29412,7 +29490,7 @@ def create_app(state: ServerState) -> FastAPI:
                     ):
                         if early_tool_cancel_used and streamed_assistant_tool_calls:
                             return []
-                        chunks: list[str] = []
+                        chunks: list[dict[str, Any]] = []
                         for delta in content_tool_translator.feed(field, text):
                             if not delta:
                                 continue
@@ -29500,11 +29578,11 @@ def create_app(state: ServerState) -> FastAPI:
                     remember_stream_delta(delta)
                     return [delta_payload_chunk(delta)]
 
-                def finish_orphan_stream_guards() -> list[str]:
+                def finish_orphan_stream_guards() -> list[dict[str, Any]]:
                     nonlocal stream_orphan_tool_markup_suppressed
                     if not orphan_stream_guard_enabled:
                         return []
-                    chunks: list[str] = []
+                    chunks: list[dict[str, Any]] = []
                     for field, guard in (
                         ("reasoning_content", orphan_reasoning_stream_guard),
                         ("content", orphan_content_stream_guard),
@@ -29544,11 +29622,11 @@ def create_app(state: ServerState) -> FastAPI:
                     text: str,
                     *,
                     force: bool = False,
-                ) -> list[str]:
+                ) -> list[dict[str, Any]]:
                     nonlocal read_only_force_answer_stream_buffer
                     nonlocal read_only_force_answer_stream_started
                     nonlocal read_only_force_answer_stream_marker_stripped_chars
-                    chunks: list[str] = []
+                    chunks: list[dict[str, Any]] = []
                     emit_text = ""
                     if read_only_force_answer_stream_started:
                         emit_text = text
@@ -29592,14 +29670,16 @@ def create_app(state: ServerState) -> FastAPI:
                         )
                     return chunks
 
-                def emit_read_only_force_answer_visible_text(text: str) -> list[str]:
+                def emit_read_only_force_answer_visible_text(
+                    text: str,
+                ) -> list[dict[str, Any]]:
                     nonlocal read_only_force_answer_stream_buffer
                     nonlocal read_only_force_answer_stream_started
                     if not text:
                         return []
                     read_only_force_answer_stream_buffer = ""
                     read_only_force_answer_stream_started = True
-                    chunks: list[str] = []
+                    chunks: list[dict[str, Any]] = []
                     for part in read_only_force_answer_text_slices(text):
                         chunks.extend(
                             stream_content_delta_chunks(
@@ -29614,10 +29694,10 @@ def create_app(state: ServerState) -> FastAPI:
                 def finish_translated_stream_chunks(
                     *,
                     defer_content_resolution: bool = False,
-                ) -> list[str]:
+                ) -> list[dict[str, Any]]:
                     nonlocal streamed_assistant_tool_calls
                     nonlocal streamed_tool_deltas_emitted
-                    chunks: list[str] = []
+                    chunks: list[dict[str, Any]] = []
                     if early_tool_cancel_used and streamed_assistant_tool_calls:
                         return chunks
                     if content_tool_translator is not None:
@@ -29634,6 +29714,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     content_tool_translator.tool_calls
                                     or streamed_assistant_tool_calls
                                 )
+                                remember_tool_call_delta(delta)
                             chunks.append(delta_payload_chunk(delta))
                     return chunks
 
@@ -29696,7 +29777,7 @@ def create_app(state: ServerState) -> FastAPI:
                 for field, text in splitter.start():
                     if text:
                         for chunk in stream_content_delta_chunks(field, text):
-                            yield mark_sse_sent(chunk)
+                            mark_stream_activity(chunk)
 
                 try:
                     while True:
@@ -29757,7 +29838,7 @@ def create_app(state: ServerState) -> FastAPI:
                                         else "stream_cancelled"
                                     )
                                 if not client_disconnected_now:
-                                    yield mark_sse_sent(
+                                    mark_stream_activity(
                                         error_chunk(
                                             RuntimeError(
                                                 "request cancelled via "
@@ -29768,7 +29849,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             )
                                         )
                                     )
-                                    yield mark_sse_sent("data: [DONE]\n\n")
+                                    mark_stream_activity(None)
                                 return
                             now_s = time.perf_counter()
                             if (
@@ -29809,7 +29890,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     session.abort_pending_postcommit(
                                         "stream_stall_watchdog"
                                     )
-                                yield mark_sse_sent(
+                                mark_stream_activity(
                                     error_chunk(
                                         TimeoutError(
                                             "model owner made no progress for "
@@ -29820,15 +29901,15 @@ def create_app(state: ServerState) -> FastAPI:
                                         )
                                     )
                                 )
-                                yield mark_sse_sent("data: [DONE]\n\n")
+                                mark_stream_activity(None)
                                 return
                             if (
                                 not generation_future.done()
-                                and now_s - last_sse_sent_s
+                                and now_s - last_event_sent_s
                                 >= STREAM_HEARTBEAT_INTERVAL_S
                             ):
                                 maybe_log_stream_silence(now_s)
-                                yield mark_sse_sent(
+                                mark_stream_activity(
                                     progress_chunk(
                                         _stream_heartbeat_payload(
                                             completion_tokens=streamed_progress_tokens,
@@ -29848,7 +29929,6 @@ def create_app(state: ServerState) -> FastAPI:
                             else:
                                 stream_tokens = list(item or [])
                                 token_timestamp_s = time.perf_counter()
-                            latest_token_enqueue_s = token_timestamp_s
                             if stream_tokens:
                                 streamed_token_ids.extend(int(t) for t in stream_tokens)
                                 streamed_token_times.extend(
@@ -29888,7 +29968,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     published_progress is not None
                                     and not buffer_read_only_force_answer_stream
                                 ):
-                                    yield mark_sse_sent(
+                                    mark_stream_activity(
                                         progress_chunk(published_progress)
                                     )
                             if not buffer_read_only_force_answer_stream:
@@ -29896,13 +29976,13 @@ def create_app(state: ServerState) -> FastAPI:
                                     for chunk in stream_content_delta_chunks(
                                         field, text
                                     ):
-                                        yield mark_sse_sent(chunk)
+                                        mark_stream_activity(chunk)
                             else:
                                 for _field, text in drain_stream_tokens(stream_tokens):
                                     for chunk in stream_read_only_force_answer_text(
                                         text
                                     ):
-                                        yield mark_sse_sent(chunk)
+                                        mark_stream_activity(chunk)
                             if (
                                 content_tool_translator is not None
                                 and content_tool_translator.buffering_tool_call
@@ -29925,7 +30005,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     and hidden_elapsed_s >= STREAM_HIDDEN_TOOL_GUARD_S
                                 ):
                                     for chunk in finish_translated_stream_chunks():
-                                        yield mark_sse_sent(chunk)
+                                        mark_stream_activity(chunk)
                                     if streamed_assistant_tool_calls:
                                         early_tool_cancel_used = True
                                         _cancel_stream_generation(
@@ -29947,7 +30027,7 @@ def create_app(state: ServerState) -> FastAPI:
                                         _cancel_stream_generation(
                                             cancel_event, generation_future
                                         )
-                                        yield mark_sse_sent(
+                                        mark_stream_activity(
                                             error_chunk(
                                                 HTTPException(
                                                     status_code=422,
@@ -29966,7 +30046,7 @@ def create_app(state: ServerState) -> FastAPI:
                                                 ),
                                                 code="tool_parse_error",
                                             ))
-                                        yield mark_sse_sent("data: [DONE]\n\n")
+                                        mark_stream_activity(None)
                                         return
                             else:
                                 hidden_tool_guard_started_s = None
@@ -30005,7 +30085,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     for chunk in stream_read_only_force_answer_text(
                                         text
                                     ):
-                                        yield mark_sse_sent(chunk)
+                                        mark_stream_activity(chunk)
                                 tail = decoder.finish()
                                 if tail:
                                     for _field, text in splitter.feed(tail):
@@ -30015,7 +30095,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             ) in stream_read_only_force_answer_text(
                                                 text
                                             ):
-                                                yield mark_sse_sent(chunk)
+                                                mark_stream_activity(chunk)
                                 visible_text, stripped_chars = (
                                     _read_only_force_answer_visible_text(
                                         str(generated.get("text") or "")
@@ -30069,14 +30149,14 @@ def create_app(state: ServerState) -> FastAPI:
                                                     use_orphan_guard=False,
                                                     use_tool_translator=False,
                                                 ):
-                                                    yield mark_sse_sent(chunk)
+                                                    mark_stream_activity(chunk)
                                     else:
                                         for (
                                             chunk
                                         ) in emit_read_only_force_answer_visible_text(
                                             visible_text
                                         ):
-                                            yield mark_sse_sent(chunk)
+                                            mark_stream_activity(chunk)
                                     stats[
                                         "read_only_force_answer_marker_stream_started"
                                     ] = bool(read_only_force_answer_stream_started)
@@ -30090,7 +30170,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     for chunk in stream_content_delta_chunks(
                                         field, text
                                     ):
-                                        yield mark_sse_sent(chunk)
+                                        mark_stream_activity(chunk)
                                 tail = decoder.finish()
                                 if tail:
                                     for field, text in splitter.feed(tail):
@@ -30098,7 +30178,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             for chunk in stream_content_delta_chunks(
                                                 field, text
                                             ):
-                                                yield mark_sse_sent(chunk)
+                                                mark_stream_activity(chunk)
                                 recover_unclosed_reasoning = (
                                     str(generated.get("finish_reason") or "") == "stop"
                                     and not tools_active
@@ -30113,9 +30193,9 @@ def create_app(state: ServerState) -> FastAPI:
                                         for chunk in stream_content_delta_chunks(
                                             field, text
                                         ):
-                                            yield mark_sse_sent(chunk)
+                                            mark_stream_activity(chunk)
                                 for chunk in finish_orphan_stream_guards():
-                                    yield mark_sse_sent(chunk)
+                                    mark_stream_activity(chunk)
                                 if (
                                     stop_monitor is not None
                                     and not stop_monitor.stopped
@@ -30128,11 +30208,11 @@ def create_app(state: ServerState) -> FastAPI:
                                             use_orphan_guard=False,
                                             monitor_stop=False,
                                         ):
-                                            yield mark_sse_sent(chunk)
+                                            mark_stream_activity(chunk)
                                 for chunk in finish_translated_stream_chunks(
                                     defer_content_resolution=True,
                                 ):
-                                    yield mark_sse_sent(chunk)
+                                    mark_stream_activity(chunk)
                             raw_generated_text = (
                                 _strip_mtplx_internal_continuation_markers(
                                     _strip_generated_chat_template_sentinels(
@@ -30188,7 +30268,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             use_orphan_guard=False,
                                             use_tool_translator=False,
                                         ):
-                                            yield mark_sse_sent(chunk)
+                                            mark_stream_activity(chunk)
                             if content_tool_translator is not None:
                                 for (
                                     delta
@@ -30196,7 +30276,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     has_tool_calls=bool(assistant_tool_calls),
                                 ):
                                     remember_stream_delta(delta)
-                                    yield mark_sse_sent(delta_payload_chunk(delta))
+                                    mark_stream_activity(delta_payload_chunk(delta))
                             stats = generated.setdefault("stats", {})
                             stats["openai_bridge_mode"] = "omlx_style"
                             stats["legacy_bridge_used"] = False
@@ -30242,7 +30322,7 @@ def create_app(state: ServerState) -> FastAPI:
                                 ):
                                     delta = {"content": fallback_visible_text}
                                     remember_stream_delta(delta)
-                                    yield mark_sse_sent(delta_payload_chunk(delta))
+                                    mark_stream_activity(delta_payload_chunk(delta))
                             if assistant_tool_calls:
                                 recovered_tool_preamble = getattr(
                                     splitter,
@@ -30290,7 +30370,7 @@ def create_app(state: ServerState) -> FastAPI:
                                         use_tool_translator=False,
                                         monitor_stop=False,
                                     ):
-                                        yield mark_sse_sent(chunk)
+                                        mark_stream_activity(chunk)
                                     stats[
                                         "stream_tool_preamble_recovered_as_content"
                                     ] = True
@@ -30300,7 +30380,7 @@ def create_app(state: ServerState) -> FastAPI:
                                         argument_chunk_chars=stream_interval,
                                     ):
                                         remember_tool_call_delta(delta)
-                                        yield mark_sse_sent(delta_payload_chunk(delta))
+                                        mark_stream_activity(delta_payload_chunk(delta))
                                 elif not turn_tool_deltas_emitted:
                                     for delta in _stream_tool_call_deltas(
                                         assistant_tool_calls,
@@ -30405,7 +30485,7 @@ def create_app(state: ServerState) -> FastAPI:
                                                 session.abort_pending_postcommit(
                                                     "stream_stall_watchdog"
                                                 )
-                                            yield mark_sse_sent(
+                                            mark_stream_activity(
                                                 error_chunk(
                                                     TimeoutError(
                                                         "model owner made no "
@@ -30420,16 +30500,16 @@ def create_app(state: ServerState) -> FastAPI:
                                                     )
                                                 )
                                             )
-                                            yield mark_sse_sent(
-                                                "data: [DONE]\n\n"
+                                            mark_stream_activity(
+                                                None
                                             )
                                             return
                                         if (
-                                            now_s - last_sse_sent_s
+                                            now_s - last_event_sent_s
                                             >= STREAM_HEARTBEAT_INTERVAL_S
                                         ):
                                             maybe_log_stream_silence(now_s)
-                                            yield mark_sse_sent(
+                                            mark_stream_activity(
                                                 progress_chunk(
                                                     _stream_heartbeat_payload(
                                                         completion_tokens=(
@@ -30448,8 +30528,8 @@ def create_app(state: ServerState) -> FastAPI:
                                 if commit_kind == "committed":
                                     generated = commit_item
                                 elif commit_kind == "error":
-                                    yield mark_sse_sent(error_chunk(commit_item))
-                                    yield mark_sse_sent("data: [DONE]\n\n")
+                                    mark_stream_activity(error_chunk(commit_item))
+                                    mark_stream_activity(None)
                                     return
                                 elif commit_kind == "released":
                                     release = (
@@ -30577,14 +30657,14 @@ def create_app(state: ServerState) -> FastAPI:
                                         "session_postcommit_snapshot"
                                     ] = postcommit_snapshot
                                 else:
-                                    yield mark_sse_sent(
+                                    mark_stream_activity(
                                         error_chunk(
                                             RuntimeError(
                                                 f"unexpected commit event: {commit_kind}"
                                             )
                                         )
                                     )
-                                    yield mark_sse_sent("data: [DONE]\n\n")
+                                    mark_stream_activity(None)
                                     return
                             generated = attach_response_observability(generated)
                             _attach_dashboard_progress_stats(
@@ -30642,7 +30722,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     f"\n\n{footer}",
                                     monitor_stop=False,
                                 ):
-                                    yield mark_sse_sent(chunk)
+                                    mark_stream_activity(chunk)
                             break
                         elif kind == "reset_orphan_stream_guards":
                             reset_orphan_stream_guards()
@@ -30656,7 +30736,7 @@ def create_app(state: ServerState) -> FastAPI:
                                 continue
                             for field, text in drain_stream_tokens([], force=True):
                                 for chunk in stream_content_delta_chunks(field, text):
-                                    yield mark_sse_sent(chunk)
+                                    mark_stream_activity(chunk)
                             tail = decoder.finish()
                             if tail:
                                 for field, text in splitter.feed(tail):
@@ -30664,20 +30744,20 @@ def create_app(state: ServerState) -> FastAPI:
                                         for chunk in stream_content_delta_chunks(
                                             field, text
                                         ):
-                                            yield mark_sse_sent(chunk)
+                                            mark_stream_activity(chunk)
                             for field, text in splitter.feed(THINK_CLOSE):
                                 if text:
                                     for chunk in stream_content_delta_chunks(
                                         field, text
                                     ):
-                                        yield mark_sse_sent(chunk)
+                                        mark_stream_activity(chunk)
                             decoder = _IncrementalTokenDecoder(state.runtime.tokenizer)
                             continue
                         elif kind == "error":
                             with suppress(RuntimeError):
                                 _generation_turn.fail(TurnFailed(error=str(item)))
-                            yield mark_sse_sent(error_chunk(item))
-                            yield mark_sse_sent("data: [DONE]\n\n")
+                            mark_stream_activity(error_chunk(item))
+                            mark_stream_activity(None)
                             return
                         elif kind == "cancelled":
                             if stop_monitor is not None and stop_monitor.stopped:
@@ -30761,7 +30841,7 @@ def create_app(state: ServerState) -> FastAPI:
                             if await raw_request.is_disconnected():
                                 stream_cancelled_by_client = True
                             else:
-                                yield mark_sse_sent(
+                                mark_stream_activity(
                                     error_chunk(
                                         RuntimeError(
                                             "request cancelled via "
@@ -30771,19 +30851,19 @@ def create_app(state: ServerState) -> FastAPI:
                                         )
                                     )
                                 )
-                                yield mark_sse_sent("data: [DONE]\n\n")
+                                mark_stream_activity(None)
                             return
                         else:
                             with suppress(RuntimeError):
                                 _generation_turn.fail(TurnFailed(
                                     error=f"unexpected stream event: {kind}",
                                 ))
-                            yield mark_sse_sent(
+                            mark_stream_activity(
                                 error_chunk(
                                     RuntimeError(f"unexpected stream event: {kind}")
                                 )
                             )
-                            yield mark_sse_sent("data: [DONE]\n\n")
+                            mark_stream_activity(None)
                             return
                 except asyncio.CancelledError:
                     stream_cancelled_by_client = True
@@ -30795,8 +30875,8 @@ def create_app(state: ServerState) -> FastAPI:
                 except BaseException as exc:
                     with suppress(RuntimeError):
                         _generation_turn.fail(TurnFailed(error=str(exc)))
-                    yield mark_sse_sent(error_chunk(exc))
-                    yield mark_sse_sent("data: [DONE]\n\n")
+                    mark_stream_activity(error_chunk(exc))
+                    mark_stream_activity(None)
                     return
                 finally:
                     if stream_cancelled_by_client:
@@ -30850,10 +30930,10 @@ def create_app(state: ServerState) -> FastAPI:
                         _generation_turn.fail(TurnFailed(
                             error="generation ended without a result",
                         ))
-                    yield mark_sse_sent(
+                    mark_stream_activity(
                         error_chunk(RuntimeError("generation ended without a result"))
                     )
-                    yield mark_sse_sent("data: [DONE]\n\n")
+                    mark_stream_activity(None)
                     return
                 finish_reason = generated.get("finish_reason") or "stop"
                 generated["finish_reason"] = finish_reason
@@ -30862,37 +30942,26 @@ def create_app(state: ServerState) -> FastAPI:
                     state, {"finish_reason": finish_reason}
                 )
                 with suppress(RuntimeError):
+                    usage_update = UsageUpdate(
+                        prompt_tokens=int(generated.get("prompt_tokens") or 0),
+                        completion_tokens=int(
+                            generated.get("completion_tokens") or 0
+                        ),
+                    )
+                    _generation_turn.emit(usage_update)
                     _generation_turn.complete(TurnCompleted(
                         finish_reason=finish_reason,
-                        usage=UsageUpdate(
-                            prompt_tokens=int(generated.get("prompt_tokens") or 0),
-                            completion_tokens=int(
-                                generated.get("completion_tokens") or 0
-                            ),
-                        ),
+                        usage=usage_update,
+                        mtplx_stats=_public_mtplx_stats(generated),
+                        timings=_build_timings(generated),
                     ))
-                done = {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": finish_reason,
-                        }
-                    ],
-                    "usage": _usage_payload(generated),
-                    "mtplx_stats": _public_mtplx_stats(generated),
-                    "timings": _build_timings(generated),
-                }
-                yield mark_sse_sent(f"data: {json.dumps(done)}\n\n")
-                yield mark_sse_sent("data: [DONE]\n\n")
-
-            if (metadata or {}).get("_mtplx_stream_projection") == "turn_events":
-                return _TurnEventStreamResponse(_generation_turn, event_stream)
-            return StreamingResponse(event_stream(), media_type="text/event-stream")
+            turn_stream = _GenerationTurnStream(_generation_turn, drive_turn)
+            if return_turn:
+                return turn_stream
+            return StreamingResponse(
+                _chat_stream_from_turn_events(turn_stream.events()),
+                media_type="text/event-stream",
+            )
 
         def run_nonstream_generation() -> dict[str, Any]:
             return run_generation_for_response()
@@ -31197,6 +31266,16 @@ def create_app(state: ServerState) -> FastAPI:
             }
         )
 
+    @app.post("/v1/chat/completions")
+    async def chat_completions(
+        raw_request: Request, request: ChatCompletionRequest
+    ) -> Any:
+        return await _chat_completions_impl(
+            raw_request,
+            request,
+            return_turn=False,
+        )
+
     @app.post("/v1/responses")
     async def responses(raw_request: Request, request: ResponsesRequest) -> Any:
         """Render the existing Chat turn through the ephemeral Responses wire."""
@@ -31215,10 +31294,10 @@ def create_app(state: ServerState) -> FastAPI:
         )
         created_at = int(time.time())
         if request.stream:
-            chat_request.metadata = dict(chat_request.metadata or {})
-            chat_request.metadata["_mtplx_stream_projection"] = "turn_events"
-            chat_response = await chat_completions(raw_request, chat_request)
-            if not isinstance(chat_response, _TurnEventStreamResponse):
+            chat_response = await _chat_completions_impl(
+                raw_request, chat_request, return_turn=True
+            )
+            if not isinstance(chat_response, _GenerationTurnStream):
                 return chat_response
             return StreamingResponse(
                 responses_stream_from_turn_events(
@@ -31289,10 +31368,10 @@ def create_app(state: ServerState) -> FastAPI:
         chat_request = _anthropic_to_chat_request(request)
         chat_request.stream = bool(request.stream)
         if request.stream:
-            chat_request.metadata = dict(chat_request.metadata or {})
-            chat_request.metadata["_mtplx_stream_projection"] = "turn_events"
-            response = await chat_completions(raw_request, chat_request)
-            if not isinstance(response, _TurnEventStreamResponse):
+            response = await _chat_completions_impl(
+                raw_request, chat_request, return_turn=True
+            )
+            if not isinstance(response, _GenerationTurnStream):
                 return response
             return StreamingResponse(
                 _anthropic_stream_from_turn_events(
