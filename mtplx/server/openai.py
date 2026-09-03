@@ -38,6 +38,7 @@ import uuid
 import weakref
 import webbrowser
 from collections import Counter, OrderedDict, deque
+from collections.abc import AsyncIterator
 from concurrent.futures import Future
 from contextlib import asynccontextmanager, contextmanager, nullcontext, suppress
 from dataclasses import asdict, dataclass, is_dataclass, replace
@@ -129,12 +130,14 @@ from mtplx.server.request_policy import (
 )
 from mtplx.server.core import (
     GenerationTurn,
+    OutputItemStarted,
     ReasoningDelta,
     TextDelta,
     ToolCallDelta,
     TurnCancelled,
     TurnCompleted,
     TurnFailed,
+    TurnHeartbeat,
     TurnStarted,
     UsageUpdate,
 )
@@ -143,7 +146,6 @@ from mtplx.server.protocols.responses import (
     ResponsesRequest,
     response_from_chat_completion,
     responses_request_to_chat,
-    responses_stream_from_chat_sse,
     responses_stream_from_turn_events,
 )
 from mtplx.server.response_envelope import build_generation_result
@@ -704,6 +706,45 @@ async def _monitor_request_disconnect(
             return True
         await asyncio.sleep(max(0.01, float(poll_s)))
     return False
+
+
+class _TurnEventStreamResponse:
+    """Internal streaming turn handle for non-Chat protocol projections."""
+
+    def __init__(
+        self,
+        turn: GenerationTurn,
+        driver_factory: Callable[[], AsyncIterator[str]],
+    ) -> None:
+        self.turn = turn
+        self._driver_factory = driver_factory
+
+    async def events(self) -> AsyncIterator[Any]:
+        subscriber = self.turn.subscribe()
+        driver = self._driver_factory()
+        drain = getattr(subscriber, "drain_nowait", None)
+        try:
+            async for _ in driver:
+                if drain is not None:
+                    for event in drain():
+                        yield event
+            if getattr(getattr(self.turn, "state", None), "value", None) != "terminal":
+                with suppress(RuntimeError):
+                    self.turn.fail(
+                        TurnFailed(
+                            error="generation driver ended without a terminal event",
+                            code="driver_eof_without_terminal",
+                        )
+                    )
+            if drain is not None:
+                for event in drain():
+                    yield event
+            async for event in subscriber:
+                yield event
+        finally:
+            if hasattr(driver, "aclose"):
+                with suppress(Exception):
+                    await driver.aclose()
 
 
 def _comma_floats(value: str) -> tuple[float, ...]:
@@ -5196,6 +5237,7 @@ async def _anthropic_stream_from_turn_events(
     stop_reason = "end_turn"
     usage = _anthropic_usage_from_openai_usage(None)
     tool_blocks: dict[int, dict[str, Any]] = {}
+    terminal_seen = False
 
     yield _anthropic_sse(
         "message_start",
@@ -5227,6 +5269,9 @@ async def _anthropic_stream_from_turn_events(
 
     async for ev in events:
         if isinstance(ev, TurnStarted):
+            continue
+
+        if isinstance(ev, (OutputItemStarted, TurnHeartbeat)):
             continue
 
         if isinstance(ev, ReasoningDelta):
@@ -5341,6 +5386,7 @@ async def _anthropic_stream_from_turn_events(
             continue
 
         if isinstance(ev, TurnCompleted):
+            terminal_seen = True
             if ev.usage is not None:
                 usage = _anthropic_usage_from_openai_usage(
                     {
@@ -5354,6 +5400,7 @@ async def _anthropic_stream_from_turn_events(
             break
 
         if isinstance(ev, TurnFailed):
+            terminal_seen = True
             yield _anthropic_sse(
                 "error",
                 {
@@ -5367,6 +5414,7 @@ async def _anthropic_stream_from_turn_events(
             return
 
         if isinstance(ev, TurnCancelled):
+            terminal_seen = True
             yield _anthropic_sse(
                 "error",
                 {
@@ -5375,6 +5423,19 @@ async def _anthropic_stream_from_turn_events(
                 },
             )
             return
+
+    if not terminal_seen:
+        yield _anthropic_sse(
+            "error",
+            {
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": "generation event stream ended without a terminal event",
+                },
+            },
+        )
+        return
 
     if active_text_index is not None:
         yield stop_content_block(active_text_index)
@@ -30984,6 +31045,10 @@ def create_app(state: ServerState) -> FastAPI:
                     return delta_payload_chunk({field: text})
 
                 def progress_chunk(progress: dict[str, Any]) -> str:
+                    with suppress(RuntimeError):
+                        _generation_turn.emit(
+                            TurnHeartbeat(payload=_json_safe(progress))
+                        )
                     payload = {
                         "id": response_id,
                         "object": "chat.completion.chunk",
@@ -31109,6 +31174,7 @@ def create_app(state: ServerState) -> FastAPI:
                 streamed_decode_started_s: float | None = None
                 streamed_assistant_tool_calls: list[dict[str, Any]] | None = None
                 streamed_tool_deltas_emitted = False
+                turn_tool_deltas_emitted = False
                 early_tool_cancel_used = False
                 pending_tool_cancel_started_s: float | None = None
                 hidden_tool_guard_started_s: float | None = None
@@ -31119,16 +31185,48 @@ def create_app(state: ServerState) -> FastAPI:
                 read_only_force_answer_stream_buffer = ""
                 read_only_force_answer_stream_started = False
                 read_only_force_answer_stream_marker_stripped_chars = 0
+                turn_output_items_started: set[tuple[str, int]] = set()
+
+                def start_turn_output_item(kind: str, index: int = 0) -> None:
+                    key = (kind, int(index))
+                    if key in turn_output_items_started:
+                        return
+                    turn_output_items_started.add(key)
+                    with suppress(RuntimeError):
+                        _generation_turn.emit(
+                            OutputItemStarted(kind=kind, index=int(index))
+                        )
+
+                def remember_tool_call_delta(delta: dict[str, Any]) -> None:
+                    nonlocal turn_tool_deltas_emitted
+                    for _tc_delta in delta.get("tool_calls", []):
+                        _tc_fn = _tc_delta.get("function") or {}
+                        _tc_index = int(_tc_delta.get("index") or 0)
+                        start_turn_output_item("tool", _tc_index)
+                        with suppress(RuntimeError):
+                            _generation_turn.emit(ToolCallDelta(
+                                index=_tc_index,
+                                call_id=_tc_delta.get("id"),
+                                name=_tc_fn.get("name"),
+                                arguments_delta=str(
+                                    _tc_fn.get("arguments") or ""
+                                ),
+                            ))
+                            turn_tool_deltas_emitted = True
 
                 def remember_stream_delta(delta: dict[str, Any]) -> None:
                     reasoning = delta.get("reasoning_content")
                     if isinstance(reasoning, str) and reasoning:
                         history_reasoning_chunks.append(reasoning)
-                        _generation_turn.emit(ReasoningDelta(delta=reasoning))
+                        start_turn_output_item("reasoning")
+                        with suppress(RuntimeError):
+                            _generation_turn.emit(ReasoningDelta(delta=reasoning))
                     content = delta.get("content")
                     if isinstance(content, str) and content:
                         history_content_chunks.append(content)
-                        _generation_turn.emit(TextDelta(delta=content))
+                        start_turn_output_item("text")
+                        with suppress(RuntimeError):
+                            _generation_turn.emit(TextDelta(delta=content))
 
                 def reset_orphan_stream_guards() -> None:
                     nonlocal orphan_reasoning_stream_guard
@@ -31229,16 +31327,7 @@ def create_app(state: ServerState) -> FastAPI:
                                 if single_tool_call_stream and parsed_calls:
                                     parsed_calls = parsed_calls[:1]
                                 streamed_assistant_tool_calls = parsed_calls
-                                for _tc_delta in delta.get("tool_calls", []):
-                                    _tc_fn = _tc_delta.get("function") or {}
-                                    _generation_turn.emit(ToolCallDelta(
-                                        index=int(_tc_delta.get("index") or 0),
-                                        call_id=_tc_delta.get("id"),
-                                        name=_tc_fn.get("name"),
-                                        arguments_delta=str(
-                                            _tc_fn.get("arguments") or ""
-                                        ),
-                                    ))
+                                remember_tool_call_delta(delta)
                             chunks.append(delta_payload_chunk(delta))
                         if (
                             single_tool_call_stream
@@ -31784,10 +31873,14 @@ def create_app(state: ServerState) -> FastAPI:
                                                 )
                                             )
                                         )
-                                        _generation_turn.fail(TurnFailed(
-                                            error="malformed tool_call: unterminated stream",
-                                            code="tool_parse_error",
-                                        ))
+                                        with suppress(RuntimeError):
+                                            _generation_turn.fail(TurnFailed(
+                                                error=(
+                                                    "malformed tool_call: "
+                                                    "unterminated stream"
+                                                ),
+                                                code="tool_parse_error",
+                                            ))
                                         yield mark_sse_sent("data: [DONE]\n\n")
                                         return
                             else:
@@ -32183,7 +32276,14 @@ def create_app(state: ServerState) -> FastAPI:
                                         assistant_tool_calls,
                                         argument_chunk_chars=stream_interval,
                                     ):
+                                        remember_tool_call_delta(delta)
                                         yield mark_sse_sent(delta_payload_chunk(delta))
+                                elif not turn_tool_deltas_emitted:
+                                    for delta in _stream_tool_call_deltas(
+                                        assistant_tool_calls,
+                                        argument_chunk_chars=stream_interval,
+                                    ):
+                                        remember_tool_call_delta(delta)
                                 _record_tool_parse_event(
                                     state,
                                     event="tool_parse_success",
@@ -32553,7 +32653,8 @@ def create_app(state: ServerState) -> FastAPI:
                         elif kind == "error":
                             if isinstance(item, BaseException):
                                 stream_error_item = item
-                            _generation_turn.fail(TurnFailed(error=str(item)))
+                            with suppress(RuntimeError):
+                                _generation_turn.fail(TurnFailed(error=str(item)))
                             yield mark_sse_sent(error_chunk(item))
                             yield mark_sse_sent("data: [DONE]\n\n")
                             return
@@ -32632,9 +32733,10 @@ def create_app(state: ServerState) -> FastAPI:
                                     state, generated["stats"]
                                 )
                                 break
-                            _generation_turn.cancel(TurnCancelled(
-                                reason=str(item),
-                            ))
+                            with suppress(RuntimeError):
+                                _generation_turn.cancel(TurnCancelled(
+                                    reason=str(item),
+                                ))
                             if await raw_request.is_disconnected():
                                 stream_cancelled_by_client = True
                             else:
@@ -32651,9 +32753,10 @@ def create_app(state: ServerState) -> FastAPI:
                                 yield mark_sse_sent("data: [DONE]\n\n")
                             return
                         else:
-                            _generation_turn.fail(TurnFailed(
-                                error=f"unexpected stream event: {kind}",
-                            ))
+                            with suppress(RuntimeError):
+                                _generation_turn.fail(TurnFailed(
+                                    error=f"unexpected stream event: {kind}",
+                                ))
                             yield mark_sse_sent(
                                 error_chunk(
                                     RuntimeError(f"unexpected stream event: {kind}")
@@ -32671,15 +32774,17 @@ def create_app(state: ServerState) -> FastAPI:
                     stream_cancelled_by_client = True
                     raise
                 except BaseException as exc:
-                    _generation_turn.fail(TurnFailed(error=str(exc)))
+                    with suppress(RuntimeError):
+                        _generation_turn.fail(TurnFailed(error=str(exc)))
                     yield mark_sse_sent(error_chunk(exc))
                     yield mark_sse_sent("data: [DONE]\n\n")
                     return
                 finally:
                     if stream_cancelled_by_client:
-                        _generation_turn.cancel(
-                            TurnCancelled(reason="client_disconnected")
-                        )
+                        with suppress(RuntimeError):
+                            _generation_turn.cancel(
+                                TurnCancelled(reason="client_disconnected")
+                            )
                     nonlocal_cancel_reason = (
                         "client_disconnected"
                         if stream_cancelled_by_client
@@ -32749,9 +32854,10 @@ def create_app(state: ServerState) -> FastAPI:
                     state.dashboard.progress_events.forget(response_id)
 
                 if generated is None:
-                    _generation_turn.fail(TurnFailed(
-                        error="generation ended without a result",
-                    ))
+                    with suppress(RuntimeError):
+                        _generation_turn.fail(TurnFailed(
+                            error="generation ended without a result",
+                        ))
                     yield mark_sse_sent(
                         error_chunk(RuntimeError("generation ended without a result"))
                     )
@@ -32763,15 +32869,16 @@ def create_app(state: ServerState) -> FastAPI:
                 _merge_final_bridge_stats_into_latest_metrics(
                     state, {"finish_reason": finish_reason}
                 )
-                _generation_turn.complete(TurnCompleted(
-                    finish_reason=finish_reason,
-                    usage=UsageUpdate(
-                        prompt_tokens=int(generated.get("prompt_tokens") or 0),
-                        completion_tokens=int(
-                            generated.get("completion_tokens") or 0
+                with suppress(RuntimeError):
+                    _generation_turn.complete(TurnCompleted(
+                        finish_reason=finish_reason,
+                        usage=UsageUpdate(
+                            prompt_tokens=int(generated.get("prompt_tokens") or 0),
+                            completion_tokens=int(
+                                generated.get("completion_tokens") or 0
+                            ),
                         ),
-                    ),
-                ))
+                    ))
                 done = {
                     "id": response_id,
                     "object": "chat.completion.chunk",
@@ -32791,11 +32898,9 @@ def create_app(state: ServerState) -> FastAPI:
                 yield mark_sse_sent(f"data: {json.dumps(done)}\n\n")
                 yield mark_sse_sent("data: [DONE]\n\n")
 
-            _stream_response = StreamingResponse(
-                event_stream(), media_type="text/event-stream"
-            )
-            _stream_response._generation_turn = _generation_turn  # type: ignore[attr-defined]
-            return _stream_response
+            if (metadata or {}).get("_mtplx_stream_projection") == "turn_events":
+                return _TurnEventStreamResponse(_generation_turn, event_stream)
+            return StreamingResponse(event_stream(), media_type="text/event-stream")
 
         def run_nonstream_generation() -> dict[str, Any]:
             return run_generation_for_response()
@@ -33159,48 +33264,15 @@ def create_app(state: ServerState) -> FastAPI:
             metadata=_request_metadata(chat_request),
         )
         created_at = int(time.time())
-        chat_response = await chat_completions(raw_request, chat_request)
         if request.stream:
-            if not isinstance(chat_response, StreamingResponse):
+            chat_request.metadata = dict(chat_request.metadata or {})
+            chat_request.metadata["_mtplx_stream_projection"] = "turn_events"
+            chat_response = await chat_completions(raw_request, chat_request)
+            if not isinstance(chat_response, _TurnEventStreamResponse):
                 return chat_response
-            turn = getattr(chat_response, "_generation_turn", None)
-            if turn is not None:
-                subscriber = turn.subscribe()
-
-                async def _drive_and_render():
-                    async def _drive_generation() -> None:
-                        async for _ in chat_response.body_iterator:
-                            pass
-
-                    driver = asyncio.ensure_future(_drive_generation())
-                    try:
-                        async for chunk in responses_stream_from_turn_events(
-                            subscriber,
-                            request=request,
-                            response_id=response_id,
-                            model=state.model_id,
-                            created_at=created_at,
-                        ):
-                            yield chunk
-                    finally:
-                        if not driver.done():
-                            driver.cancel()
-                        try:
-                            await driver
-                        except (asyncio.CancelledError, Exception):
-                            pass
-
-                return StreamingResponse(
-                    _drive_and_render(),
-                    media_type="text/event-stream",
-                    headers={
-                        "Cache-Control": "no-cache",
-                        "X-Accel-Buffering": "no",
-                    },
-                )
             return StreamingResponse(
-                responses_stream_from_chat_sse(
-                    chat_response.body_iterator,
+                responses_stream_from_turn_events(
+                    chat_response.events(),
                     request=request,
                     response_id=response_id,
                     model=state.model_id,
@@ -33212,6 +33284,7 @@ def create_app(state: ServerState) -> FastAPI:
                     "X-Accel-Buffering": "no",
                 },
             )
+        chat_response = await chat_completions(raw_request, chat_request)
         if not isinstance(chat_response, JSONResponse):
             return chat_response
         if chat_response.status_code >= 400:
@@ -33265,44 +33338,20 @@ def create_app(state: ServerState) -> FastAPI:
             raise HTTPException(status_code=400, detail="messages must not be empty")
         chat_request = _anthropic_to_chat_request(request)
         chat_request.stream = bool(request.stream)
-        response = await chat_completions(raw_request, chat_request)
         if request.stream:
-            if not isinstance(response, StreamingResponse):
+            chat_request.metadata = dict(chat_request.metadata or {})
+            chat_request.metadata["_mtplx_stream_projection"] = "turn_events"
+            response = await chat_completions(raw_request, chat_request)
+            if not isinstance(response, _TurnEventStreamResponse):
                 return response
-            turn = getattr(response, "_generation_turn", None)
-            if turn is not None:
-                subscriber = turn.subscribe()
-
-                async def _drive_and_render_anthropic():
-                    async def _drive_generation() -> None:
-                        async for _ in response.body_iterator:
-                            pass
-
-                    driver = asyncio.ensure_future(_drive_generation())
-                    try:
-                        async for chunk in _anthropic_stream_from_turn_events(
-                            subscriber, model=state.model_id,
-                        ):
-                            yield chunk
-                    finally:
-                        if not driver.done():
-                            driver.cancel()
-                        try:
-                            await driver
-                        except (asyncio.CancelledError, Exception):
-                            pass
-
-                return StreamingResponse(
-                    _drive_and_render_anthropic(),
-                    media_type="text/event-stream",
-                )
             return StreamingResponse(
-                _anthropic_stream_from_openai_sse(
-                    response.body_iterator,
+                _anthropic_stream_from_turn_events(
+                    response.events(),
                     model=state.model_id,
                 ),
                 media_type="text/event-stream",
             )
+        response = await chat_completions(raw_request, chat_request)
         if not isinstance(response, JSONResponse):
             return response
         try:

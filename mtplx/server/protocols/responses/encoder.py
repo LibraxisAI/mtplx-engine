@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from mtplx.server.core.events import (
+    OutputItemStarted,
     ReasoningDelta,
     TextDelta,
     ToolCallDelta,
@@ -17,6 +18,7 @@ from mtplx.server.core.events import (
     TurnCompleted,
     TurnEvent,
     TurnFailed,
+    TurnHeartbeat,
     TurnStarted,
     UsageUpdate,
 )
@@ -501,9 +503,66 @@ async def responses_stream_from_turn_events(
     yield state.event("response.created", response=state.response(status="in_progress"))
     yield state.event("response.in_progress", response=state.response(status="in_progress"))
 
+    terminal_seen = False
     async for ev in events:
         if isinstance(ev, TurnStarted):
             state.model = ev.model
+            continue
+
+        if isinstance(ev, TurnHeartbeat):
+            yield ": mtplx-heartbeat\n\n"
+            continue
+
+        if isinstance(ev, OutputItemStarted):
+            if ev.kind == "reasoning" and state.reasoning_id is None:
+                state.reasoning_id = ev.item_id or _item_id("rs")
+                output_index = state.register_output("reasoning")
+                yield state.event(
+                    "response.output_item.added",
+                    output_index=output_index,
+                    item=_reasoning_item(
+                        "",
+                        item_id=state.reasoning_id,
+                        status="in_progress",
+                    ),
+                )
+            elif ev.kind == "text" and state.text_id is None:
+                state.text_id = ev.item_id or _item_id("msg")
+                output_index = state.register_output("text")
+                item = _message_item("", item_id=state.text_id, status="in_progress")
+                yield state.event(
+                    "response.output_item.added",
+                    output_index=output_index,
+                    item=item,
+                )
+                yield state.event(
+                    "response.content_part.added",
+                    item_id=state.text_id,
+                    output_index=output_index,
+                    content_index=0,
+                    part=item["content"][0],
+                )
+            elif ev.kind == "tool" and ev.index not in state.tools:
+                tool = {
+                    "id": ev.item_id or _item_id("fc"),
+                    "call_id": _item_id("call"),
+                    "name": "",
+                    "arguments": "",
+                }
+                state.tools[ev.index] = tool
+                output_index = state.register_output("tool", ev.index)
+                yield state.event(
+                    "response.output_item.added",
+                    output_index=output_index,
+                    item=_function_item(
+                        {
+                            "id": tool["call_id"],
+                            "function": {"name": tool["name"], "arguments": ""},
+                        },
+                        item_id=tool["id"],
+                        status="in_progress",
+                    ),
+                )
             continue
 
         if isinstance(ev, ReasoningDelta):
@@ -600,6 +659,7 @@ async def responses_stream_from_turn_events(
             continue
 
         if isinstance(ev, TurnCompleted):
+            terminal_seen = True
             state.finish_reason = ev.finish_reason
             if ev.usage is not None:
                 state.usage = _usage({
@@ -609,16 +669,27 @@ async def responses_stream_from_turn_events(
             break
 
         if isinstance(ev, TurnFailed):
+            terminal_seen = True
             failed = state.response(status="failed", output_status="incomplete")
             failed["error"] = {"code": ev.code or "server_error", "message": ev.error}
             yield state.event("response.failed", response=failed)
             return
 
         if isinstance(ev, TurnCancelled):
+            terminal_seen = True
             failed = state.response(status="failed", output_status="incomplete")
             failed["error"] = {"code": "request_cancelled", "message": ev.reason}
             yield state.event("response.failed", response=failed)
             return
+
+    if not terminal_seen:
+        failed = state.response(status="failed", output_status="incomplete")
+        failed["error"] = {
+            "code": "driver_eof_without_terminal",
+            "message": "generation event stream ended without a terminal event",
+        }
+        yield state.event("response.failed", response=failed)
+        return
 
     for output_index, (kind, key) in enumerate(state.output_order):
         if kind == "reasoning" and state.reasoning_id is not None:
