@@ -9,7 +9,7 @@ Refutation coverage:
         calls (documented invariant, tested via direct invocation).
   R3 — enforced state machine: duplicate start, duplicate terminal, post-terminal
         delta refusal, EOF-without-terminal impossible.
-  R4 — OutputItemStarted removed from contract (no dead types).
+  R4 — OutputItemStarted is emitted by the live producer.
   R5 — all three protocol paths share lifecycle authority (fan-out test).
   R6 — driver cancellation, no orphan task.
 
@@ -23,13 +23,16 @@ Acceptance criteria:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from typing import Any
 
 import pytest
 
+import mtplx.server.openai as openai
 from mtplx.server.core import (
     GenerationTurn,
+    OutputItemStarted,
     ReasoningDelta,
     TextDelta,
     ToolCallDelta,
@@ -45,6 +48,11 @@ from mtplx.server.protocols.responses.encoder import (
     responses_stream_from_turn_events,
 )
 from mtplx.server.protocols.responses.schema import ResponsesRequest
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
 
 
 def _fake_responses_request(**overrides: Any) -> ResponsesRequest:
@@ -102,11 +110,10 @@ class TestEventTaxonomy:
         with pytest.raises(AttributeError):
             ev.delta = "y"  # type: ignore[misc]
 
-    def test_output_item_started_removed(self) -> None:
-        """R4: OutputItemStarted is not part of the W1 contract."""
-        import mtplx.server.core.events as mod
-
-        assert not hasattr(mod, "OutputItemStarted")
+    def test_output_item_started(self) -> None:
+        ev = OutputItemStarted(kind="text", index=0, item_id="msg_1")
+        assert ev.kind == "text"
+        assert ev.item_id == "msg_1"
 
 
 class TestStateMachine:
@@ -156,19 +163,22 @@ class TestStateMachine:
         turn.cancel(TurnCancelled(reason="dc"))
         assert turn.state == TurnState.TERMINAL
 
-    def test_duplicate_terminal_is_idempotent(self) -> None:
+    def test_duplicate_terminal_raises(self) -> None:
         turn = GenerationTurn()
         turn.start(TurnStarted(response_id="r", model="m", created=1))
         turn.complete(TurnCompleted(finish_reason="stop"))
-        turn.fail(TurnFailed(error="ignored"))
-        turn.cancel(TurnCancelled(reason="ignored"))
+        with pytest.raises(RuntimeError, match="terminal"):
+            turn.fail(TurnFailed(error="ignored"))
+        with pytest.raises(RuntimeError, match="terminal"):
+            turn.cancel(TurnCancelled(reason="ignored"))
         assert turn.state == TurnState.TERMINAL
 
-    def test_post_terminal_emit_is_silently_dropped(self) -> None:
+    def test_post_terminal_emit_raises(self) -> None:
         turn = GenerationTurn()
         turn.start(TurnStarted(response_id="r", model="m", created=1))
         turn.complete(TurnCompleted(finish_reason="stop"))
-        turn.emit(TextDelta(delta="should be dropped"))
+        with pytest.raises(RuntimeError, match="terminal"):
+            turn.emit(TextDelta(delta="refused"))
         assert turn.state == TurnState.TERMINAL
 
     def test_fail_without_start_allowed(self) -> None:
@@ -190,7 +200,7 @@ class TestStateMachine:
 class TestEOFWithoutTerminal:
     """R3 corollary: EOF without terminal fails rather than completes."""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_subscriber_eof_only_after_terminal(self) -> None:
         turn = GenerationTurn()
         turn.start(TurnStarted(response_id="r", model="m", created=1))
@@ -217,39 +227,47 @@ class TestEOFWithoutTerminal:
 class TestBoundedSlowConsumer:
     """R1: slow consumer is bounded, not unbounded accumulation."""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_subscriber_has_bounded_queue(self) -> None:
         turn = GenerationTurn(maxsize=4)
         turn.start(TurnStarted(response_id="r", model="m", created=1))
         sub = turn.subscribe()
 
         for i in range(10):
-            turn.emit(TextDelta(delta=f"d{i}"))
-
-        turn.complete(TurnCompleted(finish_reason="stop"))
+            try:
+                turn.emit(TextDelta(delta=f"d{i}"))
+            except RuntimeError:
+                break
 
         events: list[TurnEvent] = []
         async for ev in sub:
             events.append(ev)
         assert len(events) <= 5
+        assert isinstance(events[-1], TurnFailed)
+        assert events[-1].code == "backpressure_overflow"
 
-    @pytest.mark.asyncio
-    async def test_producer_never_blocks_on_slow_subscriber(self) -> None:
+    @pytest.mark.anyio
+    async def test_overflow_is_explicit_failure_not_clean_eof(self) -> None:
         turn = GenerationTurn(maxsize=2)
         turn.start(TurnStarted(response_id="r", model="m", created=1))
-        _sub = turn.subscribe()
+        sub = turn.subscribe()
 
         for _ in range(100):
-            turn.emit(TextDelta(delta="x"))
+            try:
+                turn.emit(TextDelta(delta="x"))
+            except RuntimeError:
+                break
 
-        turn.complete(TurnCompleted(finish_reason="stop"))
         assert turn.state == TurnState.TERMINAL
+        events = [ev async for ev in sub]
+        assert isinstance(events[-1], TurnFailed)
+        assert events[-1].code == "backpressure_overflow"
 
 
 class TestFanOut:
     """R5: multiple subscribers observe the same turn (lifecycle authority shared)."""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_two_subscribers_see_same_events(self) -> None:
         turn = GenerationTurn()
         sub1 = turn.subscribe()
@@ -272,7 +290,7 @@ class TestFanOut:
         for e1, e2 in zip(events1, events2):
             assert type(e1) is type(e2)
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_late_subscriber_gets_replay(self) -> None:
         turn = GenerationTurn()
         turn.start(TurnStarted(response_id="r", model="m", created=1))
@@ -293,7 +311,7 @@ class TestFanOut:
         assert isinstance(events[2], TextDelta) and events[2].delta == "b"
         assert isinstance(events[3], TurnCompleted)
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_subscribe_after_terminal_replays_everything(self) -> None:
         turn = GenerationTurn()
         turn.start(TurnStarted(response_id="r", model="m", created=1))
@@ -308,11 +326,24 @@ class TestFanOut:
         assert len(events) == 3
         assert isinstance(events[2], TurnCompleted)
 
+    @pytest.mark.anyio
+    async def test_late_subscriber_after_large_history_does_not_raise(self) -> None:
+        turn = GenerationTurn(maxsize=4, replay=4)
+        turn.start(TurnStarted(response_id="r", model="m", created=1))
+        for i in range(20):
+            turn.emit(TextDelta(delta=str(i)))
+        turn.complete(TurnCompleted(finish_reason="stop"))
+
+        sub = turn.subscribe(maxsize=3)
+        events = [ev async for ev in sub]
+        assert len(events) <= 3
+        assert isinstance(events[-1], TurnCompleted)
+
 
 class TestDriverCancellation:
     """R6: driver cancellation, no orphan task."""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_cancel_terminates_subscriber(self) -> None:
         turn = GenerationTurn()
         turn.start(TurnStarted(response_id="r", model="m", created=1))
@@ -335,7 +366,7 @@ class TestDriverCancellation:
         with pytest.raises(StopAsyncIteration):
             await sub.__anext__()
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_driver_task_cleanup_on_cancel(self) -> None:
         turn = GenerationTurn()
         turn.start(TurnStarted(response_id="r", model="m", created=1))
@@ -374,7 +405,7 @@ class TestDriverCancellation:
 class TestFirstDelta:
     """A4: first model delta observable independently from completion."""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_first_delta_s_tracked(self) -> None:
         turn = GenerationTurn()
         assert turn.first_delta_s is None
@@ -396,7 +427,7 @@ class TestFirstDelta:
 class TestResponsesFromTurnEvents:
     """A2: Responses rendered from TurnEvents, NOT from Chat SSE parsing."""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_text_completion_renders_responses_sse(self) -> None:
         turn = GenerationTurn()
         request = _fake_responses_request()
@@ -434,7 +465,7 @@ class TestResponsesFromTurnEvents:
         assert completed["response"]["status"] == "completed"
         assert completed["response"]["usage"]["output_tokens"] == 2
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_reasoning_plus_text(self) -> None:
         turn = GenerationTurn()
         request = _fake_responses_request()
@@ -457,7 +488,7 @@ class TestResponsesFromTurnEvents:
         assert "response.reasoning_text.delta" in types
         assert "response.output_text.delta" in types
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_tool_call_rendering(self) -> None:
         turn = GenerationTurn()
         request = _fake_responses_request()
@@ -484,7 +515,7 @@ class TestResponsesFromTurnEvents:
         done_fc = [e for e in events if e["type"] == "response.function_call_arguments.done"][0]
         assert done_fc["arguments"] == '{"city":"NYC"}'
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_failed_turn_renders_response_failed(self) -> None:
         turn = GenerationTurn()
         request = _fake_responses_request()
@@ -506,7 +537,7 @@ class TestResponsesFromTurnEvents:
         assert "response.failed" in types
         assert "response.completed" not in types
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_cancelled_turn_renders_response_failed(self) -> None:
         turn = GenerationTurn()
         request = _fake_responses_request()
@@ -526,7 +557,7 @@ class TestResponsesFromTurnEvents:
         types = [e["type"] for e in events]
         assert "response.failed" in types
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_length_finish_reason_produces_incomplete(self) -> None:
         turn = GenerationTurn()
         request = _fake_responses_request()
@@ -548,7 +579,7 @@ class TestResponsesFromTurnEvents:
         assert "response.incomplete" in types
         assert "response.completed" not in types
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_sequence_numbers_monotonic(self) -> None:
         turn = GenerationTurn()
         request = _fake_responses_request()
@@ -575,7 +606,7 @@ class TestResponsesFromTurnEvents:
 class TestThreeProtocolsShareLifecycle:
     """R5: Chat, Responses, and Anthropic resolve to the same lifecycle authority."""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_two_subscribers_share_terminal_state(self) -> None:
         turn = GenerationTurn()
         sub_responses = turn.subscribe()
@@ -597,7 +628,7 @@ class TestThreeProtocolsShareLifecycle:
         assert isinstance(anthropic_events[-1], TurnCompleted)
         assert responses_events[-1].finish_reason == anthropic_events[-1].finish_reason
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_cancel_reaches_all_subscribers(self) -> None:
         turn = GenerationTurn()
         sub1 = turn.subscribe()
@@ -616,3 +647,45 @@ class TestThreeProtocolsShareLifecycle:
 
         assert any(isinstance(e, TurnCancelled) for e in events1)
         assert any(isinstance(e, TurnCancelled) for e in events2)
+
+    def test_live_routes_do_not_background_drain_chat_streams(self) -> None:
+        source = inspect.getsource(openai.create_app)
+        assert "_drive_generation" not in source
+        assert "body_iterator" not in source[source.index('@app.post("/v1/responses")'):]
+
+    @pytest.mark.anyio
+    async def test_responses_eof_without_terminal_fails(self) -> None:
+        async def eof_only():
+            yield TurnStarted(response_id="r", model="m", created=1)
+            yield TextDelta(delta="partial")
+
+        events: list[dict[str, Any]] = []
+        async for chunk in responses_stream_from_turn_events(
+            eof_only(),
+            request=_fake_responses_request(),
+            response_id="r",
+            model="m",
+            created_at=1,
+        ):
+            for line in chunk.strip().split("\n"):
+                if line.startswith("data: "):
+                    events.append(json.loads(line.removeprefix("data: ")))
+
+        assert events[-1]["type"] == "response.failed"
+        assert events[-1]["response"]["error"]["code"] == "driver_eof_without_terminal"
+        assert "response.completed" not in [event["type"] for event in events]
+
+    @pytest.mark.anyio
+    async def test_anthropic_eof_without_terminal_fails(self) -> None:
+        async def eof_only():
+            yield TurnStarted(response_id="r", model="m", created=1)
+            yield TextDelta(delta="partial")
+
+        frames = [
+            frame
+            async for frame in openai._anthropic_stream_from_turn_events(
+                eof_only(), model="m"
+            )
+        ]
+        assert any("event: error" in frame for frame in frames)
+        assert not any("event: message_stop" in frame for frame in frames)

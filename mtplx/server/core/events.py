@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Union
+from typing import Any, Union
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,13 @@ class TurnStarted:
     model: str
     created: int
     timestamp_s: float = field(default_factory=time.perf_counter)
+
+
+@dataclass(frozen=True)
+class OutputItemStarted:
+    kind: str
+    index: int = 0
+    item_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -51,6 +58,11 @@ class UsageUpdate:
 
 
 @dataclass(frozen=True)
+class TurnHeartbeat:
+    payload: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
 class TurnCompleted:
     finish_reason: str
     usage: UsageUpdate | None = None
@@ -71,10 +83,12 @@ TerminalEvent = Union[TurnCompleted, TurnFailed, TurnCancelled]
 
 TurnEvent = Union[
     TurnStarted,
+    OutputItemStarted,
     TextDelta,
     ReasoningDelta,
     ToolCallDelta,
     UsageUpdate,
+    TurnHeartbeat,
     TurnCompleted,
     TurnFailed,
     TurnCancelled,
