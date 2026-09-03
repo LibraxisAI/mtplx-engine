@@ -66,12 +66,15 @@ class TurnHeartbeat:
 class TurnCompleted:
     finish_reason: str
     usage: UsageUpdate | None = None
+    mtplx_stats: dict[str, Any] | None = None
+    timings: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
 class TurnFailed:
     error: str
     code: str | None = None
+    status_code: int = 500
 
 
 @dataclass(frozen=True)

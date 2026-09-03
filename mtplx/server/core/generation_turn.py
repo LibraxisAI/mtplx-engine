@@ -65,6 +65,7 @@ class GenerationTurn:
         self._subscribers: list[asyncio.Queue[TurnEvent | None]] = []
         self._maxsize = max(2, int(maxsize))
         self._first_delta_s: float | None = None
+        self._driver_task: asyncio.Task[None] | None = None
 
     @property
     def state(self) -> TurnState:
@@ -73,6 +74,20 @@ class GenerationTurn:
     @property
     def first_delta_s(self) -> float | None:
         return self._first_delta_s
+
+    @property
+    def driver_task(self) -> asyncio.Task[None] | None:
+        return self._driver_task
+
+    def attach_driver(self, task: asyncio.Task[None]) -> None:
+        if self._driver_task is not None:
+            raise RuntimeError("generation driver already attached")
+        self._driver_task = task
+
+    def cancel_driver(self) -> None:
+        task = self._driver_task
+        if task is not None and not task.done():
+            task.cancel()
 
     def start(self, event: TurnStarted) -> None:
         if self._state != TurnState.IDLE:
