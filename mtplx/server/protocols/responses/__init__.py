@@ -1,6 +1,10 @@
 """Native, ephemeral OpenAI Responses protocol adapter."""
 
-from .encoder import response_from_chat_completion, responses_stream_from_chat_sse
+from .encoder import (
+    response_from_chat_completion,
+    responses_stream_from_chat_sse,
+    responses_stream_from_turn_events,
+)
 from .schema import ResponsesRequest
 from .translate import ResponsesProtocolError, responses_request_to_chat
 
@@ -10,4 +14,5 @@ __all__ = [
     "response_from_chat_completion",
     "responses_request_to_chat",
     "responses_stream_from_chat_sse",
+    "responses_stream_from_turn_events",
 ]
