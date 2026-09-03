@@ -33394,16 +33394,10 @@ def create_app(state: ServerState) -> FastAPI:
         response_id = response_registry.allocate_id(
             response_hint if request.store is not True else None
         )
-        chat_response_id = _response_id_from_client_hint(
-            prefix="chatcmpl",
-            headers=headers,
-            metadata=_request_metadata(chat_request),
-        )
         created_at = int(time.time())
         turn_holder: dict[str, GenerationTurn] = {}
 
         def cancel_generation() -> None:
-            state.dashboard.in_flight.cancel(chat_response_id)
             turn = turn_holder.get("turn")
             if turn is not None:
                 turn.cancel_driver()
