@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import base64
 import asyncio
+import traceback
 import builtins
 import errno
 import gc
@@ -36,7 +37,7 @@ import urllib.parse
 import uuid
 import weakref
 import webbrowser
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, deque
 from collections.abc import AsyncIterator
 from concurrent.futures import Future
 from contextlib import asynccontextmanager, contextmanager, nullcontext, suppress
@@ -45,7 +46,7 @@ from enum import Enum
 from pathlib import Path
 from queue import Empty
 from threading import Condition, Event, Lock, Thread, Timer
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -91,6 +92,8 @@ from mtplx.backends.descriptors import (
     descriptor_from_runtime,
     model_controls_for_descriptor,
     model_family_from_inspection,
+    REASONING_FAMILY_OVERRIDE_LANES,
+    reasoning_family_override_applies,
     reasoning_policy_for_model,
     set_draft_control_arg,
     sync_backend_arg_aliases,
@@ -113,6 +116,7 @@ from mtplx.gemma4_pair import (
     resolve_gemma4_pair_paths,
 )
 from mtplx.model_scheduler import ModelWorkScheduler
+from mtplx.server.hyper import HYPER_ADMISSION_CAP, HyperAdmissionGate
 from mtplx.reasoning_effort import (
     REASONING_EFFORT_CHOICES,
     REASONING_EFFORT_LEVELS,
@@ -132,15 +136,20 @@ from mtplx.server.core import (
     ToolCallDelta,
     TurnCancelled,
     TurnCompleted,
+    TurnEvent,
     TurnFailed,
     TurnHeartbeat,
     TurnStarted,
     UsageUpdate,
 )
 from mtplx.server.protocols.responses import (
+    ResponseRegistry,
+    ResponseStoreError,
     ResponsesProtocolError,
     ResponsesRequest,
+    response_failure_envelope,
     response_from_chat_completion,
+    response_output_to_chat_messages,
     responses_request_to_chat,
     responses_stream_from_turn_events,
 )
@@ -221,6 +230,13 @@ from mtplx.server_urls import (
 LOGGER = logging.getLogger("mtplx.server.openai")
 
 SCHEDULER_MODE_CHOICES = tuple(mode.value for mode in SchedulerMode)
+# What /v1/mtplx/app-capabilities advertises to the app UI. "hyper" is the
+# H0 experimental chassis (2.9.3): launchable via --scheduler-mode for
+# operators, but at width 1 it is by construction identical-output with no
+# user benefit yet, so the app does not surface it as a mode choice.
+ADVERTISED_SCHEDULER_MODES = tuple(
+    mode for mode in SCHEDULER_MODE_CHOICES if mode != "hyper"
+)
 BATCHING_PRESET_CHOICES = tuple(preset.value for preset in SchedulerPreset)
 _STDOUT_LOGGING_BROKEN = False
 
@@ -377,6 +393,17 @@ CHAT_TEMPLATE_SENTINEL_RE = re.compile(
 STREAM_HEARTBEAT_INTERVAL_S = 10.0
 STREAM_SILENCE_WARN_S = 30.0
 STREAM_SILENCE_WARN_INTERVAL_S = 60.0
+# Pre-first-token SSE comment heartbeats (#358). A long prefill (minutes at
+# >32k-token prompts) used to put zero bytes on the wire before the first
+# token payload, so strict client/proxy read-timeouts (Claude Code, Cursor,
+# Open WebUI, nginx, cloudflared) killed the connection while the engine was
+# still computing. Any SSE line starting with ":" is a spec-level comment
+# that compliant parsers (official OpenAI SDKs included) ignore, yet it still
+# resets those read-timeouts. Once real payload chunks flow, token cadence is
+# the liveness signal and the comments stop.
+SSE_KEEPALIVE_COMMENT = ": keep-alive\n\n"
+SSE_KEEPALIVE_DEFAULT_INTERVAL_S = 5.0
+SSE_KEEPALIVE_MIN_INTERVAL_S = 1.0
 # Stall containment (#86): a stream that receives nothing while the model
 # owner's progress heartbeat is frozen for this long is failed with a
 # structured error instead of hanging forever. Healthy work ticks the
@@ -604,10 +631,56 @@ def _raise_if_stream_cancelled(
         raise _StreamCancelled(message)
 
 
+class _AttributedCancelEvent(Event):
+    """Per-request cancel flag that remembers WHY it was first tripped.
+
+    One shared event is set by unrelated paths (the POST /v1/mtplx/cancel
+    endpoint, the client-disconnect monitor, stop-sequence completion,
+    early tool-call finalization, the hidden-tool guard, stall
+    containment, stream teardown). The terminal frame used to blame every
+    non-disconnect trip on the POST endpoint (#381); the first origin
+    recorded here is the one the client is told about.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.origin: str | None = None
+
+    def set_origin(self, origin: str) -> None:
+        if self.origin is None:
+            self.origin = origin
+        self.set()
+
+
+_CANCEL_ORIGIN_VIA = {
+    "post_endpoint": "POST /v1/mtplx/cancel",
+    "client_disconnect": "client disconnect",
+    "stop_sequence": "stop-sequence completion",
+    "early_tool_finish": "server tool-call finalization",
+    "hidden_tool_guard": "the hidden-tool stream guard",
+    "stream_stall": "stream-stall containment",
+    "stream_teardown": "server stream teardown",
+}
+
+
+def _cancel_via_label(cancel_event: Event) -> str:
+    origin = getattr(cancel_event, "origin", None)
+    if origin is None:
+        # Attribution unknown: never blame the POST endpoint for a trip
+        # it did not make (#381) — say what is actually known.
+        return "an internal cancellation path"
+    return _CANCEL_ORIGIN_VIA.get(origin, origin)
+
+
 def _cancel_stream_generation(
-    cancel_event: Event, generation_future: Any | None
+    cancel_event: Event,
+    generation_future: Any | None,
+    origin: str | None = None,
 ) -> None:
-    cancel_event.set()
+    if origin is not None and isinstance(cancel_event, _AttributedCancelEvent):
+        cancel_event.set_origin(origin)
+    else:
+        cancel_event.set()
     if generation_future is None:
         return
     try:
@@ -631,49 +704,195 @@ async def _monitor_request_disconnect(
         if disconnected:
             if on_disconnect is not None:
                 on_disconnect()
-            cancel_event.set()
+            if isinstance(cancel_event, _AttributedCancelEvent):
+                cancel_event.set_origin("client_disconnect")
+            else:
+                cancel_event.set()
             return True
         await asyncio.sleep(max(0.01, float(poll_s)))
     return False
 
 
-class _TurnEventStreamResponse:
-    """Internal streaming turn handle for non-Chat protocol projections."""
+class _GenerationTurnStream:
+    """One protocol-neutral driver observed by exactly one wire renderer."""
 
     def __init__(
         self,
         turn: GenerationTurn,
-        driver_factory: Callable[[], AsyncIterator[str]],
+        driver_factory: Callable[[], Awaitable[None]],
     ) -> None:
         self.turn = turn
         self._driver_factory = driver_factory
 
-    async def events(self) -> AsyncIterator[Any]:
+    async def events(self) -> AsyncIterator[TurnEvent]:
         subscriber = self.turn.subscribe()
         driver = self._driver_factory()
-        drain = getattr(subscriber, "drain_nowait", None)
-        try:
-            async for _ in driver:
-                if drain is not None:
-                    for event in drain():
-                        yield event
-            if getattr(getattr(self.turn, "state", None), "value", None) != "terminal":
-                with suppress(RuntimeError):
-                    self.turn.fail(
-                        TurnFailed(
-                            error="generation driver ended without a terminal event",
-                            code="driver_eof_without_terminal",
+        driver_task = asyncio.create_task(driver)
+        self.turn.attach_driver(driver_task)
+
+        def close_unterminated_driver(task: asyncio.Task[None]) -> None:
+            if getattr(getattr(self.turn, "state", None), "value", None) == "terminal":
+                return
+            if task.cancelled():
+                terminal: TurnEvent = TurnCancelled(reason="generation_driver_cancelled")
+            else:
+                exception = task.exception()
+                terminal = TurnFailed(
+                    error=(
+                        str(exception)
+                        if exception is not None
+                        else "generation driver ended without a terminal event"
+                    ),
+                    code=(
+                        "generation_driver_error"
+                        if exception is not None
+                        else "driver_eof_without_terminal"
+                    ),
+                )
+            with suppress(RuntimeError):
+                if isinstance(terminal, TurnCancelled):
+                    if getattr(self.turn.state, "value", None) == "idle":
+                        self.turn.fail(
+                            TurnFailed(
+                                error=terminal.reason,
+                                code="generation_driver_cancelled",
+                            )
                         )
-                    )
-            if drain is not None:
-                for event in drain():
-                    yield event
+                    else:
+                        self.turn.cancel(terminal)
+                else:
+                    self.turn.fail(terminal)
+
+        driver_task.add_done_callback(close_unterminated_driver)
+        try:
             async for event in subscriber:
                 yield event
         finally:
-            if hasattr(driver, "aclose"):
-                with suppress(Exception):
-                    await driver.aclose()
+            if getattr(getattr(self.turn, "state", None), "value", None) != "terminal":
+                with suppress(RuntimeError):
+                    self.turn.cancel(TurnCancelled(reason="renderer_disconnected"))
+            self.turn.cancel_driver()
+            with suppress(asyncio.CancelledError):
+                await driver_task
+
+
+async def _chat_stream_from_turn_events(
+    events: AsyncIterator[TurnEvent],
+) -> AsyncIterator[str]:
+    """Project the common turn lifecycle onto Chat Completions SSE."""
+
+    started: TurnStarted | None = None
+    terminal_seen = False
+
+    def payload(delta: dict[str, Any], *, finish_reason: str | None = None) -> dict[str, Any]:
+        if started is None:
+            raise RuntimeError("turn delta arrived before TurnStarted")
+        return {
+            "id": started.response_id,
+            "object": "chat.completion.chunk",
+            "created": started.created,
+            "model": started.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": finish_reason,
+                }
+            ],
+        }
+
+    async for event in events:
+        if isinstance(event, TurnStarted):
+            if started is not None:
+                raise RuntimeError("duplicate TurnStarted")
+            started = event
+            yield f"data: {json.dumps(payload({'role': 'assistant'}))}\n\n"
+            continue
+        if isinstance(event, OutputItemStarted):
+            continue
+        if isinstance(event, TurnHeartbeat):
+            heartbeat = payload({})
+            heartbeat["mtplx_progress"] = _json_safe(event.payload or {})
+            yield f"data: {json.dumps(heartbeat)}\n\n"
+            continue
+        if isinstance(event, ReasoningDelta):
+            yield f"data: {json.dumps(payload({'reasoning_content': event.delta}))}\n\n"
+            continue
+        if isinstance(event, TextDelta):
+            yield f"data: {json.dumps(payload({'content': event.delta}))}\n\n"
+            continue
+        if isinstance(event, ToolCallDelta):
+            function: dict[str, Any] = {}
+            if event.name is not None:
+                function["name"] = event.name
+                function["arguments"] = event.arguments_delta
+            elif event.arguments_delta:
+                function["arguments"] = event.arguments_delta
+            tool_call: dict[str, Any] = {
+                "index": event.index,
+                "type": "function",
+                "function": function,
+            }
+            if event.call_id is not None:
+                tool_call["id"] = event.call_id
+            yield f"data: {json.dumps(payload({'tool_calls': [tool_call]}))}\n\n"
+            continue
+        if isinstance(event, UsageUpdate):
+            continue
+        if isinstance(event, TurnCompleted):
+            terminal_seen = True
+            completed = payload({}, finish_reason=event.finish_reason)
+            usage = event.usage
+            completed["usage"] = {
+                "prompt_tokens": int(usage.prompt_tokens if usage else 0),
+                "completion_tokens": int(usage.completion_tokens if usage else 0),
+                "total_tokens": int(
+                    (usage.prompt_tokens + usage.completion_tokens) if usage else 0
+                ),
+            }
+            completed["mtplx_stats"] = event.mtplx_stats or {}
+            completed["timings"] = event.timings or {}
+            yield f"data: {json.dumps(completed)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+        if isinstance(event, TurnFailed):
+            terminal_seen = True
+            failed = payload({}, finish_reason="error")
+            failed.update(
+                _openai_error_content(
+                    event.error,
+                    status_code=event.status_code,
+                    code=event.code or "server_error",
+                )
+            )
+            yield f"data: {json.dumps(failed)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+        if isinstance(event, TurnCancelled):
+            terminal_seen = True
+            cancelled = payload({}, finish_reason="error")
+            cancelled.update(
+                _openai_error_content(
+                    event.reason,
+                    status_code=499,
+                    code="request_cancelled",
+                )
+            )
+            yield f"data: {json.dumps(cancelled)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+    if not terminal_seen and started is not None:
+        failed = payload({}, finish_reason="error")
+        failed.update(
+            _openai_error_content(
+                "generation event stream ended without a terminal event",
+                status_code=500,
+                code="driver_eof_without_terminal",
+            )
+        )
+        yield f"data: {json.dumps(failed)}\n\n"
+        yield "data: [DONE]\n\n"
 
 
 def _comma_floats(value: str) -> tuple[float, ...]:
@@ -744,7 +963,115 @@ def _server_runtime_env_overrides(
         and verify_strategy not in VERIFY_SNAPSHOT_OPTIONAL_STRATEGIES
     ):
         overrides["MTPLX_SKIP_VERIFY_SNAPSHOT"] = "0"
+    if generation_mode == "mtp" and _served_model_type_is_qwen4_exp(args):
+        # Flash-Next rejection rollback REQUIRES the recurrent-state
+        # snapshot: it is both the safety fallback and the pre-state source
+        # the family capture-commit replays from. (With the capture lane
+        # active the snapshot is the zero-copy lazy variant, so this is no
+        # longer a per-round clone.) Keyed on the served config's
+        # model_type: the family rides the generic native_mtp descriptor, so
+        # args.backend_id cannot identify it.
+        overrides["MTPLX_SKIP_VERIFY_SNAPSHOT"] = "0"
+    if _served_model_type_is_qwen4_exp(args):
+        # Family speed lanes, defaulted only when the launcher environment
+        # left them unset (an explicit operator export wins):
+        # - Pipelined AR decode + compiled GDN runs (2026-08-27 receipts:
+        #   42.6 -> 51.9 t/s AR, GPU 57% -> 96.6% busy). Arms itself only
+        #   when the n-gram table went resident (RAM-plan gated via
+        #   MTPLX_NGRAM_RESIDENT=auto); smaller machines keep the staged
+        #   classic loop.
+        # - Layer-owned capture-commit (2026-08-27 receipts: verify round
+        #   51.7 -> 38.8 ms, repair re-forwards 8.2 -> 0 ms/round, MTP
+        #   recorder 75.25 -> 85.9 t/s record) — repair-free speculative
+        #   rollback; falls back to rollback+re-forward per round if a
+        #   capture is ever missing.
+        # - Fused hyper-read v3 (2026-08-27 receipts: AR 51.2 -> 55.2,
+        #   +7.8% x3 consistent; kernel-private 8-bit pack, bf16 module
+        #   weights untouched for prefill/verify).
+        # - GDN in_proj fusion (2026-08-27 receipt: AR 55.0 -> 56.7; four
+        #   input GEMVs -> one, row-concat bit-exact, 36 layers).
+        # - MoE gate+up library merge (2026-08-27 receipt: AR 56.1 -> 57.65
+        #   mean n=4; 96 modules, 3->2 gather_qmm routed + 2->1 qmm shared).
+        #   NOTE: this arms ONLY the sanitize-time library-call merge; the
+        #   custom moe_glu_decode kernel stays behind MTPLX_FUSED_MOE_DECODE
+        #   (falsified at g64, -5%).
+        # - GDN conv+silu+l2norm fused between the GEMVs (2026-08-27 A/B/A:
+        #   59.31 -> 60.96, every B row above every A row — the first config
+        #   past the 60-AR line).
+        # - One-dispatch GDN decode step (2026-08-27): conv+silu+l2norm,
+        #   g/beta, fp32 delta recurrence, and the SigmoidRMSNormGated
+        #   epilogue in a single kernel between the in_proj/out_proj GEMVs —
+        #   a GDN layer is now 3 sends (was ~6). Supersedes CONVNORM at
+        #   decode (that kernel still covers the S>1 / verify shapes this
+        #   gate refuses). Two boot-triples, both arm orders: A/B/A
+        #   +1.03 t/s (+1.7%, B took the two fastest rows), order-reversed
+        #   B/A/B +1.26 t/s (+2.2%), B took the six fastest warm rows and
+        #   the trailing B arm beat A against the session's downward drift.
+        # - Verify-width conv+silu+l2norm rows kernel (2026-08-27): the same
+        #   chain for speculative verify blocks (S<=6, sliding in-block conv
+        #   window, capture-stash-compatible; the recurrence stays in the
+        #   library gated_delta_update dispatch). MTP two boot-triples, both
+        #   orders: B/A/B +1.95 t/s (+3.06%, fused arm held the top-5 rows),
+        #   A/B/A +1.45 t/s (+2.28%). Best arm mean of the campaign (67.15).
+        truthy_env = {"1", "true", "yes", "on"}
+        gdn_raw = os.environ.get("MTPLX_COMPILED_GDN")
+        qwen4_raw = os.environ.get("MTPLX_QWEN4EXP_COMPILE")
+        compiled_gdn_explicit_off = (
+            gdn_raw is not None and gdn_raw.strip().lower() not in truthy_env
+        )
+        qwen4_compile_explicit_off = (
+            qwen4_raw is not None and qwen4_raw.strip().lower() not in truthy_env
+        )
+        for key in (
+            "MTPLX_AR_PIPELINE",
+            "MTPLX_FAMILY_CAPTURE_COMMIT",
+            "MTPLX_FUSED_HC_V3",
+            "MTPLX_FUSED_GDN_INPROJ",
+            "MTPLX_FUSED_GATE_UP",
+            "MTPLX_FUSED_GDN_CONVNORM",
+            "MTPLX_FUSED_GDN_STEP",
+            "MTPLX_FUSED_CONVNORM_VERIFY",
+            # QSA rows-gather (2026-08-28, adapting PR #380 by @maceip):
+            # family default ON. Self-fenced to S 2..8 at KV >= 16384, so
+            # below that the config is bit-identical dense. Receipt: paired
+            # 16,384-token xhigh arms — dense verify grew 37.0->46.9
+            # ms/round (last-256 36.0 tok/s), gather held flat 45.3->45.9
+            # (last-256 64.5); parity 2e-2 on the real layer over identical
+            # visible sets. Founder release call 2026-08-28: family is
+            # unshipped, fences bound the blast radius, kill switch is
+            # MTPLX_QSA_GATHER=0. 100k rung + copy-block widths (25 rows,
+            # MTPLX_QSA_GATHER_MAX_ROWS) remain the post-release sweep.
+            "MTPLX_QSA_GATHER",
+        ):
+            if os.environ.get(key) is None:
+                overrides.setdefault(key, "1")
+        if not (compiled_gdn_explicit_off or qwen4_compile_explicit_off):
+            for key in ("MTPLX_COMPILED_GDN", "MTPLX_QWEN4EXP_COMPILE"):
+                if os.environ.get(key) is None:
+                    overrides.setdefault(key, "1")
+        if os.environ.get("MTPLX_NAX_VERIFY") is None:
+            # The turbo profile arms the 27B NAX verify patch
+            # (MTPLX_NAX_VERIFY=1); on this family it is unmeasured and
+            # mostly bypassed — the fused family modules call
+            # mx.quantized_matmul directly, so the patch could only touch
+            # foreign-shape leftovers (248320-vocab lm_head, expert
+            # gathers). Hold it OFF until it earns a family receipt at
+            # verify widths. An explicit operator export still wins via the
+            # env gate above, and runtime_env_overrides are applied AFTER
+            # the profile env (apply_profile_env), so this beats turbo's 1.
+            overrides["MTPLX_NAX_VERIFY"] = "0"
     return overrides
+
+
+def _served_model_type_is_qwen4_exp(args: argparse.Namespace) -> bool:
+    try:
+        with open(Path(str(args.model)) / "config.json", "rb") as fh:
+            cfg = json.load(fh)
+    except Exception:
+        return False
+    mt = str(cfg.get("model_type") or "").lower()
+    tmt = str((cfg.get("text_config") or {}).get("model_type") or "").lower()
+    return "qwen4_exp" in (mt, tmt) or "qwen4_exp_text" in (mt, tmt)
 
 
 def _assert_fast_path_env() -> dict[str, dict[str, Any]]:
@@ -818,14 +1145,24 @@ def _parse_byte_limit(value: str | int | None) -> int | None:
     text = str(value).strip().lower().replace("_", "")
     if not text:
         return None
+    # Single-letter spellings included: "48G" is the form every MTPLX
+    # budget message advertises ("sizes like 4G"), yet this parser only
+    # took "48GB"/"48GiB" — `--memory-budget 48G` crashed serve startup
+    # with a raw ValueError (found by the memory-governor tests, 2026-08-26).
     multipliers = {
         "b": 1,
+        "k": 1024,
         "kb": 1024,
         "kib": 1024,
+        "m": 1024**2,
         "mb": 1024**2,
         "mib": 1024**2,
+        "g": 1024**3,
         "gb": 1024**3,
         "gib": 1024**3,
+        "t": 1024**4,
+        "tb": 1024**4,
+        "tib": 1024**4,
     }
     for suffix, multiplier in sorted(
         multipliers.items(), key=lambda item: -len(item[0])
@@ -1711,6 +2048,34 @@ def _set_metal_memory_limit(mx: Any, name: str, value: int) -> str:
     raise AttributeError(f"MLX memory cap API {name} is unavailable")
 
 
+def _metal_system_reserve_bytes(total_ram_bytes: int) -> int:
+    """Unwired headroom macOS keeps outside the allocator caps.
+
+    16 GiB is right on 128 GB+ machines, but as a flat constant it
+    refused the 96 GB class by exactly the release notes' own margin
+    (issue #400: 77.3 GiB weights + 6 GiB floor margin + 16 GiB = 99.3
+    > 96, while the same pack ships healthy there with ~16 GiB left
+    unwired). Scale to RAM/8 below 128 GB, floored at 8 GiB — macOS's
+    own practical working floor — and keep 128 GB+ behavior unchanged.
+    """
+    return int(min(16 * 1024**3, max(8 * 1024**3, total_ram_bytes // 8)))
+
+
+def _resident_floor_margin_bytes(total_ram_bytes: int | None) -> int:
+    """Working margin above the weight files inside the wired floor
+    (allocator transients, KV pages, MTP sidecar churn).
+
+    6 GiB carries the 2026-08-27 128 GB receipt (n-gram eviction
+    collapse fix) and stays untouched at 112 GB+. Smaller machines run
+    proportionally smaller working sets and cannot afford the flat
+    constant: issue #400's 96 GB M2 Max receipt ships healthy at +2
+    GiB, so scale to RAM/32 with a 2 GiB floor below 112 GB.
+    """
+    if not total_ram_bytes or total_ram_bytes >= 112 * 1024**3:
+        return 6 * 1024**3
+    return int(max(2 * 1024**3, total_ram_bytes // 32))
+
+
 def _apply_metal_memory_caps(
     *,
     mx_module: Any | None = None,
@@ -1775,20 +2140,17 @@ def _apply_metal_memory_caps(
             160 * 1024**3,
         )
     resident_floor = max(0, int(minimum_resident_bytes or 0))
-    if (
-        resident_floor
-        and total_ram is not None
-        and total_ram > 0
-        and resident_floor + 16 * 1024**3 > total_ram
-    ):
-        return {
-            "applied": False,
-            "reason": "insufficient_ram",
-            "total_ram_bytes": total_ram,
-            "total_ram_source": total_ram_source,
-            "minimum_resident_bytes": resident_floor,
-            "minimum_system_reserve_bytes": 16 * 1024**3,
-        }
+    if resident_floor and total_ram is not None and total_ram > 0:
+        system_reserve = _metal_system_reserve_bytes(total_ram)
+        if resident_floor + system_reserve > total_ram:
+            return {
+                "applied": False,
+                "reason": "insufficient_ram",
+                "total_ram_bytes": total_ram,
+                "total_ram_source": total_ram_source,
+                "minimum_resident_bytes": resident_floor,
+                "minimum_system_reserve_bytes": system_reserve,
+            }
     mem_limit = _parse_metal_memory_size_bytes(mem_raw, default_mem)
     wired_limit = _parse_metal_memory_size_bytes(wired_raw, default_wired)
     if resident_floor:
@@ -1912,13 +2274,26 @@ def _select_backend_context_window(
     *,
     model_max: int,
     requested: int | None,
+    machine_fit: int | None = None,
 ) -> int:
+    """Serving window: explicit request > machine fit > model max.
+
+    ``machine_fit`` is the memory plan's largest window whose full-window
+    KV actually fits this machine's engine envelope (issue #305: the flat
+    model-max default admitted 262k-token prompts on 48 GB Macs, whose KV
+    alone exceeds the Metal budget — swap-death, not an error message).
+    It shapes only the DEFAULT: an explicit --context-window always wins,
+    with the plan warning loudly instead of refusing.
+    """
     requested_value = int(requested or 0)
     default_value = (
         backend.context_window_policy.default
         if backend.backend_id == "laguna_ar"
         else int(model_max)
     )
+    fit = int(machine_fit or 0)
+    if requested_value <= 0 and fit > 0:
+        default_value = min(int(default_value), fit)
     return max(
         4_096,
         min(
@@ -1985,9 +2360,89 @@ def _validate_mtp_batch_settings(args: argparse.Namespace) -> None:
     _require_mlx_lm_arrays_cache_fix()
 
 
+def _validate_hyper_settings(args: argparse.Namespace) -> None:
+    """Reject launch flags that contradict hyper's admission contract.
+
+    ``--scheduler-mode hyper`` fixes external admission at 1: one request in
+    flight, simultaneous requests queued FIFO exactly like serial, and any
+    width (H1/H2) spent on self-generated rows for that one request. The
+    multi-admission knobs therefore have no meaning here — an operator
+    passing them asked for two different schedulers, and hyper fails loudly
+    at startup (before model construction) instead of silently ignoring the
+    contradiction. See mtplx/server/hyper.py for the mode contract.
+    """
+
+    if str(getattr(args, "scheduler_mode", "serial")) != SchedulerMode.HYPER:
+        return
+    max_active = getattr(args, "max_active_requests", None)
+    if max_active is not None and int(max_active) != HYPER_ADMISSION_CAP:
+        raise ValueError(
+            "scheduler_mode=hyper fixes external admission at "
+            f"{HYPER_ADMISSION_CAP}; --max-active-requests {int(max_active)} "
+            "contradicts it (hyper width is per-request self-speculation, "
+            "not extra clients)"
+        )
+    decode_batch_max = getattr(args, "decode_batch_max", None)
+    if decode_batch_max is not None and int(decode_batch_max) != 1:
+        raise ValueError(
+            "scheduler_mode=hyper decodes one external request at a time; "
+            f"--decode-batch-max {int(decode_batch_max)} is an ar_batch/"
+            "mtp_batch knob. Hyper widths (H1/H2) install internally and "
+            "are not operator batch knobs."
+        )
+    batch_wait_ms = getattr(args, "batch_wait_ms", None)
+    if batch_wait_ms is not None and float(batch_wait_ms) > 0.0:
+        raise ValueError(
+            "scheduler_mode=hyper never holds a gather window "
+            f"(--batch-wait-ms {float(batch_wait_ms):g}): width comes from "
+            "the request's own speculative rows, so there is nothing to "
+            "wait for (singleton-passthrough contract)"
+        )
+    preset = str(getattr(args, "batching_preset", "latency") or "latency")
+    if preset in {"agent", "throughput"}:
+        raise ValueError(
+            "scheduler_mode=hyper is single-admission; batching preset "
+            f"'{preset}' configures multi-request admission. Use 'latency' "
+            "(default) or 'solo'."
+        )
+
+
+_QWEN3NEXT_STRUCTURE_VERIFY_STRATEGIES = frozenset(
+    {"capture", "capture_commit", "graphbank", "graphbank_capture_commit", "target_prefix"}
+)
+
+
+def _coerce_family_verify_strategy(args: argparse.Namespace) -> None:
+    """qwen4_exp packs cannot run the qwen3-next structure verify strategies.
+
+    The server default (--verify-strategy capture_commit) is the 27B fast
+    path; its capture stack introspects the qwen3-next DecoderLayer layout
+    (input_layernorm et al.) and raises AttributeError on Flash-Next
+    hyper-connection layers, so every MTP request 500s (first live hit
+    2026-08-27, raw-module boot). The family's repair-free lane is
+    MTPLX_FAMILY_CAPTURE_COMMIT, which wraps the batched verify instead of
+    replacing it, so 'batched' is the only correct base strategy here.
+    """
+    if not _served_model_type_is_qwen4_exp(args):
+        return
+    strategy = (
+        str(getattr(args, "verify_strategy", "") or "").strip().lower().replace("-", "_")
+    )
+    if strategy in _QWEN3NEXT_STRUCTURE_VERIFY_STRATEGIES:
+        print(
+            f"[serve] verify-strategy {strategy!r} is a qwen3-next structure "
+            "lane; qwen4_exp verifies 'batched' (repair-free rollback rides "
+            "the MTPLX_FAMILY_CAPTURE_COMMIT env lane). Coercing.",
+            flush=True,
+        )
+        args.verify_strategy = "batched"
+
+
 class ServerState:
     def __init__(self, args: argparse.Namespace) -> None:
+        _coerce_family_verify_strategy(args)
         _validate_mtp_batch_settings(args)
+        _validate_hyper_settings(args)
         self.args = args
         try:
             args.paged_kv_quantization = normalize_paged_kv_quantization(
@@ -2038,15 +2493,56 @@ class ServerState:
         # explicitly for foreground-vs-idle admission.
         self.generation_executor = self.model_scheduler
         self.postcommit_executor = None
+        # Hyper admission gate (scheduler_mode=hyper only): accounting + the
+        # H1/H2 width seam. Never constructed for other modes so the serial
+        # dispatch tail stays untouched (a None check is its whole cost).
+        self.hyper_gate = (
+            HyperAdmissionGate()
+            if str(getattr(args, "scheduler_mode", "serial")) == SchedulerMode.HYPER
+            else None
+        )
         self.rate_limiter = _RateLimiter(args.rate_limit)
         startup_backend = descriptor_for_backend_id(getattr(args, "backend_id", None))
         minimum_resident_bytes = None
+        resident_floor_label = "The model"
         if startup_backend.backend_id == "laguna_ar":
             from mtplx.models.laguna_config import (
                 LAGUNA_S_2_1_MIN_RESIDENT_BYTES,
             )
 
             minimum_resident_bytes = LAGUNA_S_2_1_MIN_RESIDENT_BYTES
+            resident_floor_label = "Laguna-S-2.1"
+        elif _served_model_type_is_qwen4_exp(args):
+            # The default wired cap (60% of RAM) sits BELOW this family's
+            # working set once the n-gram table goes RAM-resident: on a 128G
+            # M5 Max the cap landed at ~82G against a ~99G resident set and
+            # Metal's forced eviction collapsed serve decode to 8.5 tok/s
+            # (2026-08-27 battery receipt). Floor = pack weight files
+            # (+ the table when the resident policy arms) + working margin.
+            try:
+                from mtplx.memory_plan import (
+                    NGRAM_TABLE_FILENAME,
+                    ngram_table_resident_policy,
+                )
+
+                model_dir = Path(str(getattr(args, "model", "") or ""))
+                floor = 0
+                for f in model_dir.glob("model*.safetensors"):
+                    floor += f.stat().st_size
+                mtp_f = model_dir / "mtp.safetensors"
+                if mtp_f.exists():
+                    floor += mtp_f.stat().st_size
+                table_f = model_dir / NGRAM_TABLE_FILENAME
+                if table_f.exists() and ngram_table_resident_policy():
+                    floor += table_f.stat().st_size
+                if floor:
+                    ram_bytes, _ = _detect_total_ram_bytes_for_metal_caps()
+                    minimum_resident_bytes = floor + _resident_floor_margin_bytes(
+                        ram_bytes
+                    )
+                    resident_floor_label = "Qwen3.8-Flash-Next"
+            except OSError:
+                minimum_resident_bytes = None
         self.metal_memory_caps = _apply_metal_memory_caps(
             minimum_resident_bytes=minimum_resident_bytes,
         )
@@ -2057,10 +2553,17 @@ class ServerState:
             required_gib = (
                 int(self.metal_memory_caps.get("minimum_resident_bytes") or 0) / 1024**3
             )
+            reserve_gib = (
+                int(
+                    self.metal_memory_caps.get("minimum_system_reserve_bytes")
+                    or 16 * 1024**3
+                )
+                / 1024**3
+            )
             raise RuntimeError(
-                "Laguna-S-2.1 cannot load inside the available Metal memory "
+                f"{resident_floor_label} cannot load inside the available Metal memory "
                 f"budget; at least {required_gib:.1f} GiB resident plus "
-                "16 GiB system headroom is required"
+                f"{reserve_gib:.0f} GiB system headroom is required"
             )
         _validate_backend_context_memory_budget(
             startup_backend,
@@ -2215,6 +2718,12 @@ class ServerState:
         self.mtp_batch_lane = None
         self.mtp_batch_lanes: dict[int, Any] = {}
         self.mtp_batch_omit_speculative_bonus = False
+        if scheduler_config.mode == SchedulerMode.HYPER:
+            _startup_line(
+                "[4/6] hyper scheduler installed: stage=h0 "
+                f"admission_cap={HYPER_ADMISSION_CAP} width=1 "
+                "passthrough=serial_b1 (singleton chassis; width seam idle)"
+            )
         if scheduler_config.mode == SchedulerMode.MTP_BATCH:
             self.mtp_batch_omit_speculative_bonus = str(
                 os.environ.get("MTPLX_OMIT_SPECULATIVE_BONUS", "")
@@ -2319,10 +2828,125 @@ class ServerState:
             args.model,
         )
         requested_context_window = int(getattr(args, "context_window", None) or 0)
+        # Machine memory plan (issue #305): weights are a disk scan, RAM a
+        # sysctl, so the machine's largest safe window is knowable BEFORE
+        # any request — and it shapes the default window below. Five
+        # subsystems budgeting independently with a machine-blind 262k
+        # default is how a 48 GB Mac reached 61.8 GB resident and 3 tok/s.
+        from mtplx.engine_session import (
+            model_weights_bytes as _model_weights_bytes,
+        )
+        from mtplx.memory_plan import (
+            describe_plan as _describe_memory_plan,
+            detect_total_ram_bytes as _plan_detect_total_ram,
+            plan_memory as _plan_memory,
+        )
+
+        _plan_weights_bytes = _model_weights_bytes(
+            getattr(self.runtime, "model_path", None)
+        )
+        # Flash-Next n-gram sidecar: a commitment ONLY when the resident
+        # policy arms (it is then materialized into MLX memory at load);
+        # streamed mode reads reclaimable file-backed pages, so the plan
+        # carries it as a note instead of shrinking the window and the
+        # bank by 30G (the false MODEL-DOES-NOT-FIT chain, 2026-08-28).
+        from mtplx.engine_session import ngram_table_bytes as _ngram_table_bytes
+        from mtplx.memory_plan import (
+            ngram_table_resident_policy as _ngram_table_resident,
+        )
+
+        _plan_table_bytes = _ngram_table_bytes(
+            getattr(self.runtime, "model_path", None)
+        )
+        _plan_table_streamed_bytes = 0
+        if _plan_table_bytes:
+            if _ngram_table_resident():
+                _plan_weights_bytes = (_plan_weights_bytes or 0) + _plan_table_bytes
+            else:
+                _plan_table_streamed_bytes = _plan_table_bytes
+        # env override > model-config-derived geometry > flagship default
+        _plan_kv_bytes_per_token = 0
+        try:
+            _plan_kv_bytes_per_token = int(
+                os.environ.get("MTPLX_DENSE_KV_BYTES_PER_TOKEN") or 0
+            )
+        except (TypeError, ValueError):
+            _plan_kv_bytes_per_token = 0
+        _plan_model_path = getattr(self.runtime, "model_path", None)
+        _plan_model_config: dict[str, Any] | None = None
+        if _plan_model_path is not None:
+            try:
+                _plan_model_config = json.loads(
+                    (Path(_plan_model_path) / "config.json").read_text()
+                )
+            except (OSError, ValueError):
+                _plan_model_config = None
+        if _plan_kv_bytes_per_token <= 0:
+            from mtplx.memory_plan import (
+                dense_kv_bytes_per_token_from_config as _plan_kv_from_config,
+            )
+
+            _plan_kv_bytes_per_token = (
+                _plan_kv_from_config(_plan_model_config) or 65536
+            )
+        _plan_metal_limit: int | None = None
+        _caps = getattr(self, "metal_memory_caps", None)
+        if isinstance(_caps, dict):
+            _cap_value = _caps.get("memory_limit_bytes")
+            if isinstance(_cap_value, int) and _cap_value > 0:
+                _plan_metal_limit = _cap_value
+        from mtplx.memory_plan import (
+            qsa_aux_bytes_per_token_from_config as _plan_aux_from_config,
+        )
+        from mtplx.memory_plan import (
+            qsa_prefill_transient_bytes_per_token_from_config as _plan_transient_from_config,
+        )
+
+        # The context-linear transient prices the DENSE indexer lane's
+        # [S, T] mask/score chain. When the sparse prefill lane will serve
+        # this process (auto on NAX machines, or explicitly armed), those
+        # transients are crossover-bounded and the honest per-token term is
+        # zero — measured: 262K cold prefill peaked at 87.4 GB on a 128 GiB
+        # M5 Max (weights 77.3 + KV 6.4 + aux + flat reserve), against the
+        # dense-priced ~115 GB that #393 observed wedging the machine.
+        _plan_transient_per_token = _plan_transient_from_config(_plan_model_config)
+        if _plan_transient_per_token:
+            try:
+                from mtplx.models.qwen4_exp import (
+                    _qsa_prefill_enabled as _qsa_prefill_lane_resolved,
+                )
+
+                if _qsa_prefill_lane_resolved():
+                    _plan_transient_per_token = 0
+            except Exception:
+                pass
+        _plan_inputs: dict[str, Any] = {
+            "total_ram_bytes": _plan_detect_total_ram(),
+            "model_weights_bytes": _plan_weights_bytes,
+            "ngram_table_streamed_bytes": _plan_table_streamed_bytes,
+            "kv_bytes_per_token": _plan_kv_bytes_per_token,
+            "kv_quantization": _effective_paged_kv_quantization(),
+            "model_max_context": int(self.model_context_window_max),
+            "memory_budget_bytes": self.memory_budget_bytes,
+            "usable_bytes_override": _plan_metal_limit,
+            # Family terms the KV number misses (QSA streams + MTP-head KV,
+            # and the context-linear QSA prefill transient) — issue #393:
+            # without them a 262K window was admitted on 128 GB with 2.4x
+            # phantom headroom and died at 119 GB with no 507.
+            "aux_bytes_per_token": _plan_aux_from_config(_plan_model_config),
+            "prefill_transient_bytes_per_token": _plan_transient_per_token,
+        }
+        _fit_plan = _plan_memory(**_plan_inputs)
+        _machine_fit = (
+            int(_fit_plan.context_window_fit)
+            if _fit_plan.available and _fit_plan.model_fits
+            else 0
+        )
         self.context_window = _select_backend_context_window(
             self.backend_descriptor,
             model_max=int(self.model_context_window_max),
             requested=requested_context_window,
+            machine_fit=_machine_fit,
         )
         if (
             scheduler_config.mode == SchedulerMode.MTP_BATCH
@@ -2338,14 +2962,37 @@ class ServerState:
         # The paged KV pool clamps geometric growth to this window (#150);
         # env is the plumbing because cache_state has no server handle.
         os.environ["MTPLX_CONTEXT_WINDOW_TOKENS"] = str(int(self.context_window))
-        self.session_bank_cold_tier = _session_bank_cold_tier_from_args(args)
-        from mtplx.engine_session import model_weights_bytes as _model_weights_bytes
+        # Final plan against the RESOLVED window (the fit plan above only
+        # shaped the default): overcommit and machine-bound verdicts ride
+        # the banner, the health payload, and the app's dashboard stream.
+        from mtplx.generation import (
+            _dense_decode_max_context as _dense_decode_ceiling,
+        )
 
+        _plan_inputs["requested_context"] = (
+            int(self.context_window) if requested_context_window > 0 else None
+        )
+        _plan_inputs["dense_decode_ceiling"] = int(_dense_decode_ceiling())
+        self.memory_plan = _plan_memory(**_plan_inputs)
+        if self.memory_plan.available:
+            _startup_line(
+                f"[5/6] Memory plan: {_describe_memory_plan(self.memory_plan)}"
+            )
+            for _plan_note in self.memory_plan.notes:
+                _startup_line(f"[5/6] Memory plan: {_plan_note}")
+        else:
+            # A detector whose failure path is "quietly use the default"
+            # is how the app-daemon PATH bug shipped (mistakes ledger);
+            # the fallback names its reason in one log read.
+            _startup_line(
+                "[5/6] Memory plan unavailable "
+                f"({self.memory_plan.unavailable_reason}); legacy budgets apply"
+            )
+        self.session_bank_cold_tier = _session_bank_cold_tier_from_args(args)
         self.sessions = EngineSessionManager(
             cold_tier=self.session_bank_cold_tier,
-            model_weights_bytes=_model_weights_bytes(
-                getattr(self.runtime, "model_path", None)
-            ),
+            model_weights_bytes=_plan_weights_bytes,
+            memory_plan=self.memory_plan,
         )
         # Keep the SSD cold-tier encode (full-KV byte conversion; post-#169
         # it runs at enqueue, never on the writer thread) off request and
@@ -3784,7 +4431,9 @@ def _expand_image_pads(
 # this, each turn re-preprocesses and re-forwards the tower for pixels that
 # cannot have changed. Row-budgeted LRU: ~28 MB per 2.7k-token screenshot at
 # 5120 bf16, so the 32k-row default caps at ~340 MB.
-_VISION_EMBED_CACHE: "OrderedDict[tuple[str, int], tuple[Any, int]]" = OrderedDict()
+_VISION_EMBED_CACHE: (
+    "OrderedDict[tuple[str, int], tuple[Any, int, tuple[int, int, int]]]"
+) = OrderedDict()
 _VISION_EMBED_CACHE_MAX_ROWS = 32768
 
 
@@ -3820,8 +4469,8 @@ def _image_content_digest(raw: bytes) -> int:
 
 def _vision_rows_for_image(
     state: Any, model_dir: Any, preprocessor_config: dict, raw: bytes, digest: int
-) -> tuple[Any, int]:
-    """Embedding rows + pad count for one image, via the digest LRU."""
+) -> tuple[Any, int, tuple[int, int, int]]:
+    """Embedding rows, pad count and (t, h, w) grid for one image (digest LRU)."""
 
     from mtplx.vision import load_vision_tower
     from mtplx.vision.processing import (
@@ -3838,20 +4487,21 @@ def _vision_rows_for_image(
             return hit
     pixel_values, grids = preprocess_images([decode_image(raw)], preprocessor_config)
     pad_count = image_pad_token_count(grids[0])
+    grid = tuple(int(x) for x in grids[0])
     tower = load_vision_tower(str(model_dir))
     rows, _deepstack = tower(pixel_values, grids)
     import mlx.core as _mx
 
     _mx.eval(rows)
     if _vision_embed_cache_enabled():
-        _VISION_EMBED_CACHE[cache_key] = (rows, pad_count)
+        _VISION_EMBED_CACHE[cache_key] = (rows, pad_count, grid)
         cached_rows = sum(entry[1] for entry in _VISION_EMBED_CACHE.values())
         while (
             cached_rows > _VISION_EMBED_CACHE_MAX_ROWS and len(_VISION_EMBED_CACHE) > 1
         ):
             _, evicted = _VISION_EMBED_CACHE.popitem(last=False)
             cached_rows -= evicted[1]
-    return rows, pad_count
+    return rows, pad_count, grid
 
 
 def _materialize_vision_splice(
@@ -3874,14 +4524,16 @@ def _materialize_vision_splice(
     digests: list[int] = []
     row_blocks: list[Any] = []
     pad_counts: list[int] = []
+    grids: list[tuple[int, int, int]] = []
     for raw in images:
         digest = _image_content_digest(raw)
-        rows, pad_count = _vision_rows_for_image(
+        rows, pad_count, grid = _vision_rows_for_image(
             state, model_dir, preprocessor_config, raw, digest
         )
         digests.append(digest)
         row_blocks.append(rows)
         pad_counts.append(pad_count)
+        grids.append(grid)
     expanded_ids = _expand_image_pads(
         prompt_ids,
         image_pad_id=int(spec.image_token_id),
@@ -3895,11 +4547,36 @@ def _materialize_vision_splice(
     # Materialize before handing off: the generation worker runs on a
     # different thread, and a pending lazy graph must not cross it.
     _mx.eval(embeddings)
+
+    # M-RoPE table for families that rope image tokens at grid positions.
+    # Pure function of (expanded ids, grids) — recomputed per request, never
+    # persisted in cache state. A None result (video pads, layout mismatch)
+    # falls back to plain sequential rope rather than a wrong table.
+    mrope_table = None
+    mrope_delta = 0
+    if spec.mrope_section and spec.model_type == "qwen4_exp":
+        from mtplx.vision.mrope import build_mrope_positions
+
+        built = build_mrope_positions(
+            expanded_ids,
+            image_token_id=int(spec.image_token_id),
+            image_grids=grids,
+            spatial_merge_size=int(spec.spatial_merge_size),
+            video_token_id=int(spec.video_token_id),
+        )
+        if built is not None:
+            table_np, mrope_delta = built
+            mrope_table = _mx.array(table_np)
+            _mx.eval(mrope_table)
+
     return expanded_ids, VisionSplice(
         image_pad_token_id=int(spec.image_token_id),
         embeddings=embeddings,
         image_digests=tuple(digests),
         pad_counts=tuple(pad_counts),
+        image_grids=tuple(grids),
+        mrope_table=mrope_table,
+        mrope_delta=mrope_delta,
     )
 
 
@@ -4192,6 +4869,13 @@ def _anthropic_to_chat_request(
         # Carry the Qwen-style kwargs across the translation so the
         # chat-completions path can honor the known keys (enable_thinking).
         extra_fields["chat_template_kwargs"] = dict(request.chat_template_kwargs)
+    # Bridges riding /v1/messages (Claude Code proxies) send the flat
+    # OpenAI-style field; the model is extra="allow" so it parses, but the
+    # translation dropped it and every family went effort-blind on this
+    # lane (showdown receipt 2026-08-27: low sent, null recorded).
+    requested_effort = getattr(request, "reasoning_effort", None)
+    if isinstance(requested_effort, str) and requested_effort.strip():
+        extra_fields["reasoning_effort"] = requested_effort.strip()
     disable_parallel = _anthropic_disable_parallel_tool_use(request.tool_choice)
     chat_request = ChatCompletionRequest(
         model=request.model,
@@ -4295,14 +4979,22 @@ def _anthropic_usage_from_openai_usage(usage: Any) -> dict[str, int]:
     """
 
     data = usage if isinstance(usage, dict) else {}
+    prompt_tokens = max(0, int(data.get("prompt_tokens") or 0))
+    # OpenAI usage.prompt_tokens is the GRAND TOTAL and prompt_tokens_details.cached_tokens is a
+    # SUBSET of it. Anthropic's input_tokens and cache_read_input_tokens are DISJOINT
+    # (total_input = input_tokens + cache_read_input_tokens + cache_creation_input_tokens). Copying
+    # prompt_tokens straight into input_tokens while also reporting cache_read_input_tokens
+    # double-counts the cached prefix on every hit, so clients that sum the disjoint fields — Claude
+    # Code / Pi context and auto-compaction math — overcount by the prefix size and compact
+    # prematurely. Subtract the cached prefix; clamp defensively against malformed upstream usage.
+    cached_tokens = int((data.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
+    cached_tokens = min(max(0, cached_tokens), prompt_tokens)
     return {
-        "input_tokens": int(data.get("prompt_tokens") or 0),
+        "input_tokens": prompt_tokens - cached_tokens,
         "output_tokens": int(data.get("completion_tokens") or 0),
         # Anthropic-native mirror of the session-cache prefix hit
         # (#121/#144); Claude Code and Pi read this field directly.
-        "cache_read_input_tokens": int(
-            (data.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
-        ),
+        "cache_read_input_tokens": cached_tokens,
     }
 
 
@@ -4374,6 +5066,12 @@ async def _iter_sse_data(body_iterator: Any):
             ]
             if data_lines:
                 yield "\n".join(data_lines)
+            elif frame.startswith(":"):
+                # SSE comment-only frame — the pre-first-token keep-alive
+                # (#358). Yield it verbatim so the Anthropic translator can
+                # forward the liveness bytes; the leading ":" is unambiguous
+                # because data payloads here are JSON or "[DONE]".
+                yield frame
     if buffer.strip():
         data_lines = [
             line.removeprefix("data:").strip()
@@ -4430,6 +5128,45 @@ async def _anthropic_stream_from_openai_sse(body_iterator: Any, *, model: str):
 
     try:
         async for data in _iter_sse_data(body_iterator):
+            if data.startswith(":"):
+                # Keep-alive comment from the inner OpenAI stream (#358),
+                # which flows only pre-first-token (long prefill). Neither
+                # raw SSE comments nor protocol `ping` events reset Claude
+                # Code's stream watchdog — its bundled SDK loop drops pings
+                # (`if(a.event==="ping")continue`) before the watchdog sees
+                # them, so a prefill longer than the 300s idle window died
+                # client-side with "Stream idle timeout - no chunks
+                # received" (measured live 2026-08-31: 137k–165k-token
+                # MCP-heavy Claude Code first turns on the 27B, killed at
+                # exactly 300.0s under both comment and ping keep-alives).
+                # Only yielded message events reset it, so pre-open the
+                # thinking block and tick it with EMPTY thinking_deltas:
+                # real events on the wire, zero content accumulated, and
+                # the model's own reasoning (which streams first on
+                # thinking-default models) continues seamlessly in the
+                # same block once prefill completes.
+                if active_thinking_index is None and active_text_index is None:
+                    active_thinking_index = next_block_index
+                    next_block_index += 1
+                    opened_any_block = True
+                    yield start_content_block(
+                        active_thinking_index,
+                        {
+                            "type": "thinking",
+                            "thinking": "",
+                            "signature": "mtplx-reasoning",
+                        },
+                    )
+                if active_thinking_index is not None:
+                    yield _anthropic_sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": active_thinking_index,
+                            "delta": {"type": "thinking_delta", "thinking": ""},
+                        },
+                    )
+                continue
             if data == "[DONE]":
                 break
             try:
@@ -4637,7 +5374,7 @@ async def _anthropic_stream_from_openai_sse(body_iterator: Any, *, model: str):
 
 
 async def _anthropic_stream_from_turn_events(
-    events: AsyncIterator[Any], *, model: str
+    events: AsyncIterator[TurnEvent], *, model: str
 ) -> AsyncIterator[str]:
     message_id = "msg_" + uuid.uuid4().hex
     next_block_index = 0
@@ -5038,6 +5775,93 @@ def _sanitize_orphan_span_interior(text: str) -> str:
         if s == previous:
             break
     return re.sub(r"\n{3,}", "\n\n", s)
+
+
+# --- Unexecuted-tool-call truthfulness (#349) -------------------------------
+#
+# #160 taught the server to hide dead tool-call markup from no-tools chats,
+# and the malformed-parse fallback hides markup for undeclared names. Both
+# fixes deleted the markup SILENTLY: the model saw its call vanish with no
+# output and no error ("tool calls going out into the void" — issue #349's
+# transcript), the user saw a blank reply, and nothing in the conversation
+# said the call never ran. A swallowed call is a masked bug: whenever tool
+# markup is suppressed without execution, the turn now carries a short,
+# truthful, visible notice so the model can self-correct on its next turn
+# and the user learns why nothing happened.
+
+_TOOL_MARKUP_NAME_FUNCTION_RE = re.compile(
+    r"<function=([A-Za-z_][\w.-]*)", re.IGNORECASE
+)
+_TOOL_MARKUP_NAME_INVOKE_RE = re.compile(
+    r'<invoke\s+name="([A-Za-z_][\w.-]*)"', re.IGNORECASE
+)
+_TOOL_MARKUP_NAME_JSON_RE = re.compile(r'"name"\s*:\s*"([A-Za-z_][\w.-]*)"')
+_UNKNOWN_TOOL_REASON_RE = re.compile(r"unknown tool '([^']*)'", re.IGNORECASE)
+
+
+def _tool_markup_call_names(text: str, *, limit: int = 5) -> list[str]:
+    """Best-effort tool names from unexecuted tool-call markup (#349).
+
+    Scans only inside orphan tool-markup spans so a JSON object the model
+    wrote as prose cannot be misread as a call. Order-preserving, deduped.
+    """
+    names: list[str] = []
+    if not text or "<" not in text:
+        return names
+    for span_match in _ORPHAN_TOOL_MARKUP_RE.finditer(text):
+        span = span_match.group(0)
+        for pattern in (
+            _TOOL_MARKUP_NAME_FUNCTION_RE,
+            _TOOL_MARKUP_NAME_INVOKE_RE,
+            _TOOL_MARKUP_NAME_JSON_RE,
+        ):
+            for match in pattern.finditer(span):
+                name = match.group(1)
+                if name and name not in names:
+                    names.append(name)
+                if len(names) >= limit:
+                    return names
+    return names
+
+
+def _unknown_tool_name_from_reason(reason: str) -> str:
+    match = _UNKNOWN_TOOL_REASON_RE.search(reason or "")
+    return match.group(1).strip() if match else ""
+
+
+def _no_tools_unexecuted_call_notice(names: list[str]) -> str:
+    """Visible truth for a no-tools turn whose tool markup was suppressed."""
+    called = ", ".join(f'"{name}"' for name in names) if names else "a tool"
+    return (
+        f"[MTPLX: this reply tried to call {called}, but no tools are active "
+        "on this request, so nothing was executed — there was no output and "
+        "no error. This chat cannot read files or run terminal commands. For "
+        "file and terminal access, connect a coding agent (Claude Code, "
+        "OpenCode, or the Hermes agent in the MTPLX app) to MTPLX.]"
+    )
+
+
+def _unknown_tool_unexecuted_call_notice(
+    name: str,
+    declared: list[str],
+) -> str:
+    """Visible truth for a suppressed call to a tool this request never had."""
+    available = ", ".join(declared) if declared else "none"
+    label = f' "{name}"' if name else ""
+    return (
+        f"[MTPLX: the tool call{label} was not executed — it is not one of "
+        f"this request's available tools (available: {available}). Nothing "
+        "ran and there is no output. Use only the available tools, or answer "
+        "directly.]"
+    )
+
+
+def _append_unexecuted_tool_notice(text: str, notice: str) -> str:
+    """Append the notice as a trailing paragraph; idempotent per turn."""
+    base = (text or "").rstrip()
+    if notice in base:
+        return base
+    return f"{base}\n\n{notice}" if base else notice
 
 
 _TOOL_CALL_BLOCK_RE = re.compile(
@@ -5982,11 +6806,35 @@ def _mtplx_tool_contract_text(
     *,
     tool_choice: Any = None,
 ) -> str:
-    signatures = [signature for tool in tools if (signature := _tool_signature(tool))]
-    allowed = "; ".join(signatures) if signatures else "(none)"
+    pairs = [
+        (signature, _tool_spec_name(tool) or "")
+        for tool in tools
+        if (signature := _tool_signature(tool))
+    ]
+    allowed = "; ".join(signature for signature, _ in pairs) if pairs else "(none)"
     example = _tool_call_example(tools)
     if len(allowed) > 1200:
-        allowed = allowed[:1197].rstrip() + "..."
+        # Name-preserving fallback (issue #376; adapted from PR #379 by
+        # @ArctifoxNL): the old raw byte cut dropped whole tool names at the
+        # tail, and the "never invent ... undeclared tool" clause below then
+        # treated every dropped name as undeclared — clients lost `task` and
+        # subagents with it. Keep every declared name visible; sacrifice only
+        # per-tool signature detail when the budget runs out (a bare name
+        # still declares the tool).
+        parts: list[str] = []
+        size = 0
+        for signature, name in pairs:
+            for candidate in (signature, name):
+                extra = len(candidate) if not parts else 2 + len(candidate)
+                if candidate and size + extra <= 1200:
+                    parts.append(candidate)
+                    size += extra
+                    break
+            else:
+                if name:
+                    parts.append(name)
+                    size += 2 + len(name)
+        allowed = "; ".join(parts)
     forced_clause = _forced_tool_contract_clause(tool_choice)
     return (
         f"{_MTPLX_TOOL_CONTRACT_SENTINEL} {_current_date_line()} Your "
@@ -13128,9 +13976,35 @@ def _record_request_metrics(state: "ServerState", record: dict[str, Any]) -> Non
     investigation had to reconstruct history from a 32-entry RAM ring; this
     keeps the full trail. Best-effort: telemetry must never fail a request.
     """
+    try:
+        # Route observability (2026-08-26): the packed-SDPA route declines
+        # silently unless its TRACE env is set — the 147.4k decode cliff hid
+        # behind that silence. Cumulative-since-boot module counters; a delta
+        # between consecutive rows isolates one request.
+        from ..attention_split import gqa_packed_route_bail_counts
+        from ..kernels.sdpa_gqa_packed import gqa_packed_bail_counts
+
+        record.setdefault(
+            "gqa_packed_route_bail_counts", dict(gqa_packed_route_bail_counts)
+        )
+        record.setdefault(
+            "gqa_packed_kernel_bail_counts", dict(gqa_packed_bail_counts)
+        )
+    except Exception:
+        pass
     safe = _json_safe(record)
-    state.last_metrics.append(safe)
-    state.last_metrics = state.last_metrics[-100:]
+    # Warmup generations (startup pass and the idle background ladder) are
+    # not user requests: keep them out of the RAM ring that feeds the
+    # dashboard's `latest`/`recent` — the same contract
+    # _dashboard_record_completion enforces for the bus and rolling gauge.
+    # A ladder rung firing minutes after a real request was replacing that
+    # request's receipt as /v1/mtplx/snapshot `latest`, handing the app a
+    # warmup row (request_id null) in place of the user's acceptance
+    # counters. Flight end + the durable JSONL below still record warmup
+    # rows so forensics keeps the full trail.
+    if not bool(safe.get("warmup")):
+        state.last_metrics.append(safe)
+        state.last_metrics = state.last_metrics[-100:]
     # Flight recorder terminal event: every completion path (normal, cancel,
     # disconnect) funnels through this sink, so the flight "end" is written
     # even for requests whose client-side accounting is lost (turn-13 class).
@@ -13949,6 +14823,8 @@ def _token_window_rate_first(token_times: list[float], window: int) -> float | N
 MAINTENANCE_TIMING_STATS_KEYS = (
     "mtp_history_materialize_every",
     "mtp_history_materialize_events",
+    "mtp_history_live_resets",
+    "mtp_history_live_reset_threshold",
     "clear_cache_every",
     "clear_cache_events",
     "clear_cache_time_s",
@@ -13992,6 +14868,32 @@ MAINTENANCE_TIMING_STATS_KEYS = (
 
 def _maintenance_timing_stats(stats: dict[str, Any]) -> dict[str, Any]:
     return {key: stats[key] for key in MAINTENANCE_TIMING_STATS_KEYS if key in stats}
+
+
+def _round_timing_series(stats: dict[str, Any]) -> list[dict[str, float]]:
+    """Per-round timing_s rows (milliseconds) for decode-decay attribution.
+
+    Non-empty only when the engine kept per-round events (MTPLX_DROP_EVENTS=0,
+    an operator/debug launch); product launches drop events and this stays [].
+    """
+    events = stats.get("events")
+    if not isinstance(events, list):
+        return []
+    series: list[dict[str, float]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        timing = event.get("timing_s")
+        if not isinstance(timing, dict) or not timing:
+            continue
+        row = {
+            key: round(float(value) * 1000.0, 3)
+            for key, value in timing.items()
+            if isinstance(value, (int, float))
+        }
+        if row:
+            series.append(row)
+    return series
 
 
 def _metrics_envelope(
@@ -14038,7 +14940,7 @@ def _metrics_envelope(
         if prompt_eval_time_s > 0
         else None
     )
-    return {
+    envelope = {
         "prompt_tokens": int(prompt_tokens),
         "cached_tokens": cached_tokens,
         "new_prefill_tokens": max(0, new_prefill_tokens),
@@ -14085,6 +14987,13 @@ def _metrics_envelope(
         "mean_accept_probability_by_depth": (
             stats.get("mean_accept_probability_by_depth") or []
         ),
+        # Fork-EV shadow telemetry (MTPLX_FORKEV_TELEMETRY): present only when
+        # the instrument ran, so request-log rows stay byte-identical when off.
+        **(
+            {"forkev": stats["forkev"]}
+            if isinstance(stats.get("forkev"), dict) and stats.get("forkev")
+            else {}
+        ),
         "correction_tokens": int(stats.get("correction_tokens") or 0),
         "bonus_tokens": int(stats.get("bonus_tokens") or 0),
         "verify_time_s": float(stats.get("verify_time_s") or 0.0),
@@ -14096,6 +15005,21 @@ def _metrics_envelope(
         "verify_hidden_eval_time_s": float(
             stats.get("verify_hidden_eval_time_s") or 0.0
         ),
+        "round_timing_ms": _round_timing_series(stats),
+        "context_copy_active": bool(stats.get("context_copy_active") or False),
+        "context_copy_probes": int(stats.get("context_copy_probes") or 0),
+        "context_copy_rounds": int(stats.get("context_copy_rounds") or 0),
+        "context_copy_drafted_tokens": int(
+            stats.get("context_copy_drafted_tokens") or 0
+        ),
+        "context_copy_accepted_blocks": int(
+            stats.get("context_copy_accepted_blocks") or 0
+        ),
+        "context_copy_accepted_tokens": int(
+            stats.get("context_copy_accepted_tokens") or 0
+        ),
+        "context_copy_suspensions": int(stats.get("context_copy_suspensions") or 0),
+        "context_copy_disabled_reason": stats.get("context_copy_disabled_reason"),
         "verify_joint_eval_time_s": float(stats.get("verify_joint_eval_time_s") or 0.0),
         "verify_target_distribution_time_s": float(
             stats.get("verify_target_distribution_time_s") or 0.0
@@ -14168,6 +15092,16 @@ def _metrics_envelope(
         "session_id": session_id,
         **generation_limits,
     }
+    # Adaptive draft-temperature trajectory (MTPLX_ADAPTIVE_DTEMP): stamped
+    # only when the engine produced a summary, so quiet request-log rows stay
+    # byte-stable (same idiom as the draft_sampler truth keys). This is the
+    # harvest surface: draft_sampler_resolved_temperature stays the request-
+    # resolved base, and this block carries current_temperature, the EMA, the
+    # transition count, and the transition log (the per-round trajectory).
+    adaptive_dtemp = stats.get("draft_sampler_adaptive_dtemp")
+    if adaptive_dtemp:
+        envelope["draft_sampler_adaptive_dtemp"] = adaptive_dtemp
+    return envelope
 
 
 def _effective_completion_tokens(
@@ -14318,12 +15252,20 @@ def _memory_attribution(state: Any) -> dict[str, Any]:
     weights = getattr(state, "_model_weights_bytes_cache", None)
     if weights is None:
         try:
-            from mtplx.engine_session import model_weights_bytes
+            from mtplx.engine_session import model_weights_bytes, ngram_table_bytes
+            from mtplx.memory_plan import ngram_table_resident_policy
 
             root = Path(str(state.args.model))
             # model_weights_bytes scans recursively and already counts the
-            # nested MTP sidecar — no manual add, or it double-counts.
+            # nested MTP sidecar — no manual add, or it double-counts. The
+            # n-gram table is excluded from that scan; it belongs in this
+            # wired-weights bucket only when the resident policy actually
+            # materialized it (streamed mode reads file-backed pages that
+            # never enter allocator active — counting them here made
+            # "weights" exceed "active total" in the app).
             weights = int(model_weights_bytes(root) or 0)
+            if ngram_table_resident_policy():
+                weights += ngram_table_bytes(root)
         except Exception:
             weights = 0
         state._model_weights_bytes_cache = weights
@@ -14828,7 +15770,7 @@ def _mtplx_app_capabilities() -> dict[str, Any]:
             "legacy_bridge_default": False,
         },
         "scheduler": {
-            "modes": list(SCHEDULER_MODE_CHOICES),
+            "modes": list(ADVERTISED_SCHEDULER_MODES),
             "presets": list(BATCHING_PRESET_CHOICES),
             "v1_done_path": "path_a_solo_mtp_plus_cooperative_ar",
             "default_ux": "coding_agents",
@@ -15325,7 +16267,9 @@ def _env_bool_setting(name: str, *, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _effective_ram_session_cache_settings() -> dict[str, Any]:
+def _effective_ram_session_cache_settings(
+    state: "ServerState | None" = None,
+) -> dict[str, Any]:
     entries_raw = os.environ.get("MTPLX_SESSION_BANK_MAX_ENTRIES")
     max_bytes = os.environ.get("MTPLX_SESSION_BANK_MAX_BYTES") or "8G"
     per_session_bytes = os.environ.get("MTPLX_SESSION_BANK_PER_SESSION_BYTES") or "4G"
@@ -15348,6 +16292,16 @@ def _effective_ram_session_cache_settings() -> dict[str, Any]:
         policy = "minimal"
     else:
         policy = "bounded"
+    # Report the budgets the bank is actually RUNNING, not the env echo:
+    # with nothing configured the engine auto-sizes from the machine plan
+    # (or the half-surplus formula), and this surface used to invent
+    # "8G/4G" — the dashboard disagreeing with the daemon's own budget
+    # line is exactly how config bugs hide.
+    bank = getattr(getattr(state, "sessions", None), "bank", None)
+    if bank is not None:
+        entries = int(getattr(bank, "max_entries", entries))
+        max_bytes = f"{int(bank.max_bytes) / 2**30:.1f}G"
+        per_session_bytes = f"{int(bank.per_session_max_bytes) / 2**30:.1f}G"
     return {
         "ram_session_cache_policy": policy,
         "ram_session_block_prefix_restore": block_prefix_restore,
@@ -15504,7 +16458,7 @@ def _mtplx_current_settings(state: "ServerState") -> dict[str, Any]:
             "paged_kv_quantization",
             "ssd_session_cache",
         ],
-        **_effective_ram_session_cache_settings(),
+        **_effective_ram_session_cache_settings(state),
     }
 
 
@@ -15532,6 +16486,8 @@ def _scheduler_config_from_args(args: Any) -> BatchSchedulerConfig:
 
 
 def _scheduler_policy_label(config: BatchSchedulerConfig) -> str:
+    if config.mode == SchedulerMode.HYPER:
+        return "hyper_singleton_admission_1"
     if config.mode == SchedulerMode.MTP_BATCH:
         return "fixed_mtp_batch_width_8"
     if (
@@ -15618,7 +16574,13 @@ def _mtplx_scheduler_state(state: "ServerState") -> dict[str, Any]:
             or int(mtp_batch_stats.get("last_real_width") or 0) > 1
         )
     )
-    if b1_exact_serial and mtp_available:
+    if config.mode == SchedulerMode.HYPER:
+        # Hyper never disables MTP for concurrency: extra requests queue FIFO
+        # behind the singleton exactly like serial, so queued depth must never
+        # be labeled as an AR fallback.
+        active_lane = "hyper_singleton" if mtp_available else "hyper_singleton_ar"
+        mtp_disabled_reason = None if mtp_available else "generation_mode_ar"
+    elif b1_exact_serial and mtp_available:
         active_lane = "mtp_batch_b1_exact_serial"
         mtp_disabled_reason = None
     elif mtp_batch_has_cohort and mtp_available:
@@ -15651,9 +16613,18 @@ def _mtplx_scheduler_state(state: "ServerState") -> dict[str, Any]:
     else:
         active_lane = "serial_ar" if not mtp_available else "serial_mtp"
         mtp_disabled_reason = None if mtp_available else "generation_mode_ar"
+    hyper_stats: dict[str, Any] = {}
+    hyper_gate = getattr(state, "hyper_gate", None)
+    if hyper_gate is not None and hasattr(hyper_gate, "snapshot"):
+        try:
+            hyper_stats = dict(hyper_gate.snapshot())
+        except Exception as exc:
+            hyper_stats = {"error": str(exc)}
     telemetry = dict(scheduler_stats)
     if config.mode == SchedulerMode.MTP_BATCH:
         telemetry.update(mtp_batch_stats)
+    elif config.mode == SchedulerMode.HYPER:
+        telemetry.update(hyper_stats)
     return {
         "config": config.to_dict(),
         "mode": config.mode.value,
@@ -15695,6 +16666,10 @@ def _mtplx_scheduler_state(state: "ServerState") -> dict[str, Any]:
         "telemetry": telemetry,
         "ar_batch": ar_batch_stats,
         "mtp_batch": mtp_batch_stats,
+        # Hyper chassis stats (empty outside scheduler_mode=hyper). H0 ships
+        # width=1 + admission accounting; the width_stats sub-block is the
+        # stable home for H1/H2 receipts (see mtplx/server/hyper.py).
+        "hyper": hyper_stats,
     }
 
 
@@ -15740,6 +16715,20 @@ def _mtplx_dashboard_snapshot(state: "ServerState") -> dict[str, Any]:
         "memory_pressure_level": int(
             getattr(dashboard, "last_memory_pressure_level", 0) or 0
         ),
+        "memory_pressure_source": str(
+            getattr(dashboard, "last_memory_pressure_source", "macos") or "macos"
+        ),
+        "allocator_fraction": float(
+            getattr(dashboard, "last_allocator_fraction", 0.0) or 0.0
+        ),
+        "memory_plan": (
+            state.memory_plan.to_dict()
+            if getattr(state, "memory_plan", None) is not None
+            else None
+        ),
+        "memory_guard_events": list(
+            getattr(dashboard, "memory_guard_events", ()) or ()
+        )[-8:],
         "settings": _mtplx_current_settings(state),
         "scheduler": _mtplx_scheduler_state(state),
         "machine": _machine_info(),
@@ -15778,6 +16767,299 @@ def _memory_pressure_guard_enabled() -> bool:
     }
 
 
+# Allocation failures the daemon must survive as per-request errors. MLX's
+# Metal allocator raises plain RuntimeErrors ("[metal::malloc] ... maximum
+# allowed buffer size", "Insufficient Memory",
+# kIOGPUCommandBufferCallbackErrorOutOfMemory); before 2.9.4 these reached
+# clients as anonymous internal_error 500s with no cache shed, so the very
+# next request hit the same wall (#348).
+_ALLOCATION_FAILURE_MARKERS = (
+    "insufficient memory",
+    "out of memory",
+    "failed to allocate",
+    "kiogpucommandbuffercallbackerroroutofmemory",
+    "metal::malloc",
+    "maximum allowed buffer size",
+)
+
+
+def _is_allocation_failure(exc: BaseException) -> bool:
+    if isinstance(exc, MemoryError):
+        return True
+    if not isinstance(exc, (RuntimeError, OSError)):
+        return False
+    text = str(exc).lower()
+    return any(marker in text for marker in _ALLOCATION_FAILURE_MARKERS)
+
+
+def _record_guard_event(state: "ServerState", payload: dict[str, Any]) -> None:
+    """Ring buffer of guard actions for the dashboard/app (never raises)."""
+    try:
+        dashboard = state.dashboard
+        events = getattr(dashboard, "memory_guard_events", None)
+        if events is None:
+            events = deque(maxlen=16)
+            dashboard.memory_guard_events = events
+        events.append({"ts": time.time(), **payload})
+    except Exception:
+        pass
+
+
+def _shed_after_allocation_failure(state: "ServerState") -> dict[str, Any]:
+    """Give memory back after an allocation failure; never raises.
+
+    Bank to half its current budget + allocator cache clear: the next
+    request should find room instead of hitting the identical wall.
+    """
+    receipt: dict[str, Any] = {"action": "allocation_failure_shed"}
+    try:
+        bank = getattr(getattr(state, "sessions", None), "bank", None)
+        if bank is not None:
+            receipt["bank_entries_evicted"] = bank.shrink_to_bytes(
+                int(bank.effective_max_bytes()) // 2,
+                reason="allocation_failure",
+            )
+            receipt["bank_bytes_after"] = int(bank.total_nbytes)
+    except Exception as exc:
+        receipt["bank_error"] = repr(exc)
+    try:
+        import mlx.core as _mx
+
+        _mx.clear_cache()
+        receipt["cache_cleared"] = True
+    except Exception:
+        receipt["cache_cleared"] = False
+    _record_guard_event(state, receipt)
+    try:
+        print("[mtplx] memory guard " + json.dumps(receipt), flush=True)
+    except Exception:
+        pass
+    return receipt
+
+
+def _allocation_failure_http_exception(
+    state: "ServerState", exc: BaseException
+) -> HTTPException:
+    """Shed caches, then turn the raw allocator error into an honest 507."""
+    _shed_after_allocation_failure(state)
+    plan = getattr(state, "memory_plan", None)
+    advice = "Reduce --context-window, close other apps, or try q8 KV quantization."
+    if plan is not None and getattr(plan, "context_overcommitted", False):
+        advice = (
+            f"--context-window {plan.context_window_resolved} exceeds this "
+            f"machine's fit of {plan.context_window_fit} tokens; serve at or "
+            "below the fit (or use q8 KV quantization)."
+        )
+    return HTTPException(
+        status_code=507,
+        detail=(
+            "insufficient memory: the request exceeded available GPU memory "
+            f"({exc}). The engine shed its caches and stays up; this request "
+            f"failed. {advice}"
+        ),
+    )
+
+
+def _prefill_admission_shed_enabled() -> bool:
+    return os.environ.get(
+        "MTPLX_PREFILL_ADMISSION_SHED", "1"
+    ).strip().lower() not in {"0", "off", "false", "no"}
+
+
+def _prefill_admission_min_miss_tokens() -> int:
+    raw = os.environ.get("MTPLX_PREFILL_ADMISSION_MIN_MISS_TOKENS", "4096")
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 4096
+
+
+# Same line as _allocator_pressure_level's WARNING edge: at >=97% of the
+# Metal limit the next growth step swaps.
+_PREFILL_ADMISSION_PRESSURE_FRACTION = 0.97
+
+
+def _prefill_admission_shed(
+    state: "ServerState",
+    *,
+    prompt_ids: list[int],
+    session_bank: Any | None,
+    session_id: str | None,
+) -> dict[str, Any] | None:
+    """Release idle memory BEFORE a tight cache-miss prefill (#415).
+
+    The shipped failure: a Pi agent hit its compaction threshold at 248k,
+    the compaction rewrote the whole prefix, and the replacement prefill —
+    a guaranteed cache miss — started while the superseded 6.09 GiB
+    SessionBank snapshot of the pre-compaction transcript sat resident on
+    a memory plan that admits 262K with zero headroom. The footprint
+    crossed the Metal cap mid-prefill and the sustained-pressure guard
+    killed the request (structured 507) ~30 s later. Shedding first is
+    cheap and reversible; the abort is neither.
+
+    Projects the miss-prefill footprint against the live allocator state
+    and, only when the projection crosses the guard's WARNING line, frees
+    in escalation order: superseded same-session bank entries (the prefix
+    was rewritten, so they can never be restored by this lineage again),
+    then LRU idle entries with every active session protected, then the
+    allocator cache. Never raises; returns the receipt when it acted.
+    """
+
+    if not _prefill_admission_shed_enabled():
+        return None
+    try:
+        prompt_tokens = len(prompt_ids)
+        if prompt_tokens < _prefill_admission_min_miss_tokens():
+            return None
+        caps = getattr(state, "metal_memory_caps", None)
+        limit = 0
+        if isinstance(caps, dict):
+            value = caps.get("memory_limit_bytes")
+            if isinstance(value, int):
+                limit = value
+        if limit <= 0:
+            return None
+        stats = _mlx_memory_stats_live()
+        active = int(stats.get("active_memory_bytes") or 0)
+        cache = int(stats.get("cache_memory_bytes") or 0)
+        if active <= 0:
+            return None
+        plan = getattr(state, "memory_plan", None)
+        per_token = 0
+        transients = 0
+        if plan is not None:
+            per_token = (
+                int(getattr(plan, "kv_bytes_per_token_effective", 0) or 0)
+                + int(getattr(plan, "aux_bytes_per_token", 0) or 0)
+                + int(getattr(plan, "prefill_transient_bytes_per_token", 0) or 0)
+            )
+            try:
+                from mtplx.memory_plan import RUNTIME_TRANSIENTS_BYTES
+
+                transients = int(RUNTIME_TRANSIENTS_BYTES)
+            except Exception:
+                transients = 0
+        threshold = int(limit * _PREFILL_ADMISSION_PRESSURE_FRACTION)
+        # Cheap worst-case gate first (miss == full prompt): skip the bank
+        # probe entirely when even a fully cold prefill projects under the
+        # line — the common, memory-healthy case.
+        if active + cache + prompt_tokens * per_token + transients <= threshold:
+            return None
+        reused_tokens = 0
+        if session_bank is not None:
+            try:
+                entry = session_bank.longest_prefix(prompt_ids)
+            except Exception:
+                entry = None
+            if entry is not None:
+                reused_tokens = len(entry.token_ids)
+        miss_tokens = max(0, prompt_tokens - reused_tokens)
+        if miss_tokens < _prefill_admission_min_miss_tokens():
+            return None
+        projected = active + cache + miss_tokens * per_token + transients
+        if projected <= threshold:
+            return None
+        receipt: dict[str, Any] = {
+            "action": "prefill_admission_shed",
+            "prompt_tokens": int(prompt_tokens),
+            "reusable_prefix_tokens": int(reused_tokens),
+            "miss_tokens": int(miss_tokens),
+            "active_bytes": int(active),
+            "cache_bytes": int(cache),
+            "projected_bytes": int(projected),
+            "threshold_bytes": int(threshold),
+            "limit_bytes": int(limit),
+        }
+        deficit = projected - threshold
+        if session_bank is not None:
+            try:
+                bank_bytes_before = int(session_bank.total_nbytes)
+                receipt["bank_bytes_before"] = bank_bytes_before
+                if session_id and reused_tokens == 0:
+                    # The client rewrote this session's prefix (agent
+                    # compaction): its banked snapshots are superseded and
+                    # can never be restored by this lineage again.
+                    receipt["superseded_session_entries_evicted"] = int(
+                        session_bank.clear(session_id=session_id)
+                    )
+                elif session_id:
+                    # A restorable prefix exists — pin this session so the
+                    # LRU pass below cannot evict the entry the imminent
+                    # restore depends on.
+                    session_bank.touch_sessions([session_id])
+                bank_bytes_now = int(session_bank.total_nbytes)
+                remaining = deficit - max(0, bank_bytes_before - bank_bytes_now)
+                if remaining > 0 and bank_bytes_now > 0:
+                    receipt["lru_entries_evicted"] = int(
+                        session_bank.shrink_to_bytes(
+                            max(0, bank_bytes_now - remaining),
+                            reason="prefill_admission",
+                            protect_active=True,
+                        )
+                    )
+                receipt["bank_bytes_after"] = int(session_bank.total_nbytes)
+            except Exception as exc:
+                receipt["bank_error"] = repr(exc)
+        try:
+            import mlx.core as _mx
+
+            _mx.clear_cache()
+            receipt["cache_cleared"] = True
+        except Exception:
+            receipt["cache_cleared"] = False
+        after = _mlx_memory_stats_live()
+        receipt["active_bytes_after"] = int(after.get("active_memory_bytes") or 0)
+        receipt["cache_bytes_after"] = int(after.get("cache_memory_bytes") or 0)
+        _record_guard_event(state, receipt)
+        try:
+            print("[mtplx] memory guard " + json.dumps(receipt), flush=True)
+        except Exception:
+            pass
+        return receipt
+    except Exception as exc:  # noqa: BLE001 — an admission guard must never
+        # cost a request; generation proceeds and the runtime backstops
+        # (#393 pressure abort, allocation-failure shed) still apply.
+        try:
+            _record_guard_event(
+                state,
+                {"action": "prefill_admission_shed_error", "error": repr(exc)},
+            )
+        except Exception:
+            pass
+        return None
+
+
+def _allocator_pressure_level(state: "ServerState") -> tuple[int, float]:
+    """Engine-relative pressure: allocator footprint vs the Metal limit.
+
+    macOS's kern.memorystatus level fires only once the system is already
+    compressing/swapping — on a 48 GB Mac that is minutes into the death
+    spiral (#305: 61.8/48.0 GB before the first signal). The allocator
+    knows earlier: active+cache at >=97% of the configured Metal memory
+    limit means the next growth step swaps, so treat it as WARNING (2);
+    past the limit is CRITICAL-equivalent (4). Returns (level, fraction).
+    """
+    caps = getattr(state, "metal_memory_caps", None)
+    limit = 0
+    if isinstance(caps, dict):
+        value = caps.get("memory_limit_bytes")
+        if isinstance(value, int):
+            limit = value
+    if limit <= 0:
+        return 1, 0.0
+    stats = _mlx_memory_stats_live()
+    active = stats.get("active_memory_bytes") or 0
+    cache = stats.get("cache_memory_bytes") or 0
+    if not active:
+        return 1, 0.0
+    fraction = float(int(active) + int(cache)) / float(limit)
+    if fraction >= 1.02:
+        return 4, fraction
+    if fraction >= 0.97:
+        return 2, fraction
+    return 1, fraction
+
+
 def _engine_busy_signal(state: "ServerState") -> bool:
     """True while any request is actively being served."""
     try:
@@ -15792,6 +17074,60 @@ def _engine_busy_signal(state: "ServerState") -> bool:
     except Exception:
         pass
     return False
+
+
+# Sustained-critical prefill abort (#393): this many consecutive guard ticks
+# (~30 s at the 10 s interval) at CRITICAL with the engine busy. One tick is
+# routinely survivable — the trim frees bank/retrieval weight and the
+# allocator recovers — but a deep prefill re-grows the footprint faster than
+# anything can be shed, and macOS compresses/swaps for minutes before any
+# Metal allocation error (the only prior 507 trigger) would ever fire.
+# Sustained critical means the shedding already ran and lost.
+_PRESSURE_ABORT_TICKS = 3
+
+
+def _pressure_abort_requested(state: "ServerState") -> bool:
+    """True while the guard loop has armed the sustained-pressure abort."""
+    event = getattr(state, "pressure_abort_event", None)
+    return bool(event is not None and event.is_set())
+
+
+def _note_critical_pressure_tick(
+    state: "ServerState", level: int, busy: bool, streak: int
+) -> int:
+    """One guard-loop tick of the sustained-critical tracker; returns streak.
+
+    Arms ``state.pressure_abort_event`` after ``_PRESSURE_ABORT_TICKS``
+    consecutive CRITICAL ticks with the engine busy — an idle engine cannot
+    be the cause, and aborting nothing frees nothing. Any tick that is
+    sub-critical or idle disarms and resets: the abort must never linger
+    past recovery and kill a healthy later request.
+    """
+    if level >= 4 and busy:
+        streak += 1
+        if streak >= _PRESSURE_ABORT_TICKS and not _pressure_abort_requested(
+            state
+        ):
+            event = getattr(state, "pressure_abort_event", None)
+            if event is None:
+                event = threading.Event()
+                state.pressure_abort_event = event
+            event.set()
+            _record_guard_event(
+                state,
+                {
+                    "action": "pressure_abort_armed",
+                    "level": int(level),
+                    "streak": int(streak),
+                },
+            )
+        return streak
+    if _pressure_abort_requested(state):
+        state.pressure_abort_event.clear()
+        _record_guard_event(
+            state, {"action": "pressure_abort_cleared", "level": int(level)}
+        )
+    return 0
 
 
 class _MemoryPressureGuard:
@@ -15919,13 +17255,87 @@ async def _memory_pressure_loop(
     """
 
     guard = _MemoryPressureGuard()
+    abort_streak = 0
     while True:
         try:
             level = await asyncio.to_thread(_memory_pressure_level)
+            level_source = "macos"
+            allocator_level, allocator_fraction = _allocator_pressure_level(state)
+            if allocator_level >= 2 and allocator_level >= level:
+                # The allocator sees the wall minutes before macOS does
+                # (see _allocator_pressure_level); the guard acts on
+                # whichever signal is worse. Ties at WARNING+ blame the
+                # allocator: the "macos" copy asserts the engine footprint
+                # is steady, which is false while the allocator is also at
+                # its ceiling.
+                level = allocator_level
+                level_source = "allocator"
+            elif level >= 2 and allocator_fraction <= 0.0:
+                # macOS reports pressure but the allocator probe bailed
+                # (no Metal limit configured, or zero active memory), so
+                # engine steadiness cannot be attested either way.
+                level_source = "unknown"
             state.dashboard.last_memory_pressure_level = level
+            state.dashboard.last_memory_pressure_source = level_source
+            state.dashboard.last_allocator_fraction = float(allocator_fraction)
+            # Dynamic bank ceiling (memory plan): during a long-context
+            # prefill no put() runs for minutes while KV grows, so the
+            # put-time budget check alone reacts too late. Enforce here
+            # every tick. Deliberately NO mx.clear_cache() while busy —
+            # freed bank buffers return to the allocator pool and get
+            # reused by the growing KV, which is exactly the point.
+            bank = getattr(getattr(state, "sessions", None), "bank", None)
+            if bank is not None and getattr(bank, "dynamic_ceiling_fn", None):
+                try:
+                    # Re-stamp the activity pin for live requests first: the
+                    # pin is otherwise touched only at restore/put, so one
+                    # turn longer than its 600 s TTL would lose
+                    # protect_active mid-generation.
+                    in_flight = getattr(
+                        getattr(state, "dashboard", None), "in_flight", None
+                    )
+                    touch = getattr(bank, "touch_sessions", None)
+                    if in_flight is not None and callable(touch):
+                        touch(in_flight.session_ids())
+                    ceiling = int(bank.effective_max_bytes())
+                    if int(bank.total_nbytes) > ceiling + 256 * 1024**2:
+                        # protect_active: the ceiling reads the working set
+                        # instantaneously, so a deep prefill's transient
+                        # spike must squeeze idle sessions' cache, never the
+                        # in-flight session's own prefix chain (93k receipt
+                        # 2026-08-28: bank walked to 0 mid-request, 54-57 s
+                        # TTFTs after). Real macOS/allocator pressure below
+                        # keeps take-anything semantics.
+                        dyn_evicted = bank.shrink_to_bytes(
+                            ceiling,
+                            reason="dynamic_ceiling",
+                            protect_active=True,
+                        )
+                        if dyn_evicted:
+                            _record_guard_event(
+                                state,
+                                {
+                                    "action": "dynamic_ceiling",
+                                    "ceiling_bytes": ceiling,
+                                    "bank_entries_evicted": int(dyn_evicted),
+                                    "bank_bytes_after": int(bank.total_nbytes),
+                                },
+                            )
+                except Exception:
+                    pass
             busy = False
             if 2 <= level < 4:
                 busy = await asyncio.to_thread(_engine_busy_signal, state)
+            # The guard's own busy is deliberately not computed at CRITICAL
+            # (CRITICAL trims never defer); the abort tracker needs it there.
+            critical_busy = (
+                await asyncio.to_thread(_engine_busy_signal, state)
+                if level >= 4
+                else False
+            )
+            abort_streak = _note_critical_pressure_tick(
+                state, level, critical_busy, abort_streak
+            )
             deferred_s = guard.deferred_for_s(time.monotonic())
             if guard.decide(level, time.monotonic(), busy):
                 bank = getattr(getattr(state, "sessions", None), "bank", None)
@@ -15965,18 +17375,20 @@ async def _memory_pressure_loop(
                         _mx.clear_cache()
                     except Exception:
                         pass
-                print(
-                    "[mtplx] memory pressure guard "
-                    + json.dumps(
-                        {
-                            "level": level,
-                            "bank_entries_evicted": evicted,
-                            "bank_bytes_after": int(
-                                getattr(bank, "total_nbytes", 0) or 0
-                            ),
-                            "deferred_s": deferred_s,
-                        }
+                action_receipt = {
+                    "action": "pressure_trim",
+                    "level": level,
+                    "level_source": level_source,
+                    "allocator_fraction": round(allocator_fraction, 3),
+                    "bank_entries_evicted": evicted,
+                    "bank_bytes_after": int(
+                        getattr(bank, "total_nbytes", 0) or 0
                     ),
+                    "deferred_s": deferred_s,
+                }
+                _record_guard_event(state, action_receipt)
+                print(
+                    "[mtplx] memory pressure guard " + json.dumps(action_receipt),
                     flush=True,
                 )
         except asyncio.CancelledError:
@@ -15987,6 +17399,212 @@ async def _memory_pressure_loop(
             await asyncio.sleep(interval_s)
         except asyncio.CancelledError:
             raise
+
+
+def _idle_pump_enabled() -> bool:
+    raw = str(os.environ.get("MTPLX_SSD_IDLE_PUMP", "1")).strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+# The pump arms only after this much request-level quiet. Well above any
+# foreground->tail-postcommit gap (milliseconds) and above the scheduler's
+# own idle+quiet graces (~0.55 s), so an armed pump can never race a
+# latency-critical tail; well below the ~90 s background-warmup re-fire,
+# so durability lands before the warm ladder re-occupies the idle band.
+_IDLE_PUMP_AFTER_S = 5.0
+_IDLE_PUMP_INTERVAL_S = 2.0
+
+
+def _server_request_idle_s(state: "ServerState") -> float:
+    """Seconds since the last HTTP request activity; 0.0 while any is live.
+
+    Fresh boot (no request ever) counts as infinitely idle: pending
+    durability work (e.g. a re-dispatched encode) may drain freely."""
+    try:
+        if state.has_foreground():
+            return 0.0
+    except BaseException:
+        return 0.0
+    last = max(
+        float(getattr(state, "last_request_started_at", 0.0) or 0.0),
+        float(getattr(state, "last_request_at", 0.0) or 0.0),
+    )
+    if last <= 0.0:
+        return float("inf")
+    return max(0.0, time.time() - last)
+
+
+async def _idle_persistence_pump_loop(
+    state: "ServerState", *, interval_s: float = _IDLE_PUMP_INTERVAL_S
+) -> None:
+    """Guarantee the durability lane forward progress on an idle server.
+
+    Issue #290: the scheduler's persistence band is reachable only while
+    the idle_postcommit deque is COMPLETELY empty, so any self-chaining
+    idle occupant (the 2.8.2 background warm ladder ran rungs back-to-back
+    for minutes after the last request; 2.8.3's 90 s grace narrowed but
+    did not close the window) starves SSD session-cache writes forever —
+    entries sat in the RAM bank with every cold-tier counter at zero and
+    were lost on restart. An idle server is the BEST time to write: once
+    the server has seen several seconds of request-level quiet, arm one
+    pump slot per tick so the persistence head can bridge the chain's
+    not-yet-ready gaps. All existing protections stand: foreground always
+    wins, a foreground submission disarms the pump before admission, a
+    ready idle item still runs first, and the per-tensor encode abort +
+    writer pause keep yielding to real traffic.
+    """
+    scheduler = getattr(state, "model_scheduler", None)
+    if (
+        scheduler is None
+        or not hasattr(scheduler, "pump_persistence")
+        or not hasattr(scheduler, "persistence_pending")
+    ):
+        return
+    while True:
+        try:
+            if (
+                scheduler.persistence_pending() > 0
+                and _server_request_idle_s(state) >= _IDLE_PUMP_AFTER_S
+                and not scheduler.foreground_pending_or_active()
+            ):
+                scheduler.pump_persistence(budget=1)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        try:
+            await asyncio.sleep(interval_s)
+        except asyncio.CancelledError:
+            raise
+
+
+def _shutdown_flush_timeout_s() -> float:
+    """Bounded best-effort window for the shutdown cold-write flush.
+
+    Matches EngineSessionManager.flush_cold_tier's historical 10 s bound.
+    MTPLX_SHUTDOWN_SSD_FLUSH_S overrides; 0 disables the flush entirely.
+    """
+    raw = str(os.environ.get("MTPLX_SHUTDOWN_SSD_FLUSH_S", "")).strip()
+    if not raw:
+        return 10.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return 10.0
+    if value != value or value < 0.0:
+        return 10.0
+    return min(value, 60.0)
+
+
+def _shutdown_flush_cold_writes(state: "ServerState") -> dict[str, Any]:
+    """Best-effort, bounded flush of pending SSD session-cache writes.
+
+    Issue #290 (secondary): lifespan shutdown used to go straight to
+    ``scheduler.shutdown(cancel_futures=True)`` — queued persistence
+    encodes were CANCELLED and the writer queue was never drained, so a
+    plain SIGTERM/Ctrl-C silently lost every entry still in flight and the
+    next boot paid a full re-prefill. This runs BEFORE the scheduler
+    shutdown: pump the persistence lane (the owner thread is still alive
+    and no foreground exists during shutdown), then wait out the writer
+    queue's task accounting. Bounded and honest — one console line says
+    how many writes flushed and how many remained.
+    """
+    outcome = {"pending_before": 0, "flushed": 0, "remained": 0, "elapsed_s": 0.0}
+    budget_s = _shutdown_flush_timeout_s()
+    scheduler = getattr(state, "model_scheduler", None)
+    cold_tier = getattr(state, "session_bank_cold_tier", None)
+    sessions = getattr(state, "sessions", None)
+    if budget_s <= 0.0 or cold_tier is None:
+        return outcome
+
+    def _writer_outstanding() -> int:
+        """Staged writes not yet durable — INCLUDING the in-flight one.
+
+        ``writer_queue_depth`` alone misses the write the writer thread
+        has already popped and is moving to disk (measured live: a 619 MB
+        entry showed depth 0 / enqueued 1 / completed 0 while its file was
+        mid-write; an early exit on depth alone let the daemon writer die
+        mid-file). This mirrors the tier's ``flush()`` task accounting.
+        """
+        try:
+            stats = cold_tier.stats()
+            outstanding = (
+                int(stats.get("writes_enqueued") or 0)
+                - int(stats.get("writes_completed") or 0)
+                - int(stats.get("write_failures") or 0)
+                - int(stats.get("writes_cancelled") or 0)
+            )
+            return max(0, outstanding)
+        except BaseException:
+            return 0
+
+    def _persistence_pending() -> int:
+        if scheduler is None or not hasattr(scheduler, "persistence_pending"):
+            return 0
+        try:
+            return int(scheduler.persistence_pending())
+        except BaseException:
+            return 0
+
+    def _persistence_active() -> bool:
+        # A popped encode no longer counts as pending but is still moving
+        # bytes (spill_entry writes blobs directly on the owner thread);
+        # the flush must outwait it or report it as remained.
+        if scheduler is None or not hasattr(scheduler, "stats"):
+            return False
+        try:
+            return scheduler.stats().get("active_kind") == "idle_persistence"
+        except BaseException:
+            return False
+
+    started = time.monotonic()
+    deadline = started + budget_s
+    pending = _persistence_pending() + _writer_outstanding()
+    if pending <= 0 and not _persistence_active():
+        return outcome
+    if _persistence_active():
+        # The running encode is real outstanding work too.
+        pending += 1
+    outcome["pending_before"] = pending
+    print(
+        f"[mtplx] shutdown: flushing {pending} pending SSD session-cache "
+        f"write(s) (bounded {budget_s:.0f}s)...",
+        flush=True,
+    )
+    # Drain the un-run encodes first: each needs an owner-thread slot, and
+    # during shutdown the only possible idle-band occupants are background
+    # chains — exactly what the pump bridges.
+    while (
+        _persistence_pending() > 0 or _persistence_active()
+    ) and time.monotonic() < deadline:
+        try:
+            if scheduler is not None and hasattr(scheduler, "pump_persistence"):
+                scheduler.pump_persistence(budget=4)
+        except BaseException:
+            break
+        time.sleep(0.05)
+    # Then the staged writer queue (file IO on the writer thread).
+    remaining_s = max(0.1, deadline - time.monotonic())
+    flush = getattr(sessions, "flush_cold_tier", None) if sessions is not None else None
+    try:
+        if callable(flush):
+            flush(timeout_s=remaining_s)
+        elif hasattr(cold_tier, "flush"):
+            cold_tier.flush(timeout_s=remaining_s)
+    except BaseException:
+        pass
+    remained = _persistence_pending() + _writer_outstanding()
+    outcome["remained"] = remained
+    outcome["flushed"] = max(0, pending - remained)
+    outcome["elapsed_s"] = round(time.monotonic() - started, 2)
+    print(
+        "[mtplx] shutdown: SSD session cache flushed "
+        f"{outcome['flushed']}/{pending} pending write(s) in "
+        f"{outcome['elapsed_s']}s"
+        + (f"; {remained} remained (bound hit)" if remained else ""),
+        flush=True,
+    )
+    return outcome
 
 
 async def _thermal_poll_loop(state: "ServerState", *, interval_s: float = 1.0) -> None:
@@ -16125,6 +17743,26 @@ def _stream_heartbeat_payload(
         "elapsed_s": max(0.0, float(now_s) - float(stream_started_s)),
         "seconds_since_last_token": max(0.0, float(now_s) - float(last_activity_s)),
     }
+
+
+def _sse_keepalive_interval_s() -> float | None:
+    """Interval for pre-first-token SSE comment heartbeats (#358); None = off.
+
+    MTPLX_SSE_HEARTBEAT=0 disables the comments; MTPLX_SSE_HEARTBEAT_INTERVAL_S
+    overrides the cadence (clamped to >= 1s; unparseable values fall back to
+    the default). Read at stream start — cheap, and tunable without a daemon
+    restart.
+    """
+    if not _env_bool_setting("MTPLX_SSE_HEARTBEAT", default=True):
+        return None
+    raw = os.environ.get("MTPLX_SSE_HEARTBEAT_INTERVAL_S")
+    if raw is None:
+        return SSE_KEEPALIVE_DEFAULT_INTERVAL_S
+    try:
+        interval_s = float(raw)
+    except ValueError:
+        return SSE_KEEPALIVE_DEFAULT_INTERVAL_S
+    return max(SSE_KEEPALIVE_MIN_INTERVAL_S, interval_s)
 
 
 @contextmanager
@@ -16893,6 +18531,9 @@ PUBLIC_MTPLX_STATS_KEYS = (
     # quiet envelopes stay byte-stable.
     "tool_calls_truncated_by_length",
     "raw_tool_markup_suppressed",
+    # Stamped only when a suppressed (unexecuted) tool call got its visible
+    # truth notice (#349), so quiet envelopes stay byte-stable.
+    "unexecuted_tool_call_notice",
     "legacy_bridge_used",
     "hidden_generation_repair_used",
     "early_tool_cancel_used",
@@ -17040,6 +18681,15 @@ def _public_mtplx_stats(generated: dict[str, Any]) -> dict[str, Any]:
     draft_ownership = stats.get("draft_sampler_ownership")
     if draft_ownership is not None:
         public["draft_sampler_ownership"] = str(draft_ownership)
+    # Adaptive draft-temperature summary (MTPLX_ADAPTIVE_DTEMP): non-empty
+    # only when the gate is on, so disabled runs keep byte-stable envelopes.
+    # With the controller active, draft_sampler_resolved_temperature remains
+    # the request-resolved BASE set-point and this block explains any drift
+    # from it (current_temperature + EMA + transition log) — an adaptive
+    # trajectory is provable telemetry, not a desync.
+    adaptive_dtemp = stats.get("draft_sampler_adaptive_dtemp")
+    if adaptive_dtemp:
+        public["draft_sampler_adaptive_dtemp"] = adaptive_dtemp
     postcommit = stats.get("session_postcommit_snapshot")
     if isinstance(postcommit, dict):
         public["session_postcommit_snapshot"] = {
@@ -17144,12 +18794,115 @@ def _record_stream_cancellation_metric(
         envelope.update(_mlx_allocator_public_stats())
     envelope.update(request_observability)
     _record_request_metrics(state, envelope)
-    state.last_request_at = time.time()
-    state.requests_cancelled = int(getattr(state, "requests_cancelled", 0) or 0) + 1
+    if not bool(envelope.get("warmup")):
+        state.last_request_at = time.time()
+        state.requests_cancelled = int(getattr(state, "requests_cancelled", 0) or 0) + 1
     try:
         state.dashboard.bus.publish(
             {
                 "kind": "cancelled",
+                "when_s": time.time(),
+                "envelope": dict(envelope),
+            }
+        )
+    except BaseException:
+        pass
+
+
+def _stream_error_kind(error: BaseException) -> tuple[str, int | None]:
+    """Classify a worker-side terminal error for the request receipt.
+
+    ``memory_refusal`` covers the engine-health 507s (#393 pressure abort,
+    allocation-failure shed): the engine refused the request to protect
+    itself. Everything else keeps its HTTP status when it has one.
+    """
+
+    status: int | None = None
+    raw_status = getattr(error, "status_code", None)
+    if isinstance(raw_status, int):
+        status = raw_status
+    if status == 507 or _is_allocation_failure(error):
+        return "memory_refusal", 507
+    if status is not None:
+        return "http_error", status
+    return "engine_error", None
+
+
+def _stream_error_detail(error: BaseException) -> str:
+    detail = getattr(error, "detail", None)
+    text = str(detail) if detail is not None else str(error)
+    return text[:400]
+
+
+def _record_stream_error_metric(
+    state: ServerState,
+    *,
+    response_id: str,
+    session_id: str | None,
+    prompt_tokens: int,
+    streamed_completion_tokens: int,
+    stream_started_s: float,
+    error: BaseException,
+    request_observability: dict[str, Any],
+    client_disconnected: bool = False,
+    token_times: list[float] | None = None,
+    mode: str = "stream",
+) -> None:
+    """Honest receipt for a request the ENGINE failed or refused (#415).
+
+    Before this, a worker-side error unwound through the stream teardown,
+    which sets the cancel event, so the receipt claimed
+    ``request_cancelled=true / cancellation_reason="stream_cancelled"``
+    while the client had actually received a structured 507. A refusal the
+    operator cannot find in the request log is a refusal they cannot act
+    on; this row names it.
+    """
+
+    error_kind, error_status = _stream_error_kind(error)
+    elapsed_s = max(0.0, time.perf_counter() - stream_started_s)
+    streamed_tokens = int(streamed_completion_tokens)
+    partial_tok_s = streamed_tokens / elapsed_s if elapsed_s > 0.0 else 0.0
+    envelope: dict[str, Any] = {
+        "mode": mode,
+        "request_id": response_id,
+        "session_id": session_id,
+        "prompt_tokens": int(prompt_tokens),
+        "completion_tokens": streamed_tokens,
+        "generated_tokens": streamed_tokens,
+        "request_elapsed_s": elapsed_s,
+        "elapsed_s": elapsed_s,
+        "server_elapsed_s": elapsed_s,
+        "decode_elapsed_s": elapsed_s,
+        "request_cancelled": False,
+        "stream_cancelled_by_client": bool(client_disconnected),
+        "stream_error": True,
+        "error_kind": error_kind,
+        "error_status": error_status,
+        "error_detail": _stream_error_detail(error),
+        "memory_refusal": error_kind == "memory_refusal",
+        "streamed_completion_tokens": streamed_tokens,
+        "decode_tok_s": partial_tok_s,
+        "request_tok_s": partial_tok_s,
+        "tok_s": partial_tok_s,
+        "server_tok_s": partial_tok_s,
+        "partial_decode_tok_s": partial_tok_s,
+        "partial_request_tok_s": partial_tok_s,
+        "session_cache_hit": False,
+        "cache_miss_reason": None,
+    }
+    if token_times:
+        envelope.update(_producer_gap_census(token_times))
+    # Allocator truth at failure time — for memory refusals this is the
+    # diagnosis, not decoration.
+    envelope.update(_mlx_allocator_public_stats())
+    envelope.update(request_observability)
+    _record_request_metrics(state, envelope)
+    if not bool(envelope.get("warmup")):
+        state.last_request_at = time.time()
+    try:
+        state.dashboard.bus.publish(
+            {
+                "kind": "request_error",
                 "when_s": time.time(),
                 "envelope": dict(envelope),
             }
@@ -18835,15 +20588,22 @@ def _schedule_idle_postcommit_snapshot(
     def _postcommit_abort_reason() -> str:
         if _stale_session_revision():
             return "stale_session_revision"
+        if _pressure_abort_requested(state):
+            return "memory_pressure_critical"
         if abort_event.is_set() or _foreground_pressure_past_grace():
             return "foreground_preempted_postcommit"
         return "postcommit_abort_requested"
 
     def _postcommit_abort_check() -> bool:
+        # The pressure arm (#393): a postcommit prefill replays the same
+        # deep forward that wedged the machine, so it must yield too. The
+        # aborted job re-arms on the idle band and retries once pressure
+        # clears.
         return bool(
             abort_event.is_set()
             or _stale_session_revision()
             or _foreground_pressure_past_grace()
+            or _pressure_abort_requested(state)
         )
 
     def _resubmit_after_yield() -> bool:
@@ -19064,30 +20824,67 @@ def _uncapped_response_lease_tokens_from_env() -> int | None:
 
 
 def _reject_prompt_over_context(state: ServerState, prompt_token_count: int) -> None:
-    """400 when the prompt alone fills or overflows the context window.
+    """Refuse prompts the serve cannot hold (400) or honestly fit (507).
 
-    Without this the request would enter generation with remaining_context
-    floored to 1 and produce a single token — a silent degradation a
-    benchmark ladder charts as engine speed. OpenAI parity: error code
-    context_length_exceeded with both numbers in the message. Called early
-    in the chat/completions handlers (a real 400 before any stream starts)
-    and again inside _generation_params as the backstop for every lane.
+    400: the prompt alone fills or overflows the context window. Without
+    this the request would enter generation with remaining_context floored
+    to 1 and produce a single token — a silent degradation a benchmark
+    ladder charts as engine speed. OpenAI parity: error code
+    context_length_exceeded with both numbers in the message.
+
+    507: the served window was explicitly overcommitted past the memory
+    plan's fit (--context-window overrides the plan by design — warn-loudly
+    policy) and THIS prompt's cold cost lands beyond the fit. Admitting it
+    would not fail fast: macOS compresses and swaps for minutes before any
+    Metal allocation error (the only prior 507 trigger) would fire — #393
+    wedged a 128 GB machine at a 119 GB footprint that way. Prompts under
+    the fit still serve, so an oversized window keeps its legitimate use.
+
+    Called early in the chat/completions handlers (a real error before any
+    stream starts) and again inside _generation_params as the backstop for
+    every lane.
     """
     context_window = int(state.context_window)
-    if int(prompt_token_count) < context_window:
-        return
-    raise HTTPException(
-        status_code=400,
-        detail={
-            "message": (
-                f"This model's maximum context length is {context_window} "
-                f"tokens, but the prompt alone has {int(prompt_token_count)} "
-                "tokens, leaving no room to generate. Reduce the prompt or "
-                "serve with a larger --context-window."
-            ),
-            "code": "context_length_exceeded",
-        },
-    )
+    if int(prompt_token_count) >= context_window:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": (
+                    f"This model's maximum context length is {context_window} "
+                    f"tokens, but the prompt alone has "
+                    f"{int(prompt_token_count)} tokens, leaving no room to "
+                    "generate. Reduce the prompt or serve with a larger "
+                    "--context-window."
+                ),
+                "code": "context_length_exceeded",
+            },
+        )
+    plan = getattr(state, "memory_plan", None)
+    if (
+        plan is not None
+        and bool(getattr(plan, "context_overcommitted", False))
+        and int(getattr(plan, "context_window_fit", 0) or 0) > 0
+        and int(prompt_token_count) >= int(plan.context_window_fit)
+    ):
+        fit = int(plan.context_window_fit)
+        resolved = int(
+            getattr(plan, "context_window_resolved", context_window)
+            or context_window
+        )
+        raise HTTPException(
+            status_code=507,
+            detail={
+                "message": (
+                    f"--context-window {resolved} exceeds this machine's "
+                    f"memory-plan fit of {fit} tokens, and this prompt "
+                    f"({int(prompt_token_count)} tokens) does not fit in "
+                    "memory. Prompts below the fit still serve; reduce the "
+                    f"prompt, serve at or below --context-window {fit}, or "
+                    "use q8 KV quantization."
+                ),
+                "code": "insufficient_memory",
+            },
+        )
 
 
 def _generation_params(
@@ -19482,10 +21279,18 @@ def _finalize_batched_ar_generation(
     stats["server_tok_s"] = (
         completion_tokens / request_elapsed_s if request_elapsed_s > 0 else 0.0
     )
-    state.last_metrics.append(dict(envelope))
-    state.last_metrics = state.last_metrics[-100:]
-    state.last_request_at = time.time()
-    state.requests_completed += 1
+    # Warmup rows stay out of the dashboard ring (see
+    # _record_request_metrics); real-request bookkeeping below still runs.
+    if not bool(envelope.get("warmup")):
+        state.last_metrics.append(dict(envelope))
+        state.last_metrics = state.last_metrics[-100:]
+        # Warming generations are not user requests (adapting community PR
+        # #300 by @Blakeolson21): stamping the traffic clock from a warm rung
+        # made the ladder defer against its own output and made /health
+        # report user traffic on an untouched daemon. Clock and counter move
+        # together so the two /health fields cannot disagree.
+        state.last_request_at = time.time()
+        state.requests_completed += 1
     _dashboard_record_completion(state, envelope=envelope, stats=stats)
     generated["stats"] = _json_safe(stats)
     generated["completion_tokens"] = completion_tokens
@@ -19675,10 +21480,18 @@ def _finalize_mtp_batch_generation(
     stats["server_tok_s"] = (
         completion_tokens / request_elapsed_s if request_elapsed_s > 0 else 0.0
     )
-    state.last_metrics.append(dict(envelope))
-    state.last_metrics = state.last_metrics[-100:]
-    state.last_request_at = time.time()
-    state.requests_completed += 1
+    # Warmup rows stay out of the dashboard ring (see
+    # _record_request_metrics); real-request bookkeeping below still runs.
+    if not bool(envelope.get("warmup")):
+        state.last_metrics.append(dict(envelope))
+        state.last_metrics = state.last_metrics[-100:]
+        # Warming generations are not user requests (adapting community PR
+        # #300 by @Blakeolson21): stamping the traffic clock from a warm rung
+        # made the ladder defer against its own output and made /health
+        # report user traffic on an untouched daemon. Clock and counter move
+        # together so the two /health fields cannot disagree.
+        state.last_request_at = time.time()
+        state.requests_completed += 1
     _dashboard_record_completion(state, envelope=envelope, stats=stats)
     generated["stats"] = _json_safe(stats)
     generated["completion_tokens"] = completion_tokens
@@ -20081,7 +21894,9 @@ def _run_mtp_batch_generation_dispatched(
     draft_sampler = _resolve_draft_sampler_for_request(
         state,
         request_draft_sampler=kwargs.get("draft_sampler"),
-        target_temperature=kwargs.get("temperature"),
+        # Effective temperature, not the raw kwarg (None when omitted) —
+        # same coupling contract as the serial lane.
+        target_temperature=float(sampler.temperature),
         target_sampler=sampler,
         request_observability=request_observability,
     )
@@ -20655,18 +22470,46 @@ def _run_generation_dispatched(
         kwargs.pop("mtp_batch_finalize_ownership", None)
         return _run_generation(state, prompt_ids, **kwargs)
 
+    # scheduler_mode=hyper (H0 singleton chassis): the SAME `run` closure and
+    # the SAME FIFO submission as serial — the gate only wraps admission
+    # accounting and the H1/H2 width seam around it (mtplx/server/hyper.py).
+    # Hyper must never route width-1 traffic through a batched driver; serial
+    # mode pays exactly one None check here.
+    hyper_gate = getattr(state, "hyper_gate", None)
+    hyper_ticket = None
+    submitted_run = run
+    if hyper_gate is not None:
+        hyper_ticket = hyper_gate.admit(
+            request_id=(
+                response_id or request_observability_for_lane.get("request_id")
+            ),
+            prompt_tokens=len(prompt_ids),
+        )
+        # The admission lane; orthogonal markers (ar_batch_bypass_reason,
+        # constrained flags) stay in the envelope untouched.
+        request_observability_for_lane["scheduler_lane"] = "hyper_singleton"
+        submitted_run = hyper_gate.bind(
+            hyper_ticket, run, generation_mode=effective_mode
+        )
     scheduler = getattr(state, "model_scheduler", None)
-    if (
-        scheduler is not None
-        and hasattr(scheduler, "is_owner_thread")
-        and scheduler.is_owner_thread()
-    ):
-        return run()
-    return _submit_foreground_model_work(
-        state,
-        run,
-        batch_key=batch_key,
-    ).result()
+    try:
+        if (
+            scheduler is not None
+            and hasattr(scheduler, "is_owner_thread")
+            and scheduler.is_owner_thread()
+        ):
+            return submitted_run()
+        return _submit_foreground_model_work(
+            state,
+            submitted_run,
+            batch_key=batch_key,
+        ).result()
+    finally:
+        # Settles hyper tickets whose work item never started (cancelled
+        # futures / submit failures); a no-op for started tickets and for
+        # every non-hyper mode.
+        if hyper_gate is not None and hyper_ticket is not None:
+            hyper_gate.release(hyper_ticket)
 
 
 def _couple_draft_sampler_to_greedy_target(
@@ -20917,7 +22760,11 @@ def _run_generation(
         else _resolve_draft_sampler_for_request(
             state,
             request_draft_sampler=draft_sampler,
-            target_temperature=temperature,
+            # Effective temperature, not the raw request field: the field is
+            # None when the client omits it while the launch default still
+            # decodes greedily, and a None here skips greedy coupling — a
+            # silent sampled-draft collapse ([79/65/42]% vs [96/87/76]%).
+            target_temperature=float(sampler.temperature),
             target_sampler=sampler,
             request_observability=request_observability,
         )
@@ -21006,6 +22853,14 @@ def _run_generation(
         try:
             if cancel_event is not None and cancel_event.is_set():
                 raise _StreamCancelled("request cancelled before generation")
+            admission_shed = _prefill_admission_shed(
+                state,
+                prompt_ids=prompt_ids,
+                session_bank=session_bank,
+                session_id=session_id,
+            )
+            if admission_shed is not None and request_observability is not None:
+                request_observability["prefill_admission_shed"] = admission_shed
             dynamic_kv_reservation = _dynamic_paged_kv_reservation(
                 prompt_tokens=len(prompt_ids),
                 max_new_tokens=response_max,
@@ -21073,9 +22928,14 @@ def _run_generation(
                         session_policy_fingerprint=session_policy_fingerprint,
                         capture_final_state=session_bank is not None,
                         abort_check=(
-                            (lambda: bool(cancel_event.is_set()))
+                            (
+                                lambda: bool(
+                                    cancel_event.is_set()
+                                    or _pressure_abort_requested(state)
+                                )
+                            )
                             if cancel_event is not None
-                            else None
+                            else (lambda: _pressure_abort_requested(state))
                         ),
                     )
                 else:
@@ -21092,9 +22952,14 @@ def _run_generation(
                         constraint=constraint,
                         vision_splice=vision_splice,
                         abort_check=(
-                            (lambda: bool(cancel_event.is_set()))
+                            (
+                                lambda: bool(
+                                    cancel_event.is_set()
+                                    or _pressure_abort_requested(state)
+                                )
+                            )
                             if cancel_event is not None
-                            else None
+                            else (lambda: _pressure_abort_requested(state))
                         ),
                         max_tokens=response_max,
                         sampler=sampler,
@@ -21167,9 +23032,22 @@ def _run_generation(
                         ),
                     )
         except PostcommitAbort:
-            # abort_check tripped inside the prefill: the client disconnected
-            # mid-prompt-processing. Reuse the exact cancellation path client
-            # disconnects already take during decode.
+            # abort_check tripped inside the prefill. Two arms share it: a
+            # client disconnect reuses the exact cancellation path decode
+            # disconnects take, while the guard loop's sustained-critical
+            # pressure abort (#393) is an engine-health refusal the client
+            # must SEE — that one maps to the honest 507 (which also sheds
+            # caches) instead of a silent cancel.
+            if _pressure_abort_requested(state) and not (
+                cancel_event is not None and cancel_event.is_set()
+            ):
+                raise _allocation_failure_http_exception(
+                    state,
+                    RuntimeError(
+                        "sustained critical memory pressure during prefill; "
+                        "aborted before the allocator wall"
+                    ),
+                )
             raise _StreamCancelled("client disconnected during prefill")
         finally:
             from mtplx.generation import set_live_decode_sink
@@ -21386,6 +23264,11 @@ def _run_generation(
         # Desync receipts (dynamic draft temperature): the resolved draft
         # sampler is visible per response, so a drifted draft is provable
         # from mtplx_stats alone. AR responses carry no draft keys at all.
+        # With MTPLX_ADAPTIVE_DTEMP on, this stamp stays the request-resolved
+        # BASE; the engine's per-round moves ride the accompanying
+        # draft_sampler_adaptive_dtemp block (current temp + EMA + transition
+        # log), which is what distinguishes an adaptive trajectory from a
+        # genuine desync.
         if effective_mode != "ar" and effective_draft_sampler is not None:
             stats["draft_sampler_resolved_temperature"] = float(
                 getattr(effective_draft_sampler, "temperature", 0.0)
@@ -21443,8 +23326,11 @@ def _run_generation(
             else (getattr(out, "finish_reason", None) or "stop")
         )
         _record_request_metrics(state, dict(envelope))
-        state.last_request_at = time.time()
-        state.requests_completed += 1
+        if not bool(envelope.get("warmup")):
+            # Same contract as the batch lanes: warm rungs never stamp the
+            # traffic clock (adapting community PR #300 by @Blakeolson21).
+            state.last_request_at = time.time()
+            state.requests_completed += 1
         _dashboard_record_completion(state, envelope=envelope, stats=stats)
         last = {
             "text": out.text,
@@ -21485,7 +23371,16 @@ def _run_generation(
         request_capture.capture_outcome(
             (request_observability or {}).get("request_id"),
             {
-                "scheduler_lane": "serial",
+                # The solo path serves serial AND hyper-singleton traffic;
+                # mirror the hyper lane stamp instead of mislabeling hyper
+                # capture envelopes as serial. Every other lane keeps the
+                # historical "serial" label byte-for-byte.
+                "scheduler_lane": (
+                    "hyper_singleton"
+                    if (request_observability or {}).get("scheduler_lane")
+                    == "hyper_singleton"
+                    else "serial"
+                ),
                 **request_capture.completion_token_ids(last.get("tokens")),
                 "completion_tokens": last["completion_tokens"],
                 "finish_reason": last.get("finish_reason"),
@@ -21673,10 +23568,40 @@ class _BackgroundWarmup:
                 return cls.IDLE_GRACE_S
         return cls.IDLE_GRACE_S
 
+    def _foreground_busy(self) -> bool:
+        """True while a real request is generating or queued for the model.
+
+        Only sound at step admission. The warming generation itself calls
+        ``begin_foreground`` for the whole rung, so ``has_foreground()``
+        reads zero here but non-zero once the rung is running: a caller
+        that re-checked from inside a rung would see warmup's own work as
+        live traffic and defer the ladder forever. That is why the sibling
+        ``_ForegroundYield`` reads the scheduler queues instead -- it runs
+        during the rung, this runs before it.
+        """
+        state = self.state
+        try:
+            if state.has_foreground():
+                return True
+        except BaseException:
+            pass
+        try:
+            return bool(_foreground_model_work_pending(state))
+        except BaseException:
+            return False
+
     def _foreground_quiet_for_s(self) -> float:
+        # last_request_at is stamped when a request COMPLETES, so a request
+        # that has arrived and is still generating leaves it untouched --
+        # 0.0 on a daemon that has not finished one yet, which read as
+        # "infinitely quiet" and admitted a warm rung against live traffic.
+        # That is the post-restart window an operator actually types into,
+        # so the very first request of a serve was the one most likely to
+        # be warmed over. In-flight and queued work is _foreground_busy's
+        # answer; this measures the completion stamp alone.
         last = float(getattr(self.state, "last_request_at", 0.0) or 0.0)
         if last <= 0.0:
-            # No request has ever landed (fresh boot): warm immediately.
+            # Nothing has ever completed: no traffic to stay clear of.
             return float("inf")
         return max(0.0, time.time() - last)
 
@@ -21712,10 +23637,15 @@ class _BackgroundWarmup:
             self._finish()
             return
         grace = self._idle_grace_s()
-        quiet = self._foreground_quiet_for_s()
-        if quiet < grace:
-            # Recently-served traffic: hold the plan without burning GPU or
-            # the resubmit budget, and re-check when the grace can be met.
+        busy = self._foreground_busy()
+        quiet = 0.0 if busy else self._foreground_quiet_for_s()
+        if busy or quiet < grace:
+            # Live or recently-served traffic: hold the plan without burning
+            # GPU or the resubmit budget, and re-check when the grace can be
+            # met. Busy is its own branch, not a zero folded into the grace
+            # comparison: MTPLX_WARMUP_IDLE_GRACE_S=0 is how an operator says
+            # "do not wait between turns", and it must not also hand a warm
+            # rung a request that is still generating.
             step = self.steps[index]
             if step.get("state") in ("pending", "yielded", "waiting_idle"):
                 step["state"] = "waiting_idle"
@@ -21920,6 +23850,9 @@ def _run_startup_warmup(state: ServerState) -> dict[str, Any]:
         _startup_line(
             f"[6/6] Warmup failed after {status['elapsed_s']:.1f}s: {status['error']}"
         )
+        # A failed warmup leaves every later request on the same broken
+        # path; the one-line message has no raise site, so surface it.
+        _startup_line(traceback.format_exc())
         if getattr(state.args, "strict_warmup", False):
             raise
         return status
@@ -24944,7 +26877,14 @@ def _reasoning_effort_for_state(
     return codec.default_effort
 
 
-_AGENT_THINKING_BUDGET_BY_EFFORT = {"low": 1536, "medium": 3072, "high": 6144}
+_AGENT_THINKING_BUDGET_BY_EFFORT = {
+    "low": 1536,
+    "medium": 3072,
+    "high": 6144,
+    # xhigh must sit above high — without this key the opt-in guard silently
+    # clamped xhigh sessions to the medium fallback budget.
+    "xhigh": 12288,
+}
 
 
 def _thinking_guard_config_for_request(
@@ -25090,12 +27030,17 @@ def _reasoning_history_mode(state: "ServerState") -> str:
         return _REASONING_HISTORY_STRIP
     if policy == "on":
         return _REASONING_HISTORY_PRESERVE
-    if policy == "auto" and _model_family_for_state(state) == "qwen3_8":
+    if policy == "auto" and _model_family_for_state(state) in {"qwen3_8", "qwen4_exp"}:
         # Qwen3.8's trained contract inverts the 3.6-era rolling checkpoint:
         # preserve_thinking is on by default for all workloads (model card),
         # keeping historical <think> blocks in the rendered conversation.
         # Append-only histories are also what the session bank wants. An
         # explicit "scoped" policy above still wins for operators who ask.
+        # Flash-Next (qwen4_exp) ships the byte-identical Qwen3.8 template
+        # and the same trained contract; leaving it on the scoped fallback
+        # made every agent round's postcommit abort with
+        # reasoning_history_scoping_mismatch and re-prefill the whole
+        # assistant turn (receipted 2026-08-28, OpenCode wall-clock rig).
         return _REASONING_HISTORY_PRESERVE
     if getattr(state, "reasoning_history_scoped_capable", False):
         return _REASONING_HISTORY_SCOPED
@@ -25319,6 +27264,11 @@ def _as_text_list(value: Any, *, field: str) -> list[str]:
 
 
 def create_app(state: ServerState) -> FastAPI:
+    response_registry = getattr(state, "response_registry", None)
+    if not isinstance(response_registry, ResponseRegistry):
+        response_registry = ResponseRegistry.from_env()
+        state.response_registry = response_registry
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         # Bind the running asyncio loop to the dashboard bus so generation
@@ -25334,6 +27284,14 @@ def create_app(state: ServerState) -> FastAPI:
             bg_tasks.append(asyncio.create_task(_thermal_poll_loop(state)))
         if _memory_pressure_guard_enabled():
             bg_tasks.append(asyncio.create_task(_memory_pressure_loop(state)))
+        if (
+            _idle_pump_enabled()
+            and getattr(state, "session_bank_cold_tier", None) is not None
+        ):
+            # Issue #290: guarantee SSD session-cache writes forward
+            # progress once the server goes request-idle (the persistence
+            # band otherwise starves behind any chaining idle occupant).
+            bg_tasks.append(asyncio.create_task(_idle_persistence_pump_loop(state)))
         retrieval = getattr(state, "retrieval", None)
         if retrieval is not None and retrieval.idle_timeout_s > 0:
             bg_tasks.append(asyncio.create_task(_retrieval_idle_loop(state)))
@@ -25348,8 +27306,18 @@ def create_app(state: ServerState) -> FastAPI:
                 await _aime_runner.stop_runs()
             except Exception:
                 pass
+            await asyncio.to_thread(response_registry.shutdown, 1.0)
             for task in bg_tasks:
                 task.cancel()
+            # Issue #290: BEFORE the scheduler shutdown cancels queued
+            # futures, give pending SSD session-cache writes a bounded
+            # best-effort flush — a plain SIGTERM/Ctrl-C used to silently
+            # lose every entry still in flight, and the next boot paid a
+            # full re-prefill. Off-loop so a second Ctrl-C stays live.
+            try:
+                await asyncio.to_thread(_shutdown_flush_cold_writes, state)
+            except Exception:
+                pass
             mtp_batch_service = getattr(state, "mtp_batch_service", None)
             if mtp_batch_service is not None:
                 mtp_batch_service.shutdown()
@@ -25588,6 +27556,7 @@ def create_app(state: ServerState) -> FastAPI:
             "dashboard_active_requests": dashboard_active,
             "active_requests": active_requests,
             "scheduler": scheduler_state,
+            "response_store": response_registry.stats(),
             "session_bank": (
                 state.sessions.bank.to_dict()
                 if hasattr(getattr(state, "sessions", None), "bank")
@@ -25775,6 +27744,11 @@ def create_app(state: ServerState) -> FastAPI:
                 state,
                 "metal_memory_caps",
                 {"applied": False, "reason": "unavailable"},
+            ),
+            "memory_plan": (
+                state.memory_plan.to_dict()
+                if getattr(state, "memory_plan", None) is not None
+                else None
             ),
             "mlx_cache_limit": state.mlx_cache_limit_status,
             "mlx_runtime": state.mlx_runtime_status,
@@ -26639,6 +28613,7 @@ def create_app(state: ServerState) -> FastAPI:
             "tool_parse_counters": dict(
                 getattr(state, "tool_parse_counters", {}) or {}
             ),
+            "response_store": response_registry.stats(),
         }
 
     @app.get("/admin/sessions")
@@ -26874,9 +28849,12 @@ def create_app(state: ServerState) -> FastAPI:
             "usage": {"total_tokens": prompt_tokens},
         }
 
-    @app.post("/v1/chat/completions")
-    async def chat_completions(
-        raw_request: Request, request: ChatCompletionRequest
+    async def _chat_completions_impl(
+        raw_request: Request,
+        request: ChatCompletionRequest,
+        *,
+        return_turn: bool,
+        bind_cancel: Callable[[Callable[[], Any]], Any] | None = None,
     ) -> Any:
         if not request.messages:
             raise HTTPException(status_code=400, detail="messages must not be empty")
@@ -27425,6 +29403,12 @@ def create_app(state: ServerState) -> FastAPI:
             session = state.sessions.get_or_create(session_id)
             session.last_cache_miss_reason = cache_miss_reason
             session.last_restore_mode = session_restore_mode
+            # request_observability was built ~100 lines up, before this
+            # resolution ran, from the line-one None placeholder — so a
+            # header-identified session logged request_session_source: null
+            # while session_id was populated, which #384 read (reasonably)
+            # as the live-ref gate never opening. Stamp the truth.
+            request_observability["request_session_source"] = session_source
         if requested_model:
             request_observability["request_model"] = requested_model
             request_observability["served_model_id"] = state.model_id
@@ -27919,46 +29903,18 @@ def create_app(state: ServerState) -> FastAPI:
         if request.stream:
             _generation_turn = GenerationTurn()
 
-            async def event_stream():
+            async def drive_turn():
                 stream_started_s = time.perf_counter()
-                last_sse_sent_s = stream_started_s
+                last_event_sent_s = stream_started_s
                 last_token_s: float | None = None
-                # Enqueue stamp of the token item currently being drained
-                # (generation-thread perf_counter). The census subtracts it
-                # to expose queue residency — the direct starvation receipt.
-                latest_token_enqueue_s: float | None = None
                 next_silence_warn_s = stream_started_s + STREAM_SILENCE_WARN_S
                 owner_stall_probe = _OwnerStallProbe(deadline_s=STREAM_STALL_DEADLINE_S)
+                sse_keepalive_interval_s = _sse_keepalive_interval_s()
 
-                def mark_sse_sent(chunk: str) -> str:
-                    nonlocal last_sse_sent_s
-                    last_sse_sent_s = time.perf_counter()
-                    if _STREAM_CENSUS_DIR is not None:
-                        _stream_census_record(
-                            response_id,
-                            chunk,
-                            queue_age_ms=(
-                                (last_sse_sent_s - latest_token_enqueue_s) * 1000
-                                if latest_token_enqueue_s is not None
-                                else None
-                            ),
-                        )
-                    return chunk
+                def mark_stream_activity(_event: object = None) -> None:
+                    nonlocal last_event_sent_s
+                    last_event_sent_s = time.perf_counter()
 
-                first = {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"role": "assistant"},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
-                yield mark_sse_sent(f"data: {json.dumps(first)}\n\n")
                 _generation_turn.start(TurnStarted(
                     response_id=response_id,
                     model=model,
@@ -27966,7 +29922,7 @@ def create_app(state: ServerState) -> FastAPI:
                 ))
 
                 queue = _LoopFedStreamQueue(asyncio.get_running_loop())
-                cancel_event = Event()
+                cancel_event = _AttributedCancelEvent()
                 # Register this request in the dashboard's in-flight registry
                 # so external cancel (`POST /v1/mtplx/cancel/{id}`) can flip
                 # the same per-request cancel_event the worker already checks.
@@ -27983,6 +29939,8 @@ def create_app(state: ServerState) -> FastAPI:
                     prompt_tokens=len(prompt_ids),
                 )
                 state.dashboard.in_flight.register(in_flight_handle)
+                if bind_cancel is not None:
+                    bind_cancel(cancel_event.set)
                 _flight(state).begin(
                     response_id,
                     session_id=session_id,
@@ -28017,7 +29975,9 @@ def create_app(state: ServerState) -> FastAPI:
                     if stop_sequence_cancel_fired:
                         return
                     stop_sequence_cancel_fired = True
-                    _cancel_stream_generation(cancel_event, generation_future)
+                    _cancel_stream_generation(
+                        cancel_event, generation_future, origin="stop_sequence"
+                    )
 
                 stream_interval = max(1, int(state.args.stream_interval))
                 content_tool_translator = (
@@ -28335,9 +30295,35 @@ def create_app(state: ServerState) -> FastAPI:
                 def maybe_repair_tool_fed_reasoning_only_completion(
                     generated: dict[str, Any],
                 ) -> dict[str, Any]:
+                    # The repair is a second-chance enhancement: its own
+                    # failure must never take down a request that already has
+                    # a servable first pass. Cancellation still propagates.
+                    try:
+                        return _repair_reasoning_only_completion_unguarded(
+                            generated
+                        )
+                    except _StreamCancelled:
+                        raise
+                    except Exception as exc:
+                        generated.setdefault("stats", {})[
+                            "reasoning_completion_repair_error"
+                        ] = f"{type(exc).__name__}: {exc}"[:200]
+                        return generated
+
+                def _repair_reasoning_only_completion_unguarded(
+                    generated: dict[str, Any],
+                ) -> dict[str, Any]:
+                    # Tools-declared turns are excluded from the F3
+                    # reasoning-as-content recovery (planning prose is not an
+                    # answer), so a reasoning-only stop here would otherwise
+                    # return an EMPTY assistant message. That includes the
+                    # FIRST turn of a tools-declared conversation (app chat
+                    # with web search on, agent clients' opening message) —
+                    # not just tool-fed turns — so the continuation repair
+                    # covers both (user reports: "model responds but produces
+                    # no answer", 27B + Flash-Next, chat and API).
                     if (
                         not tools_active
-                        or not tool_result_history_present
                         or not thinking_enabled
                         or request.seed is not None
                         or _reasoning_parser_for_state(state)
@@ -28355,6 +30341,19 @@ def create_app(state: ServerState) -> FastAPI:
                         )
                     )
                     if not first_text.strip():
+                        return generated
+                    # Tool-control markup — even unclosed — belongs to the
+                    # established tool-parse fallback machinery
+                    # (orphan/unclosed_tool_call), not this repair. The
+                    # thinking splitter classifies markup after a pre-opened
+                    # <think> as reasoning, which would otherwise read here
+                    # as a reasoning-only turn.
+                    if any(
+                        marker in first_text
+                        for marker in (
+                            _ThinkingContentStreamSplitter._TOOL_CONTROL_MARKERS
+                        )
+                    ):
                         return generated
                     raw_reasoning_text, raw_content_text = _tool_extraction_text_parts(
                         state,
@@ -28393,6 +30392,8 @@ def create_app(state: ServerState) -> FastAPI:
                             "reasoning_completion_repair_attempted": True,
                             "reasoning_completion_repair_reason": (
                                 "tool_fed_reasoning_only_completion"
+                                if tool_result_history_present
+                                else "tools_declared_reasoning_only_completion"
                             ),
                             "reasoning_completion_repair_first_completion_tokens": int(
                                 generated.get("completion_tokens") or 0
@@ -29149,60 +31150,46 @@ def create_app(state: ServerState) -> FastAPI:
                     daemon=True,
                 ).start()
 
-                # The envelope around each delta is constant for the whole
-                # stream; serialize it once instead of rebuilding and
-                # re-serializing the full payload dict per token chunk.
-                # Byte-identical to json.dumps of the equivalent dict
-                # (default separators and key order).
-                _delta_envelope_prefix = (
-                    'data: {"id": '
-                    + json.dumps(response_id)
-                    + ', "object": "chat.completion.chunk", "created": '
-                    + json.dumps(created)
-                    + ', "model": '
-                    + json.dumps(model)
-                    + ', "choices": [{"index": 0, "delta": '
-                )
-                _delta_envelope_suffix = ', "finish_reason": null}]}\n\n'
+                # Helpers return semantic deltas only. Wire serialization is
+                # owned exclusively by the selected protocol renderer.
+                def delta_payload_chunk(delta: dict[str, Any]) -> dict[str, Any]:
+                    return delta
 
-                def delta_payload_chunk(delta: dict[str, Any]) -> str:
-                    return (
-                        _delta_envelope_prefix
-                        + json.dumps(delta)
-                        + _delta_envelope_suffix
-                    )
-
-                def delta_chunk(field: str, text: str) -> str:
+                def delta_chunk(field: str, text: str) -> dict[str, Any]:
                     return delta_payload_chunk({field: text})
 
-                def progress_chunk(progress: dict[str, Any]) -> str:
+                def progress_chunk(progress: dict[str, Any]) -> dict[str, Any]:
                     with suppress(RuntimeError):
                         _generation_turn.emit(
                             TurnHeartbeat(payload=_json_safe(progress))
                         )
-                    payload = {
-                        "id": response_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": None,
-                            }
-                        ],
-                        "mtplx_progress": _json_safe(progress),
-                    }
-                    return f"data: {json.dumps(payload)}\n\n"
+                    return progress
 
                 def error_chunk(exc: BaseException) -> str:
+                    if _is_allocation_failure(exc):
+                        # Shed caches + honest 507 instead of an anonymous
+                        # RuntimeError 500; the daemon stays up (#348).
+                        exc = _allocation_failure_http_exception(state, exc)
                     if isinstance(exc, HTTPException):
                         message = str(exc.detail)
                         status_code = exc.status_code
+                        error_code = (
+                            "insufficient_memory"
+                            if status_code == 507
+                            else type(exc).__name__
+                        )
                     else:
                         message = str(exc)
                         status_code = 500
+                        error_code = type(exc).__name__
+                    with suppress(RuntimeError):
+                        _generation_turn.fail(
+                            TurnFailed(
+                                error=message,
+                                code=error_code,
+                                status_code=int(status_code),
+                            )
+                        )
                     payload = {
                         "id": response_id,
                         "object": "chat.completion.chunk",
@@ -29214,7 +31201,7 @@ def create_app(state: ServerState) -> FastAPI:
                         **_openai_error_content(
                             message,
                             status_code=status_code,
-                            code=type(exc).__name__,
+                            code=error_code,
                         ),
                     }
                     return f"data: {json.dumps(payload)}\n\n"
@@ -29380,7 +31367,7 @@ def create_app(state: ServerState) -> FastAPI:
                     use_orphan_guard: bool = True,
                     use_tool_translator: bool = True,
                     monitor_stop: bool = True,
-                ) -> list[str]:
+                ) -> list[dict[str, Any]]:
                     nonlocal streamed_assistant_tool_calls
                     nonlocal streamed_tool_deltas_emitted
                     nonlocal early_tool_cancel_used
@@ -29412,7 +31399,7 @@ def create_app(state: ServerState) -> FastAPI:
                     ):
                         if early_tool_cancel_used and streamed_assistant_tool_calls:
                             return []
-                        chunks: list[str] = []
+                        chunks: list[dict[str, Any]] = []
                         for delta in content_tool_translator.feed(field, text):
                             if not delta:
                                 continue
@@ -29457,7 +31444,11 @@ def create_app(state: ServerState) -> FastAPI:
                         ):
                             early_tool_cancel_used = True
                             pending_tool_cancel_started_s = None
-                            _cancel_stream_generation(cancel_event, generation_future)
+                            _cancel_stream_generation(
+                                cancel_event,
+                                generation_future,
+                                origin="early_tool_finish",
+                            )
                             return chunks
                         if content_tool_translator.invalid_trailing_after_tool_call:
                             streamed_assistant_tool_calls = (
@@ -29473,7 +31464,11 @@ def create_app(state: ServerState) -> FastAPI:
                                 )
                             early_tool_cancel_used = True
                             pending_tool_cancel_started_s = None
-                            _cancel_stream_generation(cancel_event, generation_future)
+                            _cancel_stream_generation(
+                                cancel_event,
+                                generation_future,
+                                origin="early_tool_finish",
+                            )
                         elif content_tool_translator.ready_to_finish_tool_turn:
                             streamed_assistant_tool_calls = (
                                 content_tool_translator.tool_calls
@@ -29489,7 +31484,9 @@ def create_app(state: ServerState) -> FastAPI:
                                 early_tool_cancel_used = True
                                 pending_tool_cancel_started_s = None
                                 _cancel_stream_generation(
-                                    cancel_event, generation_future
+                                    cancel_event,
+                                    generation_future,
+                                    origin="early_tool_finish",
                                 )
                             elif pending_tool_cancel_started_s is None:
                                 pending_tool_cancel_started_s = time.perf_counter()
@@ -29500,11 +31497,11 @@ def create_app(state: ServerState) -> FastAPI:
                     remember_stream_delta(delta)
                     return [delta_payload_chunk(delta)]
 
-                def finish_orphan_stream_guards() -> list[str]:
+                def finish_orphan_stream_guards() -> list[dict[str, Any]]:
                     nonlocal stream_orphan_tool_markup_suppressed
                     if not orphan_stream_guard_enabled:
                         return []
-                    chunks: list[str] = []
+                    chunks: list[dict[str, Any]] = []
                     for field, guard in (
                         ("reasoning_content", orphan_reasoning_stream_guard),
                         ("content", orphan_content_stream_guard),
@@ -29544,11 +31541,11 @@ def create_app(state: ServerState) -> FastAPI:
                     text: str,
                     *,
                     force: bool = False,
-                ) -> list[str]:
+                ) -> list[dict[str, Any]]:
                     nonlocal read_only_force_answer_stream_buffer
                     nonlocal read_only_force_answer_stream_started
                     nonlocal read_only_force_answer_stream_marker_stripped_chars
-                    chunks: list[str] = []
+                    chunks: list[dict[str, Any]] = []
                     emit_text = ""
                     if read_only_force_answer_stream_started:
                         emit_text = text
@@ -29592,14 +31589,16 @@ def create_app(state: ServerState) -> FastAPI:
                         )
                     return chunks
 
-                def emit_read_only_force_answer_visible_text(text: str) -> list[str]:
+                def emit_read_only_force_answer_visible_text(
+                    text: str,
+                ) -> list[dict[str, Any]]:
                     nonlocal read_only_force_answer_stream_buffer
                     nonlocal read_only_force_answer_stream_started
                     if not text:
                         return []
                     read_only_force_answer_stream_buffer = ""
                     read_only_force_answer_stream_started = True
-                    chunks: list[str] = []
+                    chunks: list[dict[str, Any]] = []
                     for part in read_only_force_answer_text_slices(text):
                         chunks.extend(
                             stream_content_delta_chunks(
@@ -29614,10 +31613,10 @@ def create_app(state: ServerState) -> FastAPI:
                 def finish_translated_stream_chunks(
                     *,
                     defer_content_resolution: bool = False,
-                ) -> list[str]:
+                ) -> list[dict[str, Any]]:
                     nonlocal streamed_assistant_tool_calls
                     nonlocal streamed_tool_deltas_emitted
-                    chunks: list[str] = []
+                    chunks: list[dict[str, Any]] = []
                     if early_tool_cancel_used and streamed_assistant_tool_calls:
                         return chunks
                     if content_tool_translator is not None:
@@ -29634,6 +31633,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     content_tool_translator.tool_calls
                                     or streamed_assistant_tool_calls
                                 )
+                                remember_tool_call_delta(delta)
                             chunks.append(delta_payload_chunk(delta))
                     return chunks
 
@@ -29693,10 +31693,11 @@ def create_app(state: ServerState) -> FastAPI:
 
                 stream_cancelled_by_client = False
                 cancelled_metric_recorded = False
+                stream_error_item: BaseException | None = None
                 for field, text in splitter.start():
                     if text:
                         for chunk in stream_content_delta_chunks(field, text):
-                            yield mark_sse_sent(chunk)
+                            mark_stream_activity(chunk)
 
                 try:
                     while True:
@@ -29757,18 +31758,18 @@ def create_app(state: ServerState) -> FastAPI:
                                         else "stream_cancelled"
                                     )
                                 if not client_disconnected_now:
-                                    yield mark_sse_sent(
+                                    mark_stream_activity(
                                         error_chunk(
                                             RuntimeError(
                                                 "request cancelled via "
-                                                "POST /v1/mtplx/cancel "
+                                                f"{_cancel_via_label(cancel_event)} "
                                                 "after "
                                                 f"{streamed_progress_tokens} "
                                                 "streamed tokens"
                                             )
                                         )
                                     )
-                                    yield mark_sse_sent("data: [DONE]\n\n")
+                                    mark_stream_activity(None)
                                 return
                             now_s = time.perf_counter()
                             if (
@@ -29780,7 +31781,9 @@ def create_app(state: ServerState) -> FastAPI:
                                 early_tool_cancel_used = True
                                 pending_tool_cancel_started_s = None
                                 _cancel_stream_generation(
-                                    cancel_event, generation_future
+                                    cancel_event,
+                                    generation_future,
+                                    origin="early_tool_finish",
                                 )
                                 continue
                             frozen_for_s = owner_stall_probe.observe(now_s)
@@ -29801,7 +31804,9 @@ def create_app(state: ServerState) -> FastAPI:
                                     streamed_tokens=streamed_progress_tokens,
                                 )
                                 _cancel_stream_generation(
-                                    cancel_event, generation_future
+                                    cancel_event,
+                                    generation_future,
+                                    origin="stream_stall",
                                 )
                                 if session is not None and hasattr(
                                     session, "abort_pending_postcommit"
@@ -29809,7 +31814,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     session.abort_pending_postcommit(
                                         "stream_stall_watchdog"
                                     )
-                                yield mark_sse_sent(
+                                mark_stream_activity(
                                     error_chunk(
                                         TimeoutError(
                                             "model owner made no progress for "
@@ -29820,15 +31825,32 @@ def create_app(state: ServerState) -> FastAPI:
                                         )
                                     )
                                 )
-                                yield mark_sse_sent("data: [DONE]\n\n")
+                                mark_stream_activity(None)
                                 return
                             if (
-                                not generation_future.done()
+                                sse_keepalive_interval_s is not None
+                                and streamed_decode_started_s is None
+                                and not generation_future.done()
                                 and now_s - last_sse_sent_s
+                                >= sse_keepalive_interval_s
+                            ):
+                                # Pre-first-token liveness (#358): during long
+                                # prefills the only bytes so far are the role
+                                # delta, so strict client/proxy read-timeouts
+                                # see a dead wire. SSE comments are invisible
+                                # to parsers and cannot disturb chunk layout;
+                                # once decode starts, token cadence takes
+                                # over. At the default cadence (5s < 10s)
+                                # this also keeps the progress-chunk check
+                                # below idle until decode starts.
+                                yield mark_sse_sent(SSE_KEEPALIVE_COMMENT)
+                            if (
+                                not generation_future.done()
+                                and now_s - last_event_sent_s
                                 >= STREAM_HEARTBEAT_INTERVAL_S
                             ):
                                 maybe_log_stream_silence(now_s)
-                                yield mark_sse_sent(
+                                mark_stream_activity(
                                     progress_chunk(
                                         _stream_heartbeat_payload(
                                             completion_tokens=streamed_progress_tokens,
@@ -29848,7 +31870,6 @@ def create_app(state: ServerState) -> FastAPI:
                             else:
                                 stream_tokens = list(item or [])
                                 token_timestamp_s = time.perf_counter()
-                            latest_token_enqueue_s = token_timestamp_s
                             if stream_tokens:
                                 streamed_token_ids.extend(int(t) for t in stream_tokens)
                                 streamed_token_times.extend(
@@ -29888,7 +31909,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     published_progress is not None
                                     and not buffer_read_only_force_answer_stream
                                 ):
-                                    yield mark_sse_sent(
+                                    mark_stream_activity(
                                         progress_chunk(published_progress)
                                     )
                             if not buffer_read_only_force_answer_stream:
@@ -29896,13 +31917,13 @@ def create_app(state: ServerState) -> FastAPI:
                                     for chunk in stream_content_delta_chunks(
                                         field, text
                                     ):
-                                        yield mark_sse_sent(chunk)
+                                        mark_stream_activity(chunk)
                             else:
                                 for _field, text in drain_stream_tokens(stream_tokens):
                                     for chunk in stream_read_only_force_answer_text(
                                         text
                                     ):
-                                        yield mark_sse_sent(chunk)
+                                        mark_stream_activity(chunk)
                             if (
                                 content_tool_translator is not None
                                 and content_tool_translator.buffering_tool_call
@@ -29925,11 +31946,13 @@ def create_app(state: ServerState) -> FastAPI:
                                     and hidden_elapsed_s >= STREAM_HIDDEN_TOOL_GUARD_S
                                 ):
                                     for chunk in finish_translated_stream_chunks():
-                                        yield mark_sse_sent(chunk)
+                                        mark_stream_activity(chunk)
                                     if streamed_assistant_tool_calls:
                                         early_tool_cancel_used = True
                                         _cancel_stream_generation(
-                                            cancel_event, generation_future
+                                            cancel_event,
+                                            generation_future,
+                                            origin="early_tool_finish",
                                         )
                                     else:
                                         reason = (
@@ -29945,9 +31968,11 @@ def create_app(state: ServerState) -> FastAPI:
                                             stream=True,
                                         )
                                         _cancel_stream_generation(
-                                            cancel_event, generation_future
+                                            cancel_event,
+                                            generation_future,
+                                            origin="hidden_tool_guard",
                                         )
-                                        yield mark_sse_sent(
+                                        mark_stream_activity(
                                             error_chunk(
                                                 HTTPException(
                                                     status_code=422,
@@ -29966,7 +31991,7 @@ def create_app(state: ServerState) -> FastAPI:
                                                 ),
                                                 code="tool_parse_error",
                                             ))
-                                        yield mark_sse_sent("data: [DONE]\n\n")
+                                        mark_stream_activity(None)
                                         return
                             else:
                                 hidden_tool_guard_started_s = None
@@ -30005,7 +32030,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     for chunk in stream_read_only_force_answer_text(
                                         text
                                     ):
-                                        yield mark_sse_sent(chunk)
+                                        mark_stream_activity(chunk)
                                 tail = decoder.finish()
                                 if tail:
                                     for _field, text in splitter.feed(tail):
@@ -30015,7 +32040,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             ) in stream_read_only_force_answer_text(
                                                 text
                                             ):
-                                                yield mark_sse_sent(chunk)
+                                                mark_stream_activity(chunk)
                                 visible_text, stripped_chars = (
                                     _read_only_force_answer_visible_text(
                                         str(generated.get("text") or "")
@@ -30069,14 +32094,14 @@ def create_app(state: ServerState) -> FastAPI:
                                                     use_orphan_guard=False,
                                                     use_tool_translator=False,
                                                 ):
-                                                    yield mark_sse_sent(chunk)
+                                                    mark_stream_activity(chunk)
                                     else:
                                         for (
                                             chunk
                                         ) in emit_read_only_force_answer_visible_text(
                                             visible_text
                                         ):
-                                            yield mark_sse_sent(chunk)
+                                            mark_stream_activity(chunk)
                                     stats[
                                         "read_only_force_answer_marker_stream_started"
                                     ] = bool(read_only_force_answer_stream_started)
@@ -30090,7 +32115,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     for chunk in stream_content_delta_chunks(
                                         field, text
                                     ):
-                                        yield mark_sse_sent(chunk)
+                                        mark_stream_activity(chunk)
                                 tail = decoder.finish()
                                 if tail:
                                     for field, text in splitter.feed(tail):
@@ -30098,7 +32123,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             for chunk in stream_content_delta_chunks(
                                                 field, text
                                             ):
-                                                yield mark_sse_sent(chunk)
+                                                mark_stream_activity(chunk)
                                 recover_unclosed_reasoning = (
                                     str(generated.get("finish_reason") or "") == "stop"
                                     and not tools_active
@@ -30113,9 +32138,9 @@ def create_app(state: ServerState) -> FastAPI:
                                         for chunk in stream_content_delta_chunks(
                                             field, text
                                         ):
-                                            yield mark_sse_sent(chunk)
+                                            mark_stream_activity(chunk)
                                 for chunk in finish_orphan_stream_guards():
-                                    yield mark_sse_sent(chunk)
+                                    mark_stream_activity(chunk)
                                 if (
                                     stop_monitor is not None
                                     and not stop_monitor.stopped
@@ -30128,11 +32153,11 @@ def create_app(state: ServerState) -> FastAPI:
                                             use_orphan_guard=False,
                                             monitor_stop=False,
                                         ):
-                                            yield mark_sse_sent(chunk)
+                                            mark_stream_activity(chunk)
                                 for chunk in finish_translated_stream_chunks(
                                     defer_content_resolution=True,
                                 ):
-                                    yield mark_sse_sent(chunk)
+                                    mark_stream_activity(chunk)
                             raw_generated_text = (
                                 _strip_mtplx_internal_continuation_markers(
                                     _strip_generated_chat_template_sentinels(
@@ -30188,7 +32213,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             use_orphan_guard=False,
                                             use_tool_translator=False,
                                         ):
-                                            yield mark_sse_sent(chunk)
+                                            mark_stream_activity(chunk)
                             if content_tool_translator is not None:
                                 for (
                                     delta
@@ -30196,7 +32221,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     has_tool_calls=bool(assistant_tool_calls),
                                 ):
                                     remember_stream_delta(delta)
-                                    yield mark_sse_sent(delta_payload_chunk(delta))
+                                    mark_stream_activity(delta_payload_chunk(delta))
                             stats = generated.setdefault("stats", {})
                             stats["openai_bridge_mode"] = "omlx_style"
                             stats["legacy_bridge_used"] = False
@@ -30242,7 +32267,70 @@ def create_app(state: ServerState) -> FastAPI:
                                 ):
                                     delta = {"content": fallback_visible_text}
                                     remember_stream_delta(delta)
+                                    mark_stream_activity(delta_payload_chunk(delta))
                                     yield mark_sse_sent(delta_payload_chunk(delta))
+                                if (
+                                    extraction.status == "malformed_as_content"
+                                    and not assistant_tool_calls
+                                    and _tool_parse_counter_key(
+                                        extraction.malformed_reason
+                                        or "malformed_tool_call"
+                                    )
+                                    == "unknown_tool_name"
+                                ):
+                                    # #349 (stream twin of the non-stream
+                                    # fallback): a call to an undeclared tool
+                                    # was suppressed without executing — and a
+                                    # turn that was ONLY that call streamed no
+                                    # content at all. State the truth so the
+                                    # model self-corrects instead of believing
+                                    # the tool ran and returned nothing.
+                                    unknown_tool_notice = (
+                                        _unknown_tool_unexecuted_call_notice(
+                                            _unknown_tool_name_from_reason(
+                                                extraction.malformed_reason or ""
+                                            ),
+                                            _tool_names(tool_specs),
+                                        )
+                                    )
+                                    if unknown_tool_notice not in "".join(
+                                        history_content_chunks
+                                    ):
+                                        delta = {"content": unknown_tool_notice}
+                                        remember_stream_delta(delta)
+                                        yield mark_sse_sent(
+                                            delta_payload_chunk(delta)
+                                        )
+                                        stats["unexecuted_tool_call_notice"] = True
+                            elif (
+                                not tools_active
+                                and not read_only_force_answer_contract_active
+                                and not assistant_tool_calls
+                                and splitter.suppressed_tool_markup_chars > 0
+                            ):
+                                # #349 (stream twin of the non-stream #160
+                                # strip): the splitter suppressed no-tools
+                                # tool-call markup mid-stream, so the model's
+                                # call vanished with no output and no error.
+                                # Emit the truthful notice as the turn's last
+                                # content delta; remember_stream_delta puts it
+                                # in the committed history too, keeping the
+                                # session bank byte-identical with what the
+                                # client replays next turn.
+                                no_tools_notice = _no_tools_unexecuted_call_notice(
+                                    _tool_markup_call_names(raw_generated_text)
+                                )
+                                if no_tools_notice not in "".join(
+                                    history_content_chunks
+                                ):
+                                    delta = {"content": no_tools_notice}
+                                    remember_stream_delta(delta)
+                                    yield mark_sse_sent(delta_payload_chunk(delta))
+                                    stats["unexecuted_tool_call_notice"] = True
+                                    # Parity with the non-stream #160 strip,
+                                    # which stamps this on every no-tools
+                                    # suppression.
+                                    stats["raw_tool_markup_suppressed"] = True
                             if assistant_tool_calls:
                                 recovered_tool_preamble = getattr(
                                     splitter,
@@ -30290,7 +32378,7 @@ def create_app(state: ServerState) -> FastAPI:
                                         use_tool_translator=False,
                                         monitor_stop=False,
                                     ):
-                                        yield mark_sse_sent(chunk)
+                                        mark_stream_activity(chunk)
                                     stats[
                                         "stream_tool_preamble_recovered_as_content"
                                     ] = True
@@ -30300,7 +32388,7 @@ def create_app(state: ServerState) -> FastAPI:
                                         argument_chunk_chars=stream_interval,
                                     ):
                                         remember_tool_call_delta(delta)
-                                        yield mark_sse_sent(delta_payload_chunk(delta))
+                                        mark_stream_activity(delta_payload_chunk(delta))
                                 elif not turn_tool_deltas_emitted:
                                     for delta in _stream_tool_call_deltas(
                                         assistant_tool_calls,
@@ -30405,7 +32493,7 @@ def create_app(state: ServerState) -> FastAPI:
                                                 session.abort_pending_postcommit(
                                                     "stream_stall_watchdog"
                                                 )
-                                            yield mark_sse_sent(
+                                            mark_stream_activity(
                                                 error_chunk(
                                                     TimeoutError(
                                                         "model owner made no "
@@ -30420,16 +32508,16 @@ def create_app(state: ServerState) -> FastAPI:
                                                     )
                                                 )
                                             )
-                                            yield mark_sse_sent(
-                                                "data: [DONE]\n\n"
+                                            mark_stream_activity(
+                                                None
                                             )
                                             return
                                         if (
-                                            now_s - last_sse_sent_s
+                                            now_s - last_event_sent_s
                                             >= STREAM_HEARTBEAT_INTERVAL_S
                                         ):
                                             maybe_log_stream_silence(now_s)
-                                            yield mark_sse_sent(
+                                            mark_stream_activity(
                                                 progress_chunk(
                                                     _stream_heartbeat_payload(
                                                         completion_tokens=(
@@ -30448,8 +32536,8 @@ def create_app(state: ServerState) -> FastAPI:
                                 if commit_kind == "committed":
                                     generated = commit_item
                                 elif commit_kind == "error":
-                                    yield mark_sse_sent(error_chunk(commit_item))
-                                    yield mark_sse_sent("data: [DONE]\n\n")
+                                    mark_stream_activity(error_chunk(commit_item))
+                                    mark_stream_activity(None)
                                     return
                                 elif commit_kind == "released":
                                     release = (
@@ -30577,14 +32665,14 @@ def create_app(state: ServerState) -> FastAPI:
                                         "session_postcommit_snapshot"
                                     ] = postcommit_snapshot
                                 else:
-                                    yield mark_sse_sent(
+                                    mark_stream_activity(
                                         error_chunk(
                                             RuntimeError(
                                                 f"unexpected commit event: {commit_kind}"
                                             )
                                         )
                                     )
-                                    yield mark_sse_sent("data: [DONE]\n\n")
+                                    mark_stream_activity(None)
                                     return
                             generated = attach_response_observability(generated)
                             _attach_dashboard_progress_stats(
@@ -30642,7 +32730,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     f"\n\n{footer}",
                                     monitor_stop=False,
                                 ):
-                                    yield mark_sse_sent(chunk)
+                                    mark_stream_activity(chunk)
                             break
                         elif kind == "reset_orphan_stream_guards":
                             reset_orphan_stream_guards()
@@ -30656,7 +32744,7 @@ def create_app(state: ServerState) -> FastAPI:
                                 continue
                             for field, text in drain_stream_tokens([], force=True):
                                 for chunk in stream_content_delta_chunks(field, text):
-                                    yield mark_sse_sent(chunk)
+                                    mark_stream_activity(chunk)
                             tail = decoder.finish()
                             if tail:
                                 for field, text in splitter.feed(tail):
@@ -30664,20 +32752,22 @@ def create_app(state: ServerState) -> FastAPI:
                                         for chunk in stream_content_delta_chunks(
                                             field, text
                                         ):
-                                            yield mark_sse_sent(chunk)
+                                            mark_stream_activity(chunk)
                             for field, text in splitter.feed(THINK_CLOSE):
                                 if text:
                                     for chunk in stream_content_delta_chunks(
                                         field, text
                                     ):
-                                        yield mark_sse_sent(chunk)
+                                        mark_stream_activity(chunk)
                             decoder = _IncrementalTokenDecoder(state.runtime.tokenizer)
                             continue
                         elif kind == "error":
+                            if isinstance(item, BaseException):
+                                stream_error_item = item
                             with suppress(RuntimeError):
                                 _generation_turn.fail(TurnFailed(error=str(item)))
-                            yield mark_sse_sent(error_chunk(item))
-                            yield mark_sse_sent("data: [DONE]\n\n")
+                            mark_stream_activity(error_chunk(item))
+                            mark_stream_activity(None)
                             return
                         elif kind == "cancelled":
                             if stop_monitor is not None and stop_monitor.stopped:
@@ -30761,33 +32851,35 @@ def create_app(state: ServerState) -> FastAPI:
                             if await raw_request.is_disconnected():
                                 stream_cancelled_by_client = True
                             else:
-                                yield mark_sse_sent(
+                                mark_stream_activity(
                                     error_chunk(
                                         RuntimeError(
                                             "request cancelled via "
-                                            "POST /v1/mtplx/cancel after "
+                                            f"{_cancel_via_label(cancel_event)} after "
                                             f"{streamed_progress_tokens} "
                                             "streamed tokens"
                                         )
                                     )
                                 )
-                                yield mark_sse_sent("data: [DONE]\n\n")
+                                mark_stream_activity(None)
                             return
                         else:
                             with suppress(RuntimeError):
                                 _generation_turn.fail(TurnFailed(
                                     error=f"unexpected stream event: {kind}",
                                 ))
-                            yield mark_sse_sent(
+                            mark_stream_activity(
                                 error_chunk(
                                     RuntimeError(f"unexpected stream event: {kind}")
                                 )
                             )
-                            yield mark_sse_sent("data: [DONE]\n\n")
+                            mark_stream_activity(None)
                             return
                 except asyncio.CancelledError:
                     stream_cancelled_by_client = True
-                    _cancel_stream_generation(cancel_event, generation_future)
+                    _cancel_stream_generation(
+                        cancel_event, generation_future, origin="client_disconnect"
+                    )
                     raise
                 except GeneratorExit:
                     stream_cancelled_by_client = True
@@ -30795,8 +32887,8 @@ def create_app(state: ServerState) -> FastAPI:
                 except BaseException as exc:
                     with suppress(RuntimeError):
                         _generation_turn.fail(TurnFailed(error=str(exc)))
-                    yield mark_sse_sent(error_chunk(exc))
-                    yield mark_sse_sent("data: [DONE]\n\n")
+                    mark_stream_activity(error_chunk(exc))
+                    mark_stream_activity(None)
                     return
                 finally:
                     if stream_cancelled_by_client:
@@ -30807,9 +32899,17 @@ def create_app(state: ServerState) -> FastAPI:
                     nonlocal_cancel_reason = (
                         "client_disconnected"
                         if stream_cancelled_by_client
-                        else "stream_cancelled"
+                        # Truthful cancel accounting (#381): the recorded
+                        # origin (stop_sequence, early_tool_finish,
+                        # post_endpoint, ...) beats the generic bucket.
+                        else (
+                            getattr(cancel_event, "origin", None)
+                            or "stream_cancelled"
+                        )
                     )
-                    _cancel_stream_generation(cancel_event, generation_future)
+                    _cancel_stream_generation(
+                        cancel_event, generation_future, origin="stream_teardown"
+                    )
                     if (
                         stream_cancelled_by_client
                         and session is not None
@@ -30819,7 +32919,26 @@ def create_app(state: ServerState) -> FastAPI:
                     if session is not None and not commit_event.is_set():
                         commit_state["commit"] = False
                         commit_event.set()
-                    if cancel_event.is_set() and generated is None:
+                    if stream_error_item is not None and generated is None:
+                        # The worker FAILED (or the engine refused with a
+                        # structured 507); the teardown above set the cancel
+                        # event, but recording this as a cancellation hid
+                        # every memory refusal from the request log (#415).
+                        if not cancelled_metric_recorded:
+                            _record_stream_error_metric(
+                                state,
+                                response_id=response_id,
+                                session_id=session_id,
+                                prompt_tokens=len(prompt_ids),
+                                streamed_completion_tokens=streamed_progress_tokens,
+                                stream_started_s=stream_started_s,
+                                error=stream_error_item,
+                                request_observability=request_observability,
+                                client_disconnected=stream_cancelled_by_client,
+                                token_times=streamed_token_times,
+                            )
+                            cancelled_metric_recorded = True
+                    elif cancel_event.is_set() and generated is None:
                         state.dashboard.lifetime.record_cancellation()
                         if not cancelled_metric_recorded:
                             _record_stream_cancellation_metric(
@@ -30850,10 +32969,10 @@ def create_app(state: ServerState) -> FastAPI:
                         _generation_turn.fail(TurnFailed(
                             error="generation ended without a result",
                         ))
-                    yield mark_sse_sent(
+                    mark_stream_activity(
                         error_chunk(RuntimeError("generation ended without a result"))
                     )
-                    yield mark_sse_sent("data: [DONE]\n\n")
+                    mark_stream_activity(None)
                     return
                 finish_reason = generated.get("finish_reason") or "stop"
                 generated["finish_reason"] = finish_reason
@@ -30862,37 +32981,26 @@ def create_app(state: ServerState) -> FastAPI:
                     state, {"finish_reason": finish_reason}
                 )
                 with suppress(RuntimeError):
+                    usage_update = UsageUpdate(
+                        prompt_tokens=int(generated.get("prompt_tokens") or 0),
+                        completion_tokens=int(
+                            generated.get("completion_tokens") or 0
+                        ),
+                    )
+                    _generation_turn.emit(usage_update)
                     _generation_turn.complete(TurnCompleted(
                         finish_reason=finish_reason,
-                        usage=UsageUpdate(
-                            prompt_tokens=int(generated.get("prompt_tokens") or 0),
-                            completion_tokens=int(
-                                generated.get("completion_tokens") or 0
-                            ),
-                        ),
+                        usage=usage_update,
+                        mtplx_stats=_public_mtplx_stats(generated),
+                        timings=_build_timings(generated),
                     ))
-                done = {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": finish_reason,
-                        }
-                    ],
-                    "usage": _usage_payload(generated),
-                    "mtplx_stats": _public_mtplx_stats(generated),
-                    "timings": _build_timings(generated),
-                }
-                yield mark_sse_sent(f"data: {json.dumps(done)}\n\n")
-                yield mark_sse_sent("data: [DONE]\n\n")
-
-            if (metadata or {}).get("_mtplx_stream_projection") == "turn_events":
-                return _TurnEventStreamResponse(_generation_turn, event_stream)
-            return StreamingResponse(event_stream(), media_type="text/event-stream")
+            turn_stream = _GenerationTurnStream(_generation_turn, drive_turn)
+            if return_turn:
+                return turn_stream
+            return StreamingResponse(
+                _chat_stream_from_turn_events(turn_stream.events()),
+                media_type="text/event-stream",
+            )
 
         def run_nonstream_generation() -> dict[str, Any]:
             return run_generation_for_response()
@@ -30907,6 +33015,8 @@ def create_app(state: ServerState) -> FastAPI:
             prompt_tokens=len(prompt_ids),
         )
         state.dashboard.in_flight.register(nonstream_handle)
+        if bind_cancel is not None:
+            bind_cancel(nonstream_cancel_event.set)
         _flight(state).begin(
             response_id,
             session_id=session_id,
@@ -31011,6 +33121,24 @@ def create_app(state: ServerState) -> FastAPI:
                     error_type="request_cancelled",
                 ),
             )
+        except HTTPException as exc:
+            # Non-stream twin of the stream error receipt: a memory refusal
+            # must be findable in the request log, not only in the HTTP
+            # response the client saw (#415).
+            if int(getattr(exc, "status_code", 0) or 0) == 507:
+                _record_stream_error_metric(
+                    state,
+                    response_id=response_id,
+                    session_id=session_id,
+                    prompt_tokens=len(prompt_ids),
+                    streamed_completion_tokens=nonstream_completion_tokens,
+                    stream_started_s=nonstream_started_s,
+                    error=exc,
+                    request_observability=request_observability,
+                    client_disconnected=nonstream_client_disconnected,
+                    mode="nonstream",
+                )
+            raise
         finally:
             disconnect_monitor_task.cancel()
             with suppress(asyncio.CancelledError, TimeoutError):
@@ -31109,6 +33237,19 @@ def create_app(state: ServerState) -> FastAPI:
                 display_text = _strip_mtplx_internal_continuation_markers(display_text)
                 fallback_reason = extraction.malformed_reason or "malformed_tool_call"
                 fallback_kind = _tool_parse_counter_key(fallback_reason)
+                if fallback_kind == "unknown_tool_name":
+                    # #349: a call to an undeclared tool was stripped from the
+                    # visible text without executing — a turn that was ONLY
+                    # that call came back as literal empty content. Replace
+                    # silence with the truth so the model self-corrects.
+                    display_text = _append_unexecuted_tool_notice(
+                        display_text,
+                        _unknown_tool_unexecuted_call_notice(
+                            _unknown_tool_name_from_reason(fallback_reason),
+                            _tool_names(tool_specs),
+                        ),
+                    )
+                    generated["stats"]["unexecuted_tool_call_notice"] = True
                 generated["stats"]["tool_parse_fallback"] = True
                 generated["stats"]["tool_parse_fallback_reason"] = fallback_reason
                 generated["stats"]["tool_parse_fallback_kind"] = fallback_kind
@@ -31145,6 +33286,7 @@ def create_app(state: ServerState) -> FastAPI:
                     # client cannot execute or parse (#160: small models
                     # answer "look it up" prompts with raw
                     # <tool_call><function=web_search> XML in the app chat).
+                    pre_strip_text = display_text
                     display_text, orphan_blocks = _strip_orphan_tool_markup(
                         display_text
                     )
@@ -31153,6 +33295,16 @@ def create_app(state: ServerState) -> FastAPI:
                         generated["stats"]["orphan_tool_markup_blocks"] = int(
                             orphan_blocks
                         )
+                        # #349: deleting the markup silently left the model
+                        # believing it ran a tool and got nothing back, and
+                        # left the user a blank reply. Say what happened.
+                        display_text = _append_unexecuted_tool_notice(
+                            display_text,
+                            _no_tools_unexecuted_call_notice(
+                                _tool_markup_call_names(pre_strip_text)
+                            ),
+                        )
+                        generated["stats"]["unexecuted_tool_call_notice"] = True
             if stop_sequences:
                 # Post-trim safety net for matches the incremental monitor
                 # cannot see (e.g. a stop string completed only by the
@@ -31197,88 +33349,229 @@ def create_app(state: ServerState) -> FastAPI:
             }
         )
 
+    @app.post("/v1/chat/completions")
+    async def chat_completions(
+        raw_request: Request, request: ChatCompletionRequest
+    ) -> Any:
+        return await _chat_completions_impl(
+            raw_request,
+            request,
+            return_turn=False,
+        )
+
     @app.post("/v1/responses")
     async def responses(raw_request: Request, request: ResponsesRequest) -> Any:
-        """Render the existing Chat turn through the ephemeral Responses wire."""
+        """Render one existing Chat turn with bounded local Responses state."""
 
         try:
-            chat_request = ChatCompletionRequest.model_validate(
-                responses_request_to_chat(request)
+            chat_kwargs = responses_request_to_chat(request)
+            current_messages = list(chat_kwargs["messages"])
+            instruction_messages: list[dict[str, Any]] = []
+            if (
+                request.instructions
+                and current_messages
+                and current_messages[0]
+                == {"role": "system", "content": request.instructions}
+            ):
+                instruction_messages = [current_messages.pop(0)]
+            parent_messages = (
+                response_registry.parent_messages(request.previous_response_id)
+                if request.previous_response_id is not None
+                else []
             )
+            materialized_messages = [*parent_messages, *current_messages]
+            chat_kwargs["messages"] = [
+                *instruction_messages,
+                *materialized_messages,
+            ]
+            chat_request = ChatCompletionRequest.model_validate(chat_kwargs)
         except ResponsesProtocolError as exc:
             return JSONResponse(exc.payload(), status_code=400)
+        except ResponseStoreError as exc:
+            return JSONResponse(exc.payload(), status_code=exc.status_code)
 
-        response_id = _response_id_from_client_hint(
+        headers = dict(raw_request.headers)
+        response_hint = _response_id_from_client_hint(
             prefix="resp",
-            headers=dict(raw_request.headers),
+            headers=headers,
             metadata=_request_metadata(chat_request),
         )
+        response_id = response_registry.allocate_id(
+            response_hint if request.store is not True else None
+        )
         created_at = int(time.time())
+
+        try:
+            response_registry.begin(
+                response_id,
+                store=request.store is True,
+                materialized_messages=materialized_messages,
+            )
+        except ResponseStoreError as exc:
+            return JSONResponse(exc.payload(), status_code=exc.status_code)
+
+        def commit_terminal(envelope: dict[str, Any]) -> None:
+            response_registry.commit(
+                response_id,
+                envelope,
+                materialized_messages=[
+                    *materialized_messages,
+                    *response_output_to_chat_messages(envelope.get("output") or []),
+                ],
+            )
+
+        def commit_bridge_failure(response: Any) -> dict[str, Any]:
+            message = "response generation failed"
+            code = "generation_error"
+            cancelled = False
+            if isinstance(response, BaseException):
+                message = str(response) or type(response).__name__
+            elif isinstance(response, JSONResponse):
+                try:
+                    payload = json.loads(response.body)
+                    error = payload.get("error") or payload.get("detail")
+                    if isinstance(error, dict):
+                        code = str(error.get("code") or code)
+                        cancelled = code == "request_cancelled"
+                    message = (
+                        str(error.get("message") or error)
+                        if isinstance(error, dict)
+                        else str(error or message)
+                    )
+                except Exception:
+                    pass
+            envelope = response_failure_envelope(
+                request=request,
+                response_id=response_id,
+                model=state.model_id,
+                created_at=created_at,
+                message=message,
+                code=code,
+            )
+            if cancelled:
+                envelope["status"] = "cancelled"
+            commit_terminal(envelope)
+            return envelope
+
         if request.stream:
-            chat_request.metadata = dict(chat_request.metadata or {})
-            chat_request.metadata["_mtplx_stream_projection"] = "turn_events"
-            chat_response = await chat_completions(raw_request, chat_request)
-            if not isinstance(chat_response, _TurnEventStreamResponse):
+            try:
+                chat_response = await _chat_completions_impl(
+                    raw_request,
+                    chat_request,
+                    return_turn=True,
+                    bind_cancel=lambda cancel: response_registry.bind_cancel(
+                        response_id, cancel
+                    ),
+                )
+            except BaseException as exc:
+                commit_bridge_failure(exc)
+                raise
+            if not isinstance(chat_response, _GenerationTurnStream):
+                commit_bridge_failure(chat_response)
                 return chat_response
+            async def response_events() -> AsyncIterator[str]:
+                try:
+                    async for frame in responses_stream_from_turn_events(
+                        chat_response.events(),
+                        request=request,
+                        response_id=response_id,
+                        model=state.model_id,
+                        created_at=created_at,
+                        on_terminal=commit_terminal,
+                    ):
+                        yield frame
+                finally:
+                    if response_registry.is_in_flight(response_id):
+                        commit_terminal(
+                            response_failure_envelope(
+                                request=request,
+                                response_id=response_id,
+                                model=state.model_id,
+                                created_at=created_at,
+                                message="response renderer disconnected",
+                                code="request_cancelled",
+                            )
+                        )
+
             return StreamingResponse(
-                responses_stream_from_turn_events(
-                    chat_response.events(),
-                    request=request,
-                    response_id=response_id,
-                    model=state.model_id,
-                    created_at=created_at,
-                ),
+                response_events(),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
                     "X-Accel-Buffering": "no",
                 },
             )
-        chat_response = await chat_completions(raw_request, chat_request)
+        try:
+            chat_response = await _chat_completions_impl(
+                raw_request,
+                chat_request,
+                return_turn=False,
+                bind_cancel=lambda cancel: response_registry.bind_cancel(
+                    response_id, cancel
+                ),
+            )
+        except BaseException as exc:
+            commit_bridge_failure(exc)
+            raise
         if not isinstance(chat_response, JSONResponse):
+            commit_bridge_failure(chat_response)
             return chat_response
         if chat_response.status_code >= 400:
-            return chat_response
+            terminal = commit_bridge_failure(chat_response)
+            return JSONResponse(
+                terminal,
+                status_code=chat_response.status_code,
+            )
         try:
             chat_payload = json.loads(chat_response.body)
         except Exception as exc:
+            commit_bridge_failure(exc)
             raise HTTPException(
                 status_code=500, detail=f"failed to translate response: {exc}"
             ) from exc
-        return JSONResponse(
-            response_from_chat_completion(
-                chat_payload,
-                request=request,
-                response_id=response_id,
-                created_at=created_at,
-            ),
-            status_code=chat_response.status_code,
+        envelope = response_from_chat_completion(
+            chat_payload,
+            request=request,
+            response_id=response_id,
+            created_at=created_at,
         )
-
-    def _unsupported_response_lifecycle(operation: str) -> JSONResponse:
-        error = ResponsesProtocolError(
-            message=(
-                f"response {operation} is unavailable until the response "
-                "lineage store is implemented"
-            ),
-            code="not_implemented",
-        )
-        return JSONResponse(error.payload(), status_code=400)
+        commit_terminal(envelope)
+        return JSONResponse(envelope, status_code=chat_response.status_code)
 
     @app.get("/v1/responses/{response_id}")
     async def get_response(response_id: str) -> JSONResponse:
-        del response_id
-        return _unsupported_response_lifecycle("retrieval")
+        try:
+            return JSONResponse(response_registry.get(response_id))
+        except ResponseStoreError as exc:
+            return JSONResponse(exc.payload(), status_code=exc.status_code)
 
     @app.delete("/v1/responses/{response_id}")
     async def delete_response(response_id: str) -> JSONResponse:
-        del response_id
-        return _unsupported_response_lifecycle("deletion")
+        try:
+            return JSONResponse(response_registry.delete(response_id))
+        except ResponseStoreError as exc:
+            return JSONResponse(exc.payload(), status_code=exc.status_code)
 
     @app.post("/v1/responses/{response_id}/cancel")
     async def cancel_response(response_id: str) -> JSONResponse:
-        del response_id
-        return _unsupported_response_lifecycle("cancellation")
+        try:
+            inflight = response_registry.request_cancel(response_id)
+        except ResponseStoreError as exc:
+            return JSONResponse(exc.payload(), status_code=exc.status_code)
+        terminal = await asyncio.to_thread(
+            response_registry.wait_terminal, inflight, 2.0
+        )
+        if terminal is None:
+            return JSONResponse(
+                {
+                    "id": response_id,
+                    "object": "response",
+                    "status": "in_progress",
+                    "cancellation_requested": True,
+                },
+                status_code=202,
+            )
+        return JSONResponse(terminal)
 
     @app.post("/v1/messages")
     async def anthropic_messages(
@@ -31289,10 +33582,10 @@ def create_app(state: ServerState) -> FastAPI:
         chat_request = _anthropic_to_chat_request(request)
         chat_request.stream = bool(request.stream)
         if request.stream:
-            chat_request.metadata = dict(chat_request.metadata or {})
-            chat_request.metadata["_mtplx_stream_projection"] = "turn_events"
-            response = await chat_completions(raw_request, chat_request)
-            if not isinstance(response, _TurnEventStreamResponse):
+            response = await _chat_completions_impl(
+                raw_request, chat_request, return_turn=True
+            )
+            if not isinstance(response, _GenerationTurnStream):
                 return response
             return StreamingResponse(
                 _anthropic_stream_from_turn_events(
@@ -31454,13 +33747,19 @@ def create_app(state: ServerState) -> FastAPI:
             # staring at a silent stream for the whole generation.
             async def event_stream():
                 queue = _LoopFedStreamQueue(asyncio.get_running_loop())
-                cancel_event = Event()
+                cancel_event = _AttributedCancelEvent()
                 decoder = _IncrementalTokenDecoder(state.runtime.tokenizer)
                 stop_monitor = _StopSequenceStreamMonitor(stop_sequences)
                 streamed_completion_tokens = 0
                 generated: dict[str, Any] | None = None
                 stop_hit = False
                 owner_stall_probe = _OwnerStallProbe(deadline_s=STREAM_STALL_DEADLINE_S)
+                sse_keepalive_interval_s = _sse_keepalive_interval_s()
+                # This stream sends no bytes at all before the first text
+                # chunk, so "last byte sent" starts at the stream start and
+                # only the keep-alive comments below can advance it in the
+                # pre-first-token window (#358).
+                last_sse_sent_s = time.perf_counter()
 
                 def on_tokens(new_tokens: list[int]) -> None:
                     _raise_if_stream_cancelled(cancel_event)
@@ -31536,12 +33835,22 @@ def create_app(state: ServerState) -> FastAPI:
                     )
 
                 def error_chunk(exc: BaseException) -> str:
+                    if _is_allocation_failure(exc):
+                        # Shed caches + honest 507 instead of an anonymous
+                        # RuntimeError 500; the daemon stays up (#348).
+                        exc = _allocation_failure_http_exception(state, exc)
                     if isinstance(exc, HTTPException):
                         message = str(exc.detail)
                         status_code = exc.status_code
+                        error_code = (
+                            "insufficient_memory"
+                            if status_code == 507
+                            else type(exc).__name__
+                        )
                     else:
                         message = str(exc)
                         status_code = 500
+                        error_code = type(exc).__name__
                     payload = {
                         "id": response_id,
                         "object": "text_completion",
@@ -31551,7 +33860,7 @@ def create_app(state: ServerState) -> FastAPI:
                         **_openai_error_content(
                             message,
                             status_code=status_code,
-                            code=type(exc).__name__,
+                            code=error_code,
                         ),
                     }
                     return f"data: {json.dumps(payload)}\n\n"
@@ -31566,7 +33875,9 @@ def create_app(state: ServerState) -> FastAPI:
                         text = stop_monitor.feed(text)
                         if stop_monitor.stopped and not stop_hit:
                             stop_hit = True
-                            _cancel_stream_generation(cancel_event, generation_future)
+                            _cancel_stream_generation(
+                                cancel_event, generation_future, origin="stop_sequence"
+                            )
                         if not text:
                             return []
                     return [text_chunk(text)]
@@ -31591,7 +33902,8 @@ def create_app(state: ServerState) -> FastAPI:
                                     # silent close (#F36).
                                     yield error_chunk(
                                         RuntimeError(
-                                            "request cancelled server-side "
+                                            "request cancelled via "
+                                            f"{_cancel_via_label(cancel_event)} "
                                             "after "
                                             f"{streamed_completion_tokens} "
                                             "streamed tokens"
@@ -31614,7 +33926,9 @@ def create_app(state: ServerState) -> FastAPI:
                                     streamed_tokens=streamed_completion_tokens,
                                 )
                                 _cancel_stream_generation(
-                                    cancel_event, generation_future
+                                    cancel_event,
+                                    generation_future,
+                                    origin="stream_stall",
                                 )
                                 yield error_chunk(
                                     TimeoutError(
@@ -31626,6 +33940,19 @@ def create_app(state: ServerState) -> FastAPI:
                                 )
                                 yield "data: [DONE]\n\n"
                                 return
+                            now_s = time.perf_counter()
+                            if (
+                                sse_keepalive_interval_s is not None
+                                and streamed_completion_tokens == 0
+                                and not generation_future.done()
+                                and now_s - last_sse_sent_s
+                                >= sse_keepalive_interval_s
+                            ):
+                                # Pre-first-token liveness (#358): see the
+                                # chat stream loop. Comments stop as soon as
+                                # the first token batch arrives.
+                                last_sse_sent_s = now_s
+                                yield SSE_KEEPALIVE_COMMENT
                             continue
                         if kind == "tokens":
                             streamed_completion_tokens += len(item)
@@ -31702,7 +34029,9 @@ def create_app(state: ServerState) -> FastAPI:
                             yield "data: [DONE]\n\n"
                             return
                 except asyncio.CancelledError:
-                    _cancel_stream_generation(cancel_event, generation_future)
+                    _cancel_stream_generation(
+                        cancel_event, generation_future, origin="client_disconnect"
+                    )
                     raise
                 except GeneratorExit:
                     # Client disconnect closes the async generator; yielding
@@ -31714,7 +34043,9 @@ def create_app(state: ServerState) -> FastAPI:
                     yield "data: [DONE]\n\n"
                     return
                 finally:
-                    _cancel_stream_generation(cancel_event, generation_future)
+                    _cancel_stream_generation(
+                        cancel_event, generation_future, origin="stream_teardown"
+                    )
 
                 if generated is None:
                     yield error_chunk(RuntimeError("generation ended without a result"))
@@ -31933,6 +34264,24 @@ def create_app(state: ServerState) -> FastAPI:
     @app.exception_handler(Exception)
     async def unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
         _record_tool_parse_event(state, event="openai_error_response")
+        if _is_allocation_failure(exc):
+            # Non-streaming lanes land here on a Metal allocation failure.
+            # Shed caches and answer with the honest 507 (same contract as
+            # the streaming error frame) instead of a redacted 500 — the
+            # user can act on "insufficient memory"; they cannot act on
+            # "internal server error" (#348).
+            http_exc = _allocation_failure_http_exception(state, exc)
+            logging.getLogger("mtplx.server").warning(
+                "allocation failure served as 507: %s", exc
+            )
+            return JSONResponse(
+                status_code=http_exc.status_code,
+                content=_openai_error_content(
+                    str(http_exc.detail),
+                    status_code=http_exc.status_code,
+                    code="insufficient_memory",
+                ),
+            )
         request_id = uuid.uuid4().hex[:12]
         # Full detail belongs in the server log, not the wire: exception
         # class + repr in client bodies got quoted verbatim by external
@@ -32076,11 +34425,17 @@ def _gemma4_bundle_defaults(
 def _model_declared_sampler_defaults(model_ref: str | None) -> dict[str, Any] | None:
     """Official sampler defaults declared by the model artifact itself.
 
-    Reads ``generation_config.json`` next to the checkpoint. Scoped to hy_v3
-    (Tencent ships temperature=0.9 / top_p=1.0 / top_k off, which differs from
-    the project-wide 0.6/0.95/20 coding defaults) — existing Qwen/Gemma serving
-    defaults are deliberately left untouched (no-regression rule; widening this
-    to every family needs its own A/B).
+    Scoped to families whose artifact-declared sampler differs from the
+    project-wide 0.6/0.95/20 coding defaults — existing Qwen3.6/Gemma serving
+    defaults are deliberately left untouched (no-regression rule; widening
+    to another family needs its own receipts):
+
+    - hy_v3: ``generation_config.json`` (Tencent ships 0.9 / 1.0 / off).
+    - qwen4_exp: the pack's ``mtplx_runtime.json`` sampler block. The family
+      law is 1.0/0.95/20 (day-0 eval receipts); until 2026-08-27 requests
+      silently sampled at the generic 0.6 while /health advertised the
+      rebound family default — the drafts mirrored 0.6 too
+      (draft_sampler_resolved_temperature receipt, serve battery 13:04).
     """
     if not model_ref:
         return None
@@ -32089,9 +34444,21 @@ def _model_declared_sampler_defaults(model_ref: str | None) -> dict[str, Any] | 
 
         path = resolve_model_path(str(model_ref))
         config = json.loads((path / "config.json").read_text(encoding="utf-8"))
-        if str(config.get("model_type", "")).lower() != "hy_v3":
+        mt = str(config.get("model_type", "")).lower()
+        tmt = str((config.get("text_config") or {}).get("model_type") or "").lower()
+        if mt == "hy_v3":
+            gen = json.loads(
+                (path / "generation_config.json").read_text(encoding="utf-8")
+            )
+        elif "qwen4_exp" in (mt, tmt) or "qwen4_exp_text" in (mt, tmt):
+            runtime = json.loads(
+                (path / "mtplx_runtime.json").read_text(encoding="utf-8")
+            )
+            gen = runtime.get("sampler")
+            if not isinstance(gen, dict):
+                return None
+        else:
             return None
-        gen = json.loads((path / "generation_config.json").read_text(encoding="utf-8"))
     except Exception:
         return None
     out: dict[str, Any] = {}
@@ -32168,8 +34535,34 @@ def _apply_backend_server_defaults(
             )
         args.chat_template_profile = required_chat_template_profile
         args.chat_template_path = None
+    # Family-aware reasoning policy, not the raw lane descriptor — the
+    # daemon twin of _apply_backend_serve_defaults (public.py): a family
+    # sharing a generic lane (qwen4_exp on native_mtp, lfm2 on mlx_lm_ar)
+    # carries its own verified codec, and stamping the lane's parser here
+    # read as an operator override downstream — the child daemon served
+    # Flash-Next with parser "none" and no default effort (2026-08-28).
+    # The override applies when an explicitly passed --model names an
+    # override family (model intent wins; the runtime re-resolves the
+    # lane from the loaded model anyway), or when family and lane agree
+    # (REASONING_FAMILY_OVERRIDE_LANES). A DEFAULT model ref alone must
+    # never override an explicitly chosen lane — the daemon's default
+    # --model is the 27B HF id, and a ref-only override stamped qwen3
+    # onto the Laguna lane.
+    _model_ref = str(getattr(args, "model", "") or "")
+    _family = model_family_from_inspection(
+        model_ref=_model_ref, descriptor=backend
+    )
+    if _family in REASONING_FAMILY_OVERRIDE_LANES and (
+        _server_flag_present(explicit_flags, "model")
+        or reasoning_family_override_applies(_family, backend.backend_id)
+    ):
+        reasoning = reasoning_policy_for_model(
+            model_ref=_model_ref, descriptor=backend
+        )
+    else:
+        reasoning = backend.reasoning_codec
     if not _server_flag_present(explicit_flags, "reasoning-parser"):
-        args.reasoning_parser = backend.reasoning_codec.parser
+        args.reasoning_parser = reasoning.parser
     if (
         backend.default_max_response_tokens is not None
         and not _server_flag_present(explicit_flags, "max-response-tokens")
@@ -32179,9 +34572,9 @@ def _apply_backend_server_defaults(
     if (
         not _server_flag_present(explicit_flags, "reasoning-effort")
         and getattr(args, "reasoning_effort", None) in (None, "auto")
-        and backend.reasoning_codec.default_effort
+        and reasoning.default_effort
     ):
-        args.reasoning_effort = backend.reasoning_codec.default_effort
+        args.reasoning_effort = reasoning.default_effort
     if backend.backend_id != GEMMA4_BACKEND:
         return
 
@@ -32387,7 +34780,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "on the solo MTP oracle (measured 2026-07-05: serialized MTP "
             "beats the batched-AR lane end to end on prefill-heavy "
             "concurrent loads); ar_batch opts concurrency into the batched "
-            "AR decode lane, which wins on decode-heavy many-client loads."
+            "AR decode lane, which wins on decode-heavy many-client loads. "
+            "hyper admits ONE request at a time (simultaneous requests "
+            "queue FIFO exactly like serial) and reserves batch width for "
+            "self-speculative rows of that request; at width 1 it rides "
+            "the untouched serial path (see mtplx/server/hyper.py)."
         ),
     )
     parser.add_argument(
