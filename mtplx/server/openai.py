@@ -139,6 +139,7 @@ from mtplx.server.core import (
     TurnEvent,
     TurnFailed,
     TurnHeartbeat,
+    TurnKeepAlive,
     TurnStarted,
     UsageUpdate,
 )
@@ -809,6 +810,11 @@ async def _chat_stream_from_turn_events(
             yield f"data: {json.dumps(payload({'role': 'assistant'}))}\n\n"
             continue
         if isinstance(event, OutputItemStarted):
+            continue
+        if isinstance(event, TurnKeepAlive):
+            # Comment frame: invisible to SSE parsers, cannot disturb chunk
+            # layout, and _iter_sse_data forwards it to the Anthropic path.
+            yield SSE_KEEPALIVE_COMMENT
             continue
         if isinstance(event, TurnHeartbeat):
             heartbeat = payload({})
@@ -5420,6 +5426,33 @@ async def _anthropic_stream_from_turn_events(
             continue
 
         if isinstance(ev, (OutputItemStarted, TurnHeartbeat)):
+            continue
+
+        if isinstance(ev, TurnKeepAlive):
+            # Pre-first-token liveness (#358). Neither raw SSE comments nor
+            # protocol `ping` events reset Claude Code's stream watchdog (its
+            # SDK loop drops pings before the watchdog sees them), so a long
+            # prefill died client-side at exactly 300s. Only message events
+            # count: pre-open the thinking block and tick it with EMPTY
+            # thinking_deltas — real events on the wire, zero content, and
+            # the model's own reasoning continues in the same block.
+            if active_thinking_index is None and active_text_index is None:
+                active_thinking_index = next_block_index
+                next_block_index += 1
+                opened_any_block = True
+                yield start_content_block(
+                    active_thinking_index,
+                    {"type": "thinking", "thinking": "", "signature": "mtplx-reasoning"},
+                )
+            if active_thinking_index is not None:
+                yield _anthropic_sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": active_thinking_index,
+                        "delta": {"type": "thinking_delta", "thinking": ""},
+                    },
+                )
             continue
 
         if isinstance(ev, ReasoningDelta):
@@ -31280,6 +31313,10 @@ def create_app(state: ServerState) -> FastAPI:
                 streamed_token_times: list[float] = []
                 streamed_progress_tokens = 0
                 streamed_decode_started_s: float | None = None
+                # Last liveness byte the renderer could have sent before the
+                # first token (#358): the role delta at TurnStarted, then each
+                # keep-alive event. Decode start retires the mechanism.
+                last_sse_sent_s = stream_started_s
                 streamed_assistant_tool_calls: list[dict[str, Any]] | None = None
                 streamed_tool_deltas_emitted = False
                 turn_tool_deltas_emitted = False
@@ -31843,7 +31880,9 @@ def create_app(state: ServerState) -> FastAPI:
                                 # over. At the default cadence (5s < 10s)
                                 # this also keeps the progress-chunk check
                                 # below idle until decode starts.
-                                yield mark_sse_sent(SSE_KEEPALIVE_COMMENT)
+                                last_sse_sent_s = now_s
+                                with suppress(RuntimeError):
+                                    _generation_turn.emit(TurnKeepAlive())
                             if (
                                 not generation_future.done()
                                 and now_s - last_event_sent_s
@@ -32268,7 +32307,6 @@ def create_app(state: ServerState) -> FastAPI:
                                     delta = {"content": fallback_visible_text}
                                     remember_stream_delta(delta)
                                     mark_stream_activity(delta_payload_chunk(delta))
-                                    yield mark_sse_sent(delta_payload_chunk(delta))
                                 if (
                                     extraction.status == "malformed_as_content"
                                     and not assistant_tool_calls
@@ -32298,7 +32336,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     ):
                                         delta = {"content": unknown_tool_notice}
                                         remember_stream_delta(delta)
-                                        yield mark_sse_sent(
+                                        mark_stream_activity(
                                             delta_payload_chunk(delta)
                                         )
                                         stats["unexecuted_tool_call_notice"] = True
@@ -32325,7 +32363,7 @@ def create_app(state: ServerState) -> FastAPI:
                                 ):
                                     delta = {"content": no_tools_notice}
                                     remember_stream_delta(delta)
-                                    yield mark_sse_sent(delta_payload_chunk(delta))
+                                    mark_stream_activity(delta_payload_chunk(delta))
                                     stats["unexecuted_tool_call_notice"] = True
                                     # Parity with the non-stream #160 strip,
                                     # which stamps this on every no-tools

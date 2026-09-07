@@ -41,6 +41,7 @@ from mtplx.server.core import (
     TurnCompleted,
     TurnEvent,
     TurnFailed,
+    TurnKeepAlive,
     TurnStarted,
     TurnState,
     UsageUpdate,
@@ -692,6 +693,107 @@ class TestThreeProtocolsShareLifecycle:
         assert not any("event: message_stop" in frame for frame in frames)
 
 
+class TestKeepAliveAcrossRenderers:
+    """#358 pre-first-token liveness is one turn event, three wire shapes."""
+
+    @staticmethod
+    async def _events() -> AsyncIterator[TurnEvent]:
+        yield TurnStarted(response_id="r1", model="m", created=1)
+        yield TurnKeepAlive()
+        yield TurnKeepAlive()
+        yield TextDelta(delta="answer")
+        yield TurnCompleted(
+            finish_reason="stop",
+            usage=UsageUpdate(prompt_tokens=1, completion_tokens=1),
+        )
+
+    def test_keep_alive_is_a_frozen_payloadless_event(self) -> None:
+        ev = TurnKeepAlive()
+        assert ev == TurnKeepAlive()
+        with pytest.raises(AttributeError):
+            ev.anything = 1  # type: ignore[attr-defined]
+
+    def test_turn_accepts_keep_alive_between_start_and_terminal(self) -> None:
+        turn = GenerationTurn()
+        with pytest.raises(RuntimeError):
+            turn.emit(TurnKeepAlive())
+        turn.start(TurnStarted(response_id="r", model="m", created=1))
+        turn.emit(TurnKeepAlive())
+        assert turn.first_delta_s is None  # liveness is not a delta
+
+    @pytest.mark.anyio
+    async def test_chat_renders_comment_frames_before_first_delta(self) -> None:
+        frames = [
+            frame
+            async for frame in openai._chat_stream_from_turn_events(self._events())
+        ]
+        comments = [i for i, frame in enumerate(frames) if frame.startswith(":")]
+        first_content = next(
+            i
+            for i, frame in enumerate(frames)
+            if frame.startswith("data: {") and '"content": "answer"' in frame
+        )
+        assert frames[comments[0]] == openai.SSE_KEEPALIVE_COMMENT
+        assert len(comments) == 2
+        assert comments[-1] < first_content
+        assert frames[-1] == "data: [DONE]\n\n"
+
+    @pytest.mark.anyio
+    async def test_responses_renders_comment_frames_and_no_payload_change(self) -> None:
+        chunks = [
+            chunk
+            async for chunk in responses_stream_from_turn_events(
+                self._events(),
+                request=_fake_responses_request(),
+                response_id="r1",
+                model="m",
+                created_at=1,
+            )
+        ]
+        assert chunks.count(": keep-alive\n\n") == 2
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for chunk in chunks
+            for line in chunk.strip().split("\n")
+            if line.startswith("data: ")
+        ]
+        types = [e["type"] for e in events]
+        assert types[:2] == ["response.created", "response.in_progress"]
+        assert "response.output_text.delta" in types
+        assert types[-1] == "response.completed"
+
+    @pytest.mark.anyio
+    async def test_anthropic_ticks_an_empty_thinking_block(self) -> None:
+        frames = [
+            frame
+            async for frame in openai._anthropic_stream_from_turn_events(
+                self._events(), model="m"
+            )
+        ]
+        assert not any(frame.startswith(":") for frame in frames)
+        payloads = [
+            json.loads(line.removeprefix("data: "))
+            for frame in frames
+            for line in frame.splitlines()
+            if line.startswith("data: ")
+        ]
+        empty_thinking = [
+            i
+            for i, p in enumerate(payloads)
+            if p.get("type") == "content_block_delta"
+            and p["delta"] == {"type": "thinking_delta", "thinking": ""}
+        ]
+        text_delta = [
+            i
+            for i, p in enumerate(payloads)
+            if p.get("type") == "content_block_delta"
+            and p["delta"].get("type") == "text_delta"
+        ]
+        assert len(empty_thinking) == 2
+        assert empty_thinking[-1] < text_delta[0]
+        assert payloads[-1]["type"] == "message_stop"
+
+
 class TestW1dCommonDriverArchitecture:
     """The common producer is event-typed and no protocol drives another."""
 
@@ -733,6 +835,7 @@ class TestW1dCommonDriverArchitecture:
             "ReasoningDelta",
             "ToolCallDelta",
             "TurnHeartbeat",
+            "TurnKeepAlive",
             "UsageUpdate",
             "TurnCompleted",
             "TurnFailed",

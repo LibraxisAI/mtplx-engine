@@ -36,7 +36,10 @@ def test_server_parser_resolves_explicit_model_repo_id(tmp_path, monkeypatch):
     monkeypatch.setattr("mtplx.hf_loader.resolve_model_path", fake_resolve)
     args = parse_args(["--warmup-tokens", "0", "--model", "org/served-by-id"])
     assert args.model == str(model_dir)
-    assert seen == ["org/served-by-id"]
+    # The id is resolved exactly once; later parse-time consumers (sampler
+    # defaults declared by the model) already see the local directory.
+    assert seen[0] == "org/served-by-id"
+    assert all(ref == str(model_dir) for ref in seen[1:])
 
 
 def test_server_parser_leaves_existing_model_dir_untouched(tmp_path, monkeypatch):

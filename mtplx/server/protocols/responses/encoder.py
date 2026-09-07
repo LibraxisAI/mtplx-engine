@@ -19,6 +19,7 @@ from mtplx.server.core.events import (
     TurnEvent,
     TurnFailed,
     TurnHeartbeat,
+    TurnKeepAlive,
     TurnStarted,
     UsageUpdate,
 )
@@ -536,6 +537,12 @@ async def responses_stream_from_turn_events(
 
         if isinstance(ev, TurnHeartbeat):
             yield ": mtplx-heartbeat\n\n"
+            continue
+
+        if isinstance(ev, TurnKeepAlive):
+            # Pre-first-token liveness (#358), same comment-frame shape as
+            # the heartbeat so Responses clients never see a payload change.
+            yield ": keep-alive\n\n"
             continue
 
         if isinstance(ev, OutputItemStarted):

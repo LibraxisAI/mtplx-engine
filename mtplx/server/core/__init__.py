@@ -10,6 +10,7 @@ from .events import (
     TurnEvent,
     TurnFailed,
     TurnHeartbeat,
+    TurnKeepAlive,
     TurnStarted,
     UsageUpdate,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "TurnEvent",
     "TurnFailed",
     "TurnHeartbeat",
+    "TurnKeepAlive",
     "TurnStarted",
     "TurnState",
     "UsageUpdate",

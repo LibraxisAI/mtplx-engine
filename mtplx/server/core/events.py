@@ -63,6 +63,17 @@ class TurnHeartbeat:
 
 
 @dataclass(frozen=True)
+class TurnKeepAlive:
+    """Pre-first-token liveness (#358): no payload, renderers decide the bytes.
+
+    The driver emits it while the prompt is still being prefilled so strict
+    client/proxy read-timeouts see a live wire. Chat SSE projects it as a
+    comment frame; Responses SSE does the same; the Anthropic translator turns
+    the comment into an empty thinking_delta.
+    """
+
+
+@dataclass(frozen=True)
 class TurnCompleted:
     finish_reason: str
     usage: UsageUpdate | None = None
@@ -92,6 +103,7 @@ TurnEvent = Union[
     ToolCallDelta,
     UsageUpdate,
     TurnHeartbeat,
+    TurnKeepAlive,
     TurnCompleted,
     TurnFailed,
     TurnCancelled,
