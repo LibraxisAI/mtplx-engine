@@ -543,6 +543,45 @@ def test_resolve_model_path_reports_missing_cache(tmp_path: Path):
         raise AssertionError("expected missing cache error")
 
 
+def test_resolve_model_path_falls_back_to_shared_hub_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Fleet hosts keep one huggingface_hub cache; serving by repo id must find
+    # an already-downloaded snapshot there without duplicating it into the
+    # MTPLX layout and without touching the network.
+    snapshot = tmp_path / "hub" / "models--mtplx--example" / "snapshots" / "abc123"
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}\n", encoding="utf-8")
+    (snapshot / "model.safetensors").write_bytes(b"1234")
+    calls: list[dict[str, object]] = []
+
+    def fake_snapshot_download(repo_id: str, **kwargs: object) -> str:
+        calls.append({"repo_id": repo_id, **kwargs})
+        return str(snapshot)
+
+    fake_hub = ModuleType("huggingface_hub")
+    fake_hub.snapshot_download = fake_snapshot_download  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+
+    resolved = resolve_model_path("mtplx/example", cache_dir=tmp_path / "mtplx")
+    assert resolved == snapshot
+    assert calls == [{"repo_id": "mtplx/example", "local_files_only": True}]
+
+
+def test_resolve_model_path_ignores_incomplete_hub_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    snapshot = tmp_path / "hub" / "snapshots" / "abc123"
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}\n", encoding="utf-8")
+    fake_hub = ModuleType("huggingface_hub")
+    fake_hub.snapshot_download = lambda repo_id, **kwargs: str(snapshot)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+
+    with pytest.raises(FileNotFoundError, match="mtplx pull mtplx/example"):
+        resolve_model_path("mtplx/example", cache_dir=tmp_path / "mtplx")
+
+
 def test_resolve_model_path_rejects_missing_local_path(tmp_path: Path):
     missing = tmp_path / "Qwen3.6-27B-MTPLX-Optimized-Quality"
     try:

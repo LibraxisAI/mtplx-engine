@@ -24,6 +24,51 @@ def test_server_parser_default_model_is_public_hf_default():
     assert args.model == DEFAULT_HF_MODEL_ID
 
 
+def test_server_parser_resolves_explicit_model_repo_id(tmp_path, monkeypatch):
+    model_dir = tmp_path / "resolved"
+    model_dir.mkdir()
+    seen: list[str] = []
+
+    def fake_resolve(model_ref: str, **kwargs):
+        seen.append(model_ref)
+        return model_dir
+
+    monkeypatch.setattr("mtplx.hf_loader.resolve_model_path", fake_resolve)
+    args = parse_args(["--warmup-tokens", "0", "--model", "org/served-by-id"])
+    assert args.model == str(model_dir)
+    assert seen == ["org/served-by-id"]
+
+
+def test_server_parser_leaves_existing_model_dir_untouched(tmp_path, monkeypatch):
+    def boom(model_ref: str, **kwargs):
+        raise AssertionError("existing directory must not be resolved")
+
+    monkeypatch.setattr("mtplx.hf_loader.resolve_model_path", boom)
+    args = parse_args(["--warmup-tokens", "0", "--model", str(tmp_path)])
+    assert args.model == str(tmp_path)
+
+
+def test_server_parser_leaves_missing_local_path_for_load_step(tmp_path, monkeypatch):
+    def boom(model_ref: str, **kwargs):
+        raise AssertionError("plain paths are not repo ids; nothing to resolve")
+
+    monkeypatch.setattr("mtplx.hf_loader.resolve_model_path", boom)
+    missing = tmp_path / "not-there"
+    args = parse_args(["--warmup-tokens", "0", "--model", str(missing)])
+    assert args.model == str(missing)
+
+
+def test_server_parser_rejects_uncached_explicit_repo_id(monkeypatch):
+    def missing(model_ref: str, **kwargs):
+        raise FileNotFoundError(
+            f"Model {model_ref} is not cached. Run: mtplx pull {model_ref}"
+        )
+
+    monkeypatch.setattr("mtplx.hf_loader.resolve_model_path", missing)
+    with pytest.raises(SystemExit):
+        parse_args(["--warmup-tokens", "0", "--model", "org/not-cached"])
+
+
 def test_server_parser_accepts_native_app_launch_id():
     args = parse_args(["--warmup-tokens", "0", "--app-launch-id", "native-123"])
 

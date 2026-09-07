@@ -35317,6 +35317,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args._cli_flags = canonicalize_flag_tokens(
         _explicit_server_flags(raw_args), parser, args
     )
+    # --model accepts a repo id, not only a directory: every downstream load
+    # path (config sniffing, backend defaults, weight mapping) expects a real
+    # local directory, so the id must be resolved exactly once, before any of
+    # them run. resolve_model_path covers the MTPLX cache, branded builds and
+    # the shared huggingface hub cache, and stays offline-safe. Only an
+    # explicit --model is resolved here: the parser default is a public HF id
+    # that callers (tests, app launch, onboarding) read back verbatim, and a
+    # host without that model cached must still be able to parse its flags.
+    # A missing local path is left alone: the load step reports it exactly as
+    # it always has, and tests drive that step with placeholder directories.
+    if getattr(args, "model", None) and _server_flag_present(
+        args._cli_flags, "model"
+    ):
+        _model_local = Path(str(args.model)).expanduser()
+        if not _model_local.exists():
+            from mtplx.hf_loader import repo_id_from_model_ref as _repo_id_from_ref
+            from mtplx.hf_loader import resolve_model_path as _resolve_model_path
+
+            if _repo_id_from_ref(str(args.model)) is not None:
+                try:
+                    args.model = str(_resolve_model_path(str(args.model)))
+                except FileNotFoundError as exc:
+                    parser.error(str(exc))
     try:
         resolved_key = resolve_api_key(
             explicit_api_key=getattr(args, "api_key", None),

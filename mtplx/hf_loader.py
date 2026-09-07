@@ -459,6 +459,19 @@ def resolve_model_path(model_ref: str, *, cache_dir: str | Path | None = None) -
         branded = cached.parent / repo_id.split("/", 1)[1]
         if branded != cached and _cached_model_ready_for_repo(branded, repo_id):
             return branded
+    # Standard huggingface_hub cache (HF_HOME / HF_HUB_CACHE) is a valid local
+    # source for the same repo id: fleet hosts keep one shared hub cache and
+    # must not duplicate multi-GB snapshots into the MTPLX layout just to
+    # serve by id. local_files_only keeps this offline-safe — it never
+    # touches the network, it only resolves an already-downloaded snapshot.
+    try:
+        from huggingface_hub import snapshot_download
+
+        hub_path = Path(snapshot_download(repo_id, local_files_only=True))
+    except Exception:
+        hub_path = None
+    if hub_path is not None and _cached_model_ready_for_repo(hub_path, repo_id):
+        return hub_path
     raise FileNotFoundError(
         f"Model {repo_id} is not cached. Run: mtplx pull {repo_id}"
     )
