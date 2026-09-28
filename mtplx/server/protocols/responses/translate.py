@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from mtplx.reasoning_effort import normalize_reasoning_effort
+
 from .schema import ResponsesRequest
 
 
@@ -41,6 +43,9 @@ _UNSUPPORTED_TOP_LEVEL = {
     "system_instruction",
     "truncation",
 }
+
+# Effort strings that mean "thinking disabled", never an effort tier.
+_REASONING_DISABLED_EFFORTS = {"off", "none"}
 
 
 def _reject(param: str, message: str, *, code: str = "unsupported_parameter") -> None:
@@ -348,6 +353,32 @@ def responses_request_to_chat(request: ResponsesRequest) -> dict[str, Any]:
             "reasoning.summary is not supported by the ephemeral Responses adapter",
         )
 
+    enable_thinking: bool | None = None
+    reasoning_effort: str | None = None
+    if reasoning:
+        # "off"/"none" are thinking-disabled sentinels, not effort tiers
+        # (OpenAI's own Responses vocabulary includes "none"). Passing them
+        # through as reasoning_effort made the effort validator raise AFTER
+        # the SSE stream had opened, severing the connection without a
+        # terminal event (2026-09-28 dragon report). Resolve them here, at
+        # the protocol boundary, before any event is emitted.
+        if effort is None:
+            enable_thinking = True
+        else:
+            effort_text = str(effort).strip().lower()
+            if effort_text in _REASONING_DISABLED_EFFORTS:
+                enable_thinking = False
+            else:
+                try:
+                    reasoning_effort = normalize_reasoning_effort(effort_text)
+                except ValueError:
+                    _reject(
+                        "reasoning.effort",
+                        f"unsupported reasoning effort {effort!r}",
+                        code="invalid_value",
+                    )
+                enable_thinking = True
+
     return {
         "model": request.model,
         "messages": _messages(request),
@@ -363,8 +394,8 @@ def responses_request_to_chat(request: ResponsesRequest) -> dict[str, Any]:
         "tools": _tools(request.tools),
         "tool_choice": _tool_choice(request.tool_choice),
         "parallel_tool_calls": request.parallel_tool_calls,
-        "enable_thinking": bool(reasoning) if reasoning else None,
-        "reasoning_effort": str(effort) if effort is not None else None,
+        "enable_thinking": enable_thinking,
+        "reasoning_effort": reasoning_effort,
         "metadata": request.metadata,
         "user": request.user,
     }

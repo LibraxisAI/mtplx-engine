@@ -720,3 +720,76 @@ def test_missing_response_lifecycle_is_structured(monkeypatch):
     ):
         assert response.status_code == 404
         assert response.json()["error"]["code"] == "response_not_found"
+
+
+@pytest.mark.parametrize("effort", ["off", "none", "OFF", "None"])
+def test_request_translation_maps_disabled_effort_to_thinking_off(effort):
+    chat = responses_request_to_chat(
+        ResponsesRequest.model_validate(
+            {"input": "hi", "reasoning": {"effort": effort}}
+        )
+    )
+
+    assert chat["enable_thinking"] is False
+    assert chat["reasoning_effort"] is None
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "auto"])
+def test_request_translation_passes_effort_levels_through(effort):
+    chat = responses_request_to_chat(
+        ResponsesRequest.model_validate(
+            {"input": "hi", "reasoning": {"effort": effort}}
+        )
+    )
+
+    assert chat["enable_thinking"] is True
+    assert chat["reasoning_effort"] == effort
+
+
+def test_request_translation_rejects_unknown_effort_before_streaming():
+    with pytest.raises(ResponsesProtocolError) as raised:
+        responses_request_to_chat(
+            ResponsesRequest.model_validate(
+                {"input": "hi", "reasoning": {"effort": "banana"}}
+            )
+        )
+    assert raised.value.param == "reasoning.effort"
+
+
+@pytest.mark.parametrize("effort", ["off", "none", "low"])
+def test_post_responses_stream_completes_for_reasoning_effort(monkeypatch, effort):
+    state = _fake_state()
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(
+        openai, "_run_generation", _fake_streaming_generation("Hello there")
+    )
+    response = TestClient(create_app(state)).post(
+        "/v1/responses",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={"input": "hi", "stream": True, "reasoning": {"effort": effort}},
+    )
+
+    assert response.status_code == 200, response.text
+    events = _event_payloads(response.text)
+    assert events[0]["type"] == "response.created"
+    assert events[-1]["type"] == "response.completed"
+    assert events[-1]["response"]["status"] == "completed"
+    visible = "".join(
+        event["delta"]
+        for event in events
+        if event["type"] == "response.output_text.delta"
+    )
+    assert visible == "Hello there"
+
+
+@pytest.mark.parametrize("effort", ["off", "none"])
+def test_post_responses_nonstream_completes_for_disabled_effort(monkeypatch, effort):
+    client = _ready_client(monkeypatch, text="Hello")
+    response = client.post(
+        "/v1/responses",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={"input": "hi", "reasoning": {"effort": effort}},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "completed"
