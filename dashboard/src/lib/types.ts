@@ -55,6 +55,8 @@ export type MetricsLatest = {
   rollback_time_s?: number | null;
   graphbank?: Record<string, unknown> | null;
   repair_time_by_reject_depth_s?: Record<string, number> | null;
+  // ---- when the request finished (wall clock, seconds) ----
+  completed_at_s?: number | null;
   // ---- cache ----
   session_cache_hit?: boolean | null;
   cache_miss_reason?: string | null;
@@ -338,7 +340,8 @@ export type ConnectionState =
   | "connecting"
   | "open"
   | "reconnecting"
-  | "failed";
+  | "failed"
+  | "unauthorized";
 
 export type PrefillRow = {
   t: number;

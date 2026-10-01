@@ -32,12 +32,20 @@ from .models.laguna_config import (
 from .profiles import (
     DEFAULT_FP16_HF_MODEL_ID,
     DEFAULT_FP16_PUBLIC_MODEL_ID,
+    FLASH_NEXT_OPTIMIZED_QUALITY_HF_MODEL_ID,
+    FLASH_NEXT_OPTIMIZED_QUALITY_PUBLIC_MODEL_ID,
+    BONSAI_OPTIMIZED_SPEED_HF_MODEL_ID,
+    BONSAI_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
+    BONSAI_LEGACY_PUBLIC_MODEL_ID,
+    BONSAI_LEGACY_LOCAL_NAME,
     FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
     FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID,
     FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
     FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
     LEGACY_OPTIMIZED_HF_MODEL_ID,
     LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
+    MIMO_V26_QWEN_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
+    MIMO_V26_QWEN_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
     OPTIMIZED_SPEED_V1_HF_MODEL_ID,
     OPTIMIZED_SPEED_V1_PUBLIC_MODEL_ID,
     OPTIMIZED_SPEED_V2_HF_MODEL_ID,
@@ -74,6 +82,17 @@ from .profiles import (
 
 MTP_KEY_PREFIXES = ("mtp.", "language_model.mtp.")
 _KNOWN_PUBLIC_MODEL_ALIASES = {
+    "flash-next-optimized-quality": FLASH_NEXT_OPTIMIZED_QUALITY_HF_MODEL_ID,
+    FLASH_NEXT_OPTIMIZED_QUALITY_PUBLIC_MODEL_ID: FLASH_NEXT_OPTIMIZED_QUALITY_HF_MODEL_ID,
+    Path(FLASH_NEXT_OPTIMIZED_QUALITY_HF_MODEL_ID).name.lower(): FLASH_NEXT_OPTIMIZED_QUALITY_HF_MODEL_ID,
+    "bonsai-2-27b-optimized-speed": BONSAI_OPTIMIZED_SPEED_HF_MODEL_ID,
+    BONSAI_OPTIMIZED_SPEED_PUBLIC_MODEL_ID: BONSAI_OPTIMIZED_SPEED_HF_MODEL_ID,
+    Path(BONSAI_OPTIMIZED_SPEED_HF_MODEL_ID).name.lower(): BONSAI_OPTIMIZED_SPEED_HF_MODEL_ID,
+    BONSAI_LEGACY_PUBLIC_MODEL_ID: BONSAI_OPTIMIZED_SPEED_HF_MODEL_ID,
+    BONSAI_LEGACY_LOCAL_NAME.lower(): BONSAI_OPTIMIZED_SPEED_HF_MODEL_ID,
+    "mimo-v26-qwen-9b-optimized-speed": MIMO_V26_QWEN_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
+    MIMO_V26_QWEN_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID: MIMO_V26_QWEN_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
+    Path(MIMO_V26_QWEN_9B_OPTIMIZED_SPEED_HF_MODEL_ID).name.lower(): MIMO_V26_QWEN_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
     # Served public ids (the exact strings /v1/models advertises) resolve to
     # their first-party repos. Explicit ids only — consistent with the July
     # 2026 contract-match-only identity stance (#57): pasting the id the
@@ -128,6 +147,11 @@ _KNOWN_PUBLIC_MODEL_ALIASES = {
 }
 
 
+# Checkpoint prefixes the vision tower tensors live under (mlx-vlm layout and
+# the Hugging Face Qwen3.5 MoE layout); mirrors mtplx.vision.qwen3_vl_tower.
+_VISION_TENSOR_PREFIXES = ("vision_tower.", "model.visual.")
+
+
 def normalize_mtp_key(key: str) -> str:
     text = str(key)
     for prefix in MTP_KEY_PREFIXES:
@@ -148,6 +172,53 @@ def _num_mtp_layers(config: dict[str, Any]) -> int:
         or tcfg.get("num_nextn_predict_layers")
         or config.get("num_nextn_predict_layers")
         or 0
+    )
+
+
+def appended_mtp_layer_range(config: dict[str, Any]) -> range:
+    """Layer indices holding an appended-layer MTP head.
+
+    GLM MoE checkpoints ship the MTP head as extra decoder layers starting
+    at ``num_hidden_layers`` (``model.layers.47.*`` for GLM-4.7-Flash),
+    rather than under an ``mtp.`` prefix.  Returns an empty range when the
+    config does not describe that layout.
+    """
+    tcfg = text_config(config)
+    start = int(tcfg.get("num_hidden_layers") or config.get("num_hidden_layers") or 0)
+    count = _num_mtp_layers(config)
+    if start <= 0 or count <= 0:
+        return range(0)
+    return range(start, start + count)
+
+
+def is_mtp_layers_namespace_key(key: str, config: dict[str, Any]) -> bool:
+    """Match an MTP head kept in its own ``model.mtp_layers.N.`` namespace.
+
+    MiMo stores the head neither under an ``mtp.`` prefix nor as an appended
+    decoder layer, but in a separate namespace beside ``model.layers.*``.
+    ``mimo_mtp_patch`` already reads that form, so extraction only has to
+    select the keys; no rewrite is needed.
+    """
+    text = str(key)
+    count = _num_mtp_layers(config)
+    return count > 0 and any(
+        text.startswith(f"model.mtp_layers.{index}.") for index in range(count)
+    )
+
+
+def uses_mtp_layers_namespace(config: dict[str, Any]) -> bool:
+    return _num_mtp_layers(config) > 0
+
+
+def uses_appended_layer_mtp(config: dict[str, Any]) -> bool:
+    return len(appended_mtp_layer_range(config)) > 0
+
+
+def is_appended_layer_mtp_key(key: str, config: dict[str, Any]) -> bool:
+    text = str(key)
+    return any(
+        text.startswith(f"model.layers.{index}.")
+        for index in appended_mtp_layer_range(config)
     )
 
 
@@ -509,6 +580,27 @@ class ModelInspection:
     backend_status: str | None = None
     backend_artifact: dict[str, Any] | None = None
     gemma4_pair: dict[str, Any] | None = None
+    vision_declared: bool = False
+
+    @property
+    def vision(self) -> dict[str, Any]:
+        """Whether the artifact can take image input, from metadata alone.
+
+        Capable means all three pieces the vision path needs are present: a
+        ``vision_config`` in config.json, vision tower tensors in the weight
+        files, and ``preprocessor_config.json``.
+        """
+
+        tensors = sum(
+            1 for key in self.weight_keys if key.startswith(_VISION_TENSOR_PREFIXES)
+        )
+        preprocessor = bool(self.sidecars.get("preprocessor_config.json"))
+        return {
+            "declared": bool(self.vision_declared),
+            "tower_tensors": tensors,
+            "preprocessor_config": preprocessor,
+            "capable": bool(self.vision_declared and tensors > 0 and preprocessor),
+        }
 
     @property
     def passes_primary_gate(self) -> bool:
@@ -544,6 +636,7 @@ class ModelInspection:
             "laguna_s_2_1_artifacts_complete": self.laguna_s_2_1_artifacts_complete,
             "quantization": self.quantization,
             "sidecars": self.sidecars,
+            "vision": self.vision,
             "model_files": list(self.model_files),
             "passes_primary_gate": self.passes_primary_gate,
             "mtp": self.mtp.to_dict() if self.mtp else None,
@@ -657,15 +750,21 @@ def _hf_download_json(
         from huggingface_hub import hf_hub_download
     except Exception as exc:
         return None, None, f"huggingface_hub is required for HF inspection: {exc}"
+    from mtplx.hf_loader import _call_hub_with_anonymous_fallback, hf_token_for_download
+
     try:
         cache_dir = _hf_download_cache_dir()
         kwargs = {"cache_dir": str(cache_dir)} if cache_dir else {}
-        path = hf_hub_download(
-            repo_id=repo_id,
-            filename=filename,
-            repo_type="model",
-            revision=revision,
-            **kwargs,
+        path, _token = _call_hub_with_anonymous_fallback(
+            lambda token: hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                repo_type="model",
+                revision=revision,
+                token=token,
+                **kwargs,
+            ),
+            hf_token_for_download(),
         )
     except Exception as exc:
         return None, None, str(exc)
@@ -714,17 +813,19 @@ def _hf_list_repo_files(
         from huggingface_hub import HfApi
     except Exception as exc:
         return set(), f"huggingface_hub is required for HF inspection: {exc}"
+    from mtplx.hf_loader import _call_hub_with_anonymous_fallback, hf_token_for_download
+
     try:
-        return (
-            set(
-                HfApi().list_repo_files(
-                    repo_id=repo_id,
-                    repo_type="model",
-                    revision=revision,
-                )
+        files, _token = _call_hub_with_anonymous_fallback(
+            lambda token: HfApi().list_repo_files(
+                repo_id=repo_id,
+                repo_type="model",
+                revision=revision,
+                token=token,
             ),
-            None,
+            hf_token_for_download(),
         )
+        return set(files), None
     except Exception as exc:
         return set(), str(exc)
 
@@ -736,25 +837,26 @@ def _hf_url(repo_id: str, filename: str) -> str:
 
 
 def _hf_token() -> str | None:
-    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-    if token:
-        return token
-    try:
-        from huggingface_hub import get_token
+    # One token policy for every Hub call MTPLX makes; see hf_token_for_download.
+    from mtplx.hf_loader import hf_token_for_download
 
-        return get_token()
-    except Exception:
-        return None
+    token = hf_token_for_download()
+    return token if isinstance(token, str) and token else None
 
 
 def _hf_fetch_prefix(repo_id: str, filename: str, *, end: int) -> bytes:
-    headers = {"Range": f"bytes=0-{end}", "User-Agent": "mtplx-inspect/0.1"}
-    token = _hf_token()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    request = urllib.request.Request(_hf_url(repo_id, filename), headers=headers)
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return response.read()
+    from mtplx.hf_loader import _call_hub_with_anonymous_fallback
+
+    def fetch(token: str | bool) -> bytes:
+        headers = {"Range": f"bytes=0-{end}", "User-Agent": "mtplx-inspect/0.1"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        request = urllib.request.Request(_hf_url(repo_id, filename), headers=headers)
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.read()
+
+    data, _token = _call_hub_with_anonymous_fallback(fetch, _hf_token() or False)
+    return data
 
 
 def _remote_safetensors_keys(repo_id: str, filename: str) -> tuple[tuple[str, ...], str | None]:
@@ -1108,6 +1210,7 @@ def _inspect_hf_model(repo_id: str) -> ModelInspection:
         mtp_pattern=_mtp_pattern_from_config(config),
         quantization=quant,
         sidecars={name: name in files for name in MULTIMODAL_SIDECARS},
+        vision_declared=isinstance(config.get("vision_config"), dict),
         model_files=model_files,
         weight_keys=combined_weight_keys,
         mtp=mtp,
@@ -1137,6 +1240,7 @@ def _inspect_hf_model(repo_id: str) -> ModelInspection:
         mtp_pattern=inspection.mtp_pattern,
         quantization=inspection.quantization,
         sidecars=inspection.sidecars,
+        vision_declared=inspection.vision_declared,
         model_files=inspection.model_files,
         weight_keys=inspection.weight_keys,
         mtp=inspection.mtp,
@@ -1270,6 +1374,7 @@ def inspect_model(model_dir: Path | str) -> ModelInspection:
         mtp_pattern=_mtp_pattern_from_config(config),
         quantization=quant,
         sidecars={name: (model_path / name).exists() for name in MULTIMODAL_SIDECARS},
+        vision_declared=isinstance(config.get("vision_config"), dict),
         model_files=tuple(sorted(p.name for p in model_path.glob("model*.safetensors"))),
         weight_keys=weight_keys,
         mtp=mtp,
@@ -1294,6 +1399,7 @@ def inspect_model(model_dir: Path | str) -> ModelInspection:
         mtp_pattern=inspection.mtp_pattern,
         quantization=inspection.quantization,
         sidecars=inspection.sidecars,
+        vision_declared=inspection.vision_declared,
         model_files=inspection.model_files,
         weight_keys=inspection.weight_keys,
         mtp=inspection.mtp,

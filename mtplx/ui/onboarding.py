@@ -17,7 +17,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from mtplx.constants import (
     EXPECTED_ALL_PREQUANTIZED_MTP_KEYS,
@@ -28,38 +28,18 @@ from mtplx.constants import (
     expand_mtp_layer_keys,
 )
 from mtplx.default_models import (
+    catalog_model_ref,
     DefaultModelSelection,
+    DefaultModelUnavailable,
     OPTIMIZED_QUALITY_DESCRIPTION,
     OPTIMIZED_QUALITY_LABEL,
-    QWEN38_BARE_SPEED_DESCRIPTION,
-    QWEN38_BARE_SPEED_LABEL,
-    QWEN38_OPTIMIZED_QUALITY_DESCRIPTION,
-    QWEN38_OPTIMIZED_QUALITY_LABEL,
-    QWEN38_OPTIMIZED_SPEED_DESCRIPTION,
-    QWEN38_OPTIMIZED_SPEED_LABEL,
-    QWEN38_BARE_SPEED_FP16_LABEL,
-    QWEN38_FP16_SUFFIX,
-    QWEN38_OPTIMIZED_QUALITY_FP16_LABEL,
-    QWEN38_OPTIMIZED_SPEED_FP16_LABEL,
     is_verified_default_model_ref,
     is_optimized_quality_model_ref,
-    optimized_quality_model_ref,
     public_model_id_for_ref,
-    qwen38_bare_speed_fp16_model_ref,
-    qwen38_bare_speed_model_ref,
-    qwen38_optimized_quality_fp16_model_ref,
-    qwen38_optimized_quality_model_ref,
     select_default_model,
 )
-from mtplx.profiles import (
-    DEFAULT_HF_MODEL_ID,
-    QWEN38_BARE_SPEED_FP16_HF_MODEL_ID,
-    QWEN38_BARE_SPEED_HF_MODEL_ID,
-    QWEN38_OPTIMIZED_QUALITY_FP16_HF_MODEL_ID,
-    QWEN38_OPTIMIZED_QUALITY_HF_MODEL_ID,
-    QWEN38_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
-    QWEN38_OPTIMIZED_SPEED_HF_MODEL_ID,
-)
+from mtplx.profiles import DEFAULT_HF_MODEL_ID
+from mtplx.model_catalog import LEGACY_TIER, chip_tier_for_generation, recommended_models
 from mtplx.server_urls import bind_label, is_wildcard_bind, local_url_for_bind
 
 DEFAULT_HF_MODEL = DEFAULT_HF_MODEL_ID
@@ -81,11 +61,13 @@ LEGACY_OPTIMIZED_MODEL_NAMES = frozenset(
 # user never has to scroll past unsupported entries to find a launchable one.
 _TIER_RANK: dict[str, int] = {
     "verified": 0,
+    "qualification-pending": 0,
     "arch-compatible": 1,
     "needs-verification": 2,
     "mtp-invalid": 3,
     "mtp-missing": 4,
     "backend-pending": 5,
+    "engine-update": 5,
     "no-mtp": 6,
     "incompatible": 7,
     "unknown": 8,
@@ -129,7 +111,17 @@ def _pretty_path(value: str | Path | None) -> str:
 
 
 def _verified_default_selection() -> DefaultModelSelection:
-    return select_default_model()
+    """The verified default for this Mac, or a clean exit with the reason.
+
+    A Mac that cannot run any MTPLX model (an Intel processor, or less
+    memory than the smallest pack needs) gets the one-sentence message and
+    exit status 1 before any screen offers it a download.
+    """
+
+    try:
+        return select_default_model()
+    except DefaultModelUnavailable as exc:
+        raise SystemExit(exc.message) from exc
 
 
 def _verified_default_model() -> str:
@@ -190,10 +182,11 @@ class ScannedModel:
     """A model directory found while walking a user-supplied folder.
 
     ``tier`` is the normalized compatibility verdict, one of
-    ``verified`` / ``arch-compatible`` / ``needs-verification`` /
-    ``mtp-invalid`` / ``mtp-missing`` / ``backend-pending`` / ``no-mtp`` /
-    ``incompatible`` / ``unknown``. The display layer turns it into a coloured
-    badge. ``arch-compatible`` means launchable, not merely recognized.
+    ``verified`` / ``qualification-pending`` / ``arch-compatible`` /
+    ``needs-verification`` / ``mtp-invalid`` / ``mtp-missing`` /
+    ``backend-pending`` / ``engine-update`` / ``no-mtp`` / ``incompatible`` /
+    ``unknown``. The display layer turns it into a coloured badge.
+    ``arch-compatible`` means launchable, not merely recognized.
     """
 
     path: Path
@@ -476,7 +469,11 @@ def _classify_scanned_model(model_dir: Path) -> ScannedModel:
     stub.runtime_contract_path = str(contract_path) if contract_path.is_file() else None
 
     try:
-        from mtplx.backends.registry import compatibility_for_inspection
+        from mtplx.backends.registry import (
+            ENGINE_UPDATE_REQUIRED,
+            SUPPORT_QUALIFICATION_PENDING,
+            compatibility_for_inspection,
+        )
     except Exception as exc:
         return ScannedModel(
             path=model_dir,
@@ -509,6 +506,8 @@ def _classify_scanned_model(model_dir: Path) -> ScannedModel:
     artifact_missing = mtp_num_hidden_layers > 0 and not mtp_artifact_exists
     if raw_tier == "verified":
         tier = "verified"
+    elif verdict.support_level == SUPPORT_QUALIFICATION_PENDING:
+        tier = "qualification-pending"
     elif verdict.can_run or raw_tier == "family-compatible-unverified":
         tier = "arch-compatible"
     elif raw_tier == "architecture-compatible-but-unverified":
@@ -540,6 +539,8 @@ def _classify_scanned_model(model_dir: Path) -> ScannedModel:
             tier = "needs-verification"
     elif raw_tier == "no-MTP":
         tier = "no-mtp"
+    elif runtime_status == ENGINE_UPDATE_REQUIRED:
+        tier = "engine-update"
     elif raw_tier == "incompatible-architecture":
         tier = "backend-pending" if runtime_status == "recognized-backend-pending" else "incompatible"
     else:
@@ -558,6 +559,8 @@ def _tier_badge(tier: str) -> tuple[str, str]:
 
     if tier == "verified":
         return ("Verified", "bold green")
+    if tier == "qualification-pending":
+        return ("Official pack, qualification pending", "green")
     if tier == "arch-compatible":
         return ("Runnable (unverified)", "yellow")
     if tier == "needs-verification":
@@ -568,6 +571,8 @@ def _tier_badge(tier: str) -> tuple[str, str]:
         return ("MTP weights missing", "yellow")
     if tier == "backend-pending":
         return ("Backend not runnable yet", "dim")
+    if tier == "engine-update":
+        return ("Needs a newer MTPLX", "yellow")
     if tier == "no-mtp":
         return ("No MTP head", "dim")
     if tier == "incompatible":
@@ -880,13 +885,19 @@ def _print_summary(
 _MAX_INSTALLED_PICKER_ROWS = 6
 
 
-def _installed_models_for_screen() -> list[Any]:
+def _installed_models_for_screen(
+    *,
+    cache_dir: str | Path | None = None,
+    search_dirs: Iterable[str | Path] | None = None,
+) -> list[Any]:
     """Complete installs from the local cache for the 'On this Mac' group."""
 
     try:
         from mtplx.model_catalog import scan_installed_models
 
-        return list(scan_installed_models())[:_MAX_INSTALLED_PICKER_ROWS]
+        return list(
+            scan_installed_models(cache_dir, search_dirs=search_dirs)
+        )[:_MAX_INSTALLED_PICKER_ROWS]
     except Exception:
         return []
 
@@ -957,38 +968,9 @@ def screen_model(
     app_row_index: int | None = None
     verified_row_index: int | None = None
     verified_covered_by_install = False
-    quality_covered_by_install = False
-    # Qwen 3.8 trio (2026-08-15 release): on modern Macs the verified default
-    # is Qwen 3.8 Optimized Speed, and the two siblings are offered right
-    # under it so a fresh user sees the whole 3.8 line-up. M1/M2 and <32 GiB
-    # Macs keep their FP16 / 9B routing and the 3.6 Quality row.
-    qwen38_fp16 = verified_selection.hf_model == QWEN38_OPTIMIZED_SPEED_FP16_HF_MODEL_ID
-    offers_qwen38 = qwen38_fp16 or (
-        verified_selection.hf_model == QWEN38_OPTIMIZED_SPEED_HF_MODEL_ID
-    )
-    memory_gib = verified_selection.memory_gib
-    offers_qwen38_quality = offers_qwen38 and (
-        memory_gib is None or memory_gib >= 33.0
-    )
-    if qwen38_fp16:
-        # M1/M2: the whole line-up is the FP16 sibling set.
-        qwen38_speed_label = QWEN38_OPTIMIZED_SPEED_FP16_LABEL
-        qwen38_bare_label = QWEN38_BARE_SPEED_FP16_LABEL
-        qwen38_quality_label = QWEN38_OPTIMIZED_QUALITY_FP16_LABEL
-        qwen38_bare_hf_id = QWEN38_BARE_SPEED_FP16_HF_MODEL_ID
-        qwen38_quality_hf_id = QWEN38_OPTIMIZED_QUALITY_FP16_HF_MODEL_ID
-        qwen38_bare_ref = qwen38_bare_speed_fp16_model_ref
-        qwen38_quality_ref = qwen38_optimized_quality_fp16_model_ref
-        qwen38_suffix = f"  ·  {QWEN38_FP16_SUFFIX}"
-    else:
-        qwen38_speed_label = QWEN38_OPTIMIZED_SPEED_LABEL
-        qwen38_bare_label = QWEN38_BARE_SPEED_LABEL
-        qwen38_quality_label = QWEN38_OPTIMIZED_QUALITY_LABEL
-        qwen38_bare_hf_id = QWEN38_BARE_SPEED_HF_MODEL_ID
-        qwen38_quality_hf_id = QWEN38_OPTIMIZED_QUALITY_HF_MODEL_ID
-        qwen38_bare_ref = qwen38_bare_speed_model_ref
-        qwen38_quality_ref = qwen38_optimized_quality_model_ref
-        qwen38_suffix = ""
+    tier = (LEGACY_TIER if verified_selection.variant == "fp16"
+            else chip_tier_for_generation(verified_selection.chip_generation))
+    available = recommended_models(memory_gib=verified_selection.memory_gib, chip_tier=tier)
     covered_hf_ids: set[str] = set()
     for item in installed_rows:
         catalog = getattr(item, "catalog", None)
@@ -1000,8 +982,6 @@ def screen_model(
         if covers_verified:
             title = f"{title}  ·  verified default"
             verified_covered_by_install = True
-        if catalog is not None and catalog.id == "optimized-quality":
-            quality_covered_by_install = True
         if catalog is not None:
             covered_hf_ids.add(catalog.hf_model_id)
         rows.append((title, f"installed  ·  {_pretty_path(item.path)}", str(item.path)))
@@ -1016,37 +996,12 @@ def screen_model(
             ("Use your configured model", _pretty_path(configured), str(configured))
         )
     if not verified_covered_by_install:
-        if offers_qwen38:
-            rows.append(
-                (
-                    f"{qwen38_speed_label}  ·  verified default",
-                    f"{QWEN38_OPTIMIZED_SPEED_DESCRIPTION}{qwen38_suffix}",
-                    verified_default,
-                )
-            )
-        else:
-            rows.append(("Verified default for this Mac", verified_label, verified_default))
+        rows.append((f"{verified_selection.display_name}  ·  verified default", verified_label, verified_default))
         verified_row_index = len(rows) - 1
-    if offers_qwen38 and qwen38_bare_hf_id not in covered_hf_ids:
-        rows.append(
-            (
-                qwen38_bare_label,
-                f"{QWEN38_BARE_SPEED_DESCRIPTION}{qwen38_suffix}",
-                qwen38_bare_ref(),
-            )
-        )
-    if offers_qwen38_quality and qwen38_quality_hf_id not in covered_hf_ids:
-        rows.append(
-            (
-                qwen38_quality_label,
-                f"{QWEN38_OPTIMIZED_QUALITY_DESCRIPTION}{qwen38_suffix}",
-                qwen38_quality_ref(),
-            )
-        )
-    if not quality_covered_by_install and not offers_qwen38:
-        rows.append(
-            ("Optimized Quality", _optimized_quality_label(), "__quality__")
-        )
+    for pack in available:
+        if pack.hf_model_id == verified_selection.hf_model or pack.hf_model_id in covered_hf_ids:
+            continue
+        rows.append((pack.display_name, pack.detail, catalog_model_ref(pack)))
     rows.append(
         (
             "Custom Hugging Face repo",
@@ -1075,8 +1030,6 @@ def screen_model(
     valid_choices = [option[0] for option in options]
     choice = _prompt_choice("Select", valid_choices, default=default_choice)
     value = rows[int(choice) - 1][2]
-    if value == "__quality__":
-        return optimized_quality_model_ref()
     if value == "__hf__":
         return _prompt_hf_repo_id(default=verified_default)
     if value == "__local__":
@@ -1166,6 +1119,7 @@ def _scan_and_pick(root: Path) -> str | None:
     )
 
     verified = sum(1 for m in classified if m.tier == "verified")
+    pending = sum(1 for m in classified if m.tier == "qualification-pending")
     runnable = sum(1 for m in classified if m.tier == "arch-compatible")
     needs = sum(1 for m in classified if m.tier == "needs-verification")
     missing = sum(1 for m in classified if m.tier == "mtp-missing")
@@ -1173,6 +1127,8 @@ def _scan_and_pick(root: Path) -> str | None:
         f"Found {len(classified)} model(s) under {_pretty_path(root)}  ·  "
         f"{verified} verified, {runnable} runnable unverified"
     )
+    if pending:
+        intro += f", {pending} official pending qualification"
     if needs:
         intro += f", {needs} need verification"
     if missing:
@@ -1429,6 +1385,8 @@ def screen_server_surface(
 def run_onboarding_screens(
     *,
     configured_model: str | None = None,
+    cache_dir: str | Path | None = None,
+    search_dirs: Iterable[str | Path] | None = None,
     open_dashboard_override: bool | None = None,
     host: str = "127.0.0.1",
     port: int = 8000,
@@ -1447,7 +1405,10 @@ def run_onboarding_screens(
 
     model = screen_model(
         configured=configured_model,
-        installed=_installed_models_for_screen(),
+        installed=_installed_models_for_screen(
+            cache_dir=cache_dir,
+            search_dirs=search_dirs,
+        ),
         app_model=_app_settings_model(),
     )
     profile, max_mode = screen_mode()
@@ -1483,6 +1444,8 @@ def run_onboarding_screens(
 def run_serve_onboarding_screens(
     *,
     configured_model: str | None = None,
+    cache_dir: str | Path | None = None,
+    search_dirs: Iterable[str | Path] | None = None,
     host: str = "127.0.0.1",
     port: int = 8000,
     default_open_browser: bool = False,
@@ -1491,7 +1454,10 @@ def run_serve_onboarding_screens(
 
     model = screen_model(
         configured=configured_model,
-        installed=_installed_models_for_screen(),
+        installed=_installed_models_for_screen(
+            cache_dir=cache_dir,
+            search_dirs=search_dirs,
+        ),
         app_model=_app_settings_model(),
     )
     profile, max_mode = screen_mode()
@@ -1933,6 +1899,8 @@ def run_quickstart_flow(
     *,
     fresh: bool = False,
     configured_model: str | None = None,
+    cache_dir: str | Path | None = None,
+    search_dirs: Iterable[str | Path] | None = None,
     open_dashboard_override: bool | None = None,
     host: str = "127.0.0.1",
     port: int = 8000,
@@ -2015,6 +1983,8 @@ def run_quickstart_flow(
             _print_welcome()
         choice = run_onboarding_screens(
             configured_model=configured_model,
+            cache_dir=cache_dir,
+            search_dirs=search_dirs,
             open_dashboard_override=open_dashboard_override,
             host=host,
             port=port,
@@ -2071,6 +2041,8 @@ def run_serve_flow(
     *,
     fresh: bool = False,
     configured_model: str | None = None,
+    cache_dir: str | Path | None = None,
+    search_dirs: Iterable[str | Path] | None = None,
     host: str = "127.0.0.1",
     port: int = 8000,
     default_open_browser: bool = False,
@@ -2088,6 +2060,8 @@ def run_serve_flow(
         _print_server_welcome()
         choice = run_serve_onboarding_screens(
             configured_model=configured_model,
+            cache_dir=cache_dir,
+            search_dirs=search_dirs,
             host=host,
             port=port,
             default_open_browser=default_open_browser,

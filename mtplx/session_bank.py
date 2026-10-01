@@ -135,6 +135,100 @@ def _boundary_true_restore_enabled() -> bool:
     raw = str(os.environ.get("MTPLX_SESSION_BOUNDARY_TRUE_RESTORE", "1")).strip().lower()
     return raw not in {"0", "false", "off", "no"}
 
+
+SESSION_BANK_SHED_BOUNDARIES_ENV = "MTPLX_SESSION_BANK_SHED_BOUNDARIES"
+
+
+def _shed_boundaries_enabled() -> bool:
+    """Shed GDN boundary records to fit, instead of dropping the whole entry.
+
+    THE BUG, measured 2026-09-01 (PR #391 receipts/ttft/control.json).
+    A three-scenario TTFT screen on Qwen3.8 Flash-Next: a 19,022-token cold
+    turn, the same conversation with the model's own reply appended (0.217 s
+    visible TTFT, exact restore), and the same turn with the prior assistant
+    message re-rendered -- which took **15.79 s, cached=0, cold, on all three
+    repeats**. A 70x cliff on exactly the traffic shape the near-prefix lane
+    exists for.
+
+    The chain, from the receipt:
+
+    * The bank auto-sized to its 1 GiB FLOOR ("session-bank budget: 1.0G total
+      (auto: machine memory plan...), model weights 107.1G" -- the same
+      resolution production gets on this box).
+    * A 19K-token entry's base snapshot is ~711 MB. Its GDN boundary records
+      cost ~87-101 MB EACH, and MTPLX_GDN_BOUNDARY_MAX is 8, so the boundary
+      payload alone is ~700-810 MB.
+    * ``put`` counts that payload into ``entry_nbytes`` and then refuses the
+      ENTIRE entry: eviction_log shows ``skipped_oversized_snapshot`` at
+      nbytes=1,398,321,776 and 1,520,850,304 against a 1,073,741,824 budget --
+      while the same turn's boundary-LESS commit (710,255,120) was admitted.
+    * So the bank only ever held boundary-less entries. The one survivor in the
+      receipt reports ``gdn_boundaries: []``.
+    * ``recurrent_boundary_at_or_below()`` returns None on such an entry, so
+      ``_restore_near_prefix_prompt_state`` rejects every candidate
+      (``boundary_not_better:0``), the request falls through to ``restore()``,
+      the SSD lookup misses, and the response reports ``ssd_prefix_miss`` --
+      which MASKS the real RAM-lane reason and is why this read as an SSD
+      problem rather than an admission one.
+
+    Boundary records are the *sheddable* part of an entry: they are pure
+    acceleration, reconstructible by re-prefill, and an entry with FEWER
+    boundaries still serves every restore an entry with none can. Dropping the
+    entry to protect the budget therefore trades a 0.5 s restore for a 15.8 s
+    cold prefill in order to save bytes it could have saved by keeping three
+    fewer records.
+
+    With shedding, the prompt-boundary entry is admitted with as many records
+    as fit; ``put``'s existing ``prefix_donor`` inheritance then carries those
+    records onto the generation-final commit, ``_supersede_contained_prefixes``
+    collapses the pair (a boundary-carrying container legitimately dominates
+    its contained prefixes), and the single entry the 1 GiB budget allows is a
+    boundary-carrying one.
+
+    Note the corollary: under this bug, raising MTPLX_GDN_BOUNDARY_MAX from 8 --
+    the audit's "cheapest lever" -- makes things WORSE, because it enlarges the
+    payload that triggers the refusal.
+
+    Default OFF; read at SessionBank construction (see __init__) so one bank
+    keeps one admission policy for its whole life and an A/B arm cannot drift
+    mid-run.
+    """
+    raw = str(os.environ.get(SESSION_BANK_SHED_BOUNDARIES_ENV, "0")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+SESSION_BANK_PROTECTED_TERMINAL_ENV = "MTPLX_SESSION_BANK_PROTECTED_TERMINAL"
+
+
+def _protected_terminal_enabled() -> bool:
+    """Protected-terminal eviction order (oMLX PR #3330, exact_resident.py).
+
+    Ported policy, in oMLX's words: two candidates compete under one byte
+    ceiling -- the longer *matching terminal* (a banked turn that strictly
+    extends the incoming prompt) and the shorter *input-prompt fallback* (the
+    prompt itself, being published now). Publishing the fallback must never be
+    what evicts the terminal that extends it: the terminal can serve every
+    restore the fallback can (exact hits trim; boundary-true restores pick a
+    boundary <= the matched point) plus the tail the fallback cannot, so
+    trading it for the fallback strictly loses coverage. oMLX keeps the NEWEST
+    such terminal, deliberately not letting length override insertion recency
+    (`_newest_extending_entry`, exact_resident.py:87-103), and counts the
+    deflections (`protected_rejections`, exact_resident.py:189-215).
+
+    This is an eviction ORDER change and nothing else. It adds no byte ceiling
+    (effective_max_bytes() and the per-session cap already exist and are
+    model-aware), no background work, and no idle lane -- see the phase-3
+    falsification recorded at _snapshot_settle_enabled above and in commit
+    b5fac4ac: on this box, adding work to the idle lane produced the WORST
+    observed stall (27.6 s) across a warm 91K-turn A/B.
+
+    Default OFF; read at SessionBank construction (see __init__), so one bank
+    keeps one policy for its whole life and an A/B arm cannot drift mid-run.
+    """
+    raw = str(os.environ.get(SESSION_BANK_PROTECTED_TERMINAL_ENV, "0")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 GIB = 1024**3
 # Tool sessions store ~3 entries per turn (prompt-prefix commit, postcommit,
 # generation-final); an 8-entry cap churned the whole bank every ~3 turns and
@@ -143,6 +237,11 @@ GIB = 1024**3
 # a stale short prefix (#121, measured 2026-07-16). Memory stays bounded by
 # max_bytes; the count cap only bounds scan cost.
 DEFAULT_MAX_ENTRIES = 24
+# Flat fallbacks for a machine whose RAM cannot be detected and that has no
+# memory plan. Every detected machine sizes the bank from the plan
+# (engine_session.resolve_session_bank_max_bytes) and the per-session cap
+# from the plan's play (resolve_session_bank_per_session_bytes), so raising
+# these would only raise the gate on the one machine we know nothing about.
 DEFAULT_MAX_BYTES = 24 * GIB
 DEFAULT_PER_SESSION_MAX_BYTES = 8 * GIB
 DEFAULT_IDLE_TTL_S = 60 * 60
@@ -203,6 +302,7 @@ class CacheMissReason(str, Enum):
     SESSION_BUSY = "session_busy"
     SNAPSHOT_DESYNC = "snapshot_desync"
     NO_SNAPSHOT_COVERAGE = "no_snapshot_coverage"
+    OVERSIZED_SNAPSHOT_SKIPPED = "oversized_snapshot_skipped"
 
 
 def token_prefix_hash(token_ids: list[int] | tuple[int, ...]) -> str:
@@ -273,6 +373,27 @@ def _snapshot_nbytes(snapshot: CacheSnapshot) -> int:
     return _tree_nbytes(snapshot.states) + _tree_nbytes(snapshot.meta_states)
 
 
+def _live_cache_nbytes(cache: list[Any] | None) -> int:
+    """Bytes a list of LIVE cache objects keeps allocated (0 when unknown).
+
+    Reads each object's ``nbytes``: the real allocation, capacity overhang
+    included, which is what a live-reference lease pins (a paged KV reserves
+    ``prompt + 16384`` tokens). Every real cache class implements it (mlx-lm's
+    and MTPLX's paged and tensor-offset ones), and none of them materialize
+    arrays to answer, unlike ``state`` on the paged classes. An object without
+    the property, or mlx-lm's base class saying a subclass never implemented
+    it, reports 0 and the caller falls back to the refused snapshot's size.
+    """
+
+    total = 0
+    for item in cache or ():
+        try:
+            total += int(getattr(item, "nbytes", 0) or 0)
+        except NotImplementedError:
+            continue
+    return total
+
+
 @dataclass
 class SessionBankEntry:
     token_ids: tuple[int, ...]
@@ -294,6 +415,15 @@ class SessionBankEntry:
     # Record the rejected snapshot size that forced the lease so projections
     # stay honest across the whole oversized regime.
     oversized_nbytes: int = 0
+    # What a lease really holds, recorded once at put() time (#456). A lease
+    # has no snapshot, so ``nbytes`` stays 0 and keeps meaning "snapshot
+    # bytes" for the per-session budget, but the lease still keeps memory
+    # alive: ``lease_pinned_nbytes`` is the live cache it pins until a restore
+    # consumes it, ``lease_aux_nbytes`` is what it owns outright (logits,
+    # hidden, recurrent boundary records) and keeps after consumption.
+    # ``held_nbytes`` adds them up; every budget and guard reads that.
+    lease_pinned_nbytes: int = 0
+    lease_aux_nbytes: int = 0
     # Passive probe: monotonic time this ENTRY OBJECT's cold-tier encode
     # completed (the encode evals the entry's lazy roots in place), or None.
     # Kept on the exact object — Site A and Site B can create distinct
@@ -339,19 +469,77 @@ class SessionBankEntry:
     # kvcache-v2: SSD-restored entries defer boundary decode (exact restores
     # never need them); the loader fills gdn_boundaries on first partial use.
     gdn_boundary_loader: Any = None
+    # SSD block-prefix restores may hydrate only the cache state required for
+    # the boundary they will serve.  ``prefix_len`` remains the full token
+    # identity used for candidate matching; these fields describe the actual
+    # materialized state spans.
+    cache_snapshot_prefix_len: int | None = None
+    mtp_history_snapshot_prefix_len: int | None = None
 
     @property
     def prefix_len(self) -> int:
         return len(self.token_ids)
 
-    def _ensure_boundaries_loaded(self) -> None:
+    @property
+    def held_nbytes(self) -> int:
+        """Bytes of memory this entry keeps alive right now.
+
+        A durable entry holds its snapshot (``nbytes``; a lazy snapshot shares
+        its buffers with any live reference it also keeps). A lease holds the
+        live cache it pins until a restore takes the reference, and what it
+        owns outright after that. The refused snapshot's size is the floor for
+        a live lease whose cache objects cannot report their allocation.
+        """
+
+        if not self.live_ref_only:
+            return int(self.nbytes)
+        if self.cache_ref is None:
+            return int(self.lease_aux_nbytes)
+        return max(
+            int(self.lease_pinned_nbytes) + int(self.lease_aux_nbytes),
+            int(self.oversized_nbytes),
+        )
+
+    def release_live_refs(self) -> None:
+        """Drop the references to the live caches (eviction, clear).
+
+        An entry object outlives the bank's dict whenever a finished request's
+        outcome still points at it; the cache it pinned must not.
+        """
+
+        self.cache_ref = None
+        self.mtp_history_cache_ref = None
+
+    def _ensure_boundaries_loaded(
+        self, *, should_abort: Callable[[], bool] | None = None
+    ) -> None:
+        """Hydrate the lazily loaded boundary records.
+
+        ``should_abort`` is for the idle-lane persistence jobs only: they
+        hydrate on the model-owner thread before encoding, so a waiting
+        request interrupts them between records (ColdEncodeInterrupted). The
+        loader is put back first, because an entry that lost it would persist
+        without boundaries and downgrade its whole lineage on the next
+        restart. Restores pass nothing and are never interrupted.
+        """
         if self.gdn_boundaries or self.gdn_boundary_loader is None:
             return
         loader, self.gdn_boundary_loader = self.gdn_boundary_loader, None
         try:
+            if should_abort is None:
+                records = loader()
+            else:
+                try:
+                    records = loader(should_abort=should_abort)
+                except TypeError:
+                    # A loader that predates the interrupt contract.
+                    records = loader()
             self.gdn_boundaries = [
-                (int(r[0]), r[1], r[2] if len(r) > 2 else None) for r in loader() or ()
+                (int(r[0]), r[1], r[2] if len(r) > 2 else None) for r in records or ()
             ]
+        except ColdEncodeInterrupted:
+            self.gdn_boundary_loader = loader
+            raise
         except Exception:
             # Fail closed: a missing/corrupt boundary payload just means the
             # partial-restore path declines, exactly as if none were stored.
@@ -481,6 +669,12 @@ class SessionBank:
         self.last_miss_reason: str | None = None
         self.last_put_nbytes: int = 0
         self.last_put_skipped_oversized_snapshot: bool = False
+        # Sessions whose latest generation-final snapshot was refused for size
+        # (issue #499, 2026-09-16 repro): the next restore of that conversation
+        # names the refusal as the miss instead of the cold tier's prefix miss,
+        # which only says the SSD had nothing either.
+        self._oversized_skips: dict[str | None, dict[str, Any]] = {}
+        self.last_oversized_skip: dict[str, Any] | None = None
         self._oversized_warned_sessions: set[str | None] = set()
         # Bounded: appended on every eviction/skip for the daemon's lifetime;
         # health snapshots only ever read the newest entries, so an unbounded
@@ -508,6 +702,18 @@ class SessionBank:
         self.dynamic_ceiling_fn: Callable[[], int] | None = None
         self.last_dynamic_ceiling_bytes: int | None = None
         self.dynamic_ceiling_errors: int = 0
+        # MTPLX_SESSION_BANK_PROTECTED_TERMINAL, resolved ONCE here so a bank keeps
+        # one eviction policy for its whole life (see the gate's docstring).
+        self.protect_newest_extending: bool = _protected_terminal_enabled()
+        # Deflections: how many times publishing a shorter input-prompt
+        # fallback would have evicted the newest terminal extending it and
+        # took another victim instead. oMLX's `protected_rejections`.
+        self.protected_rejections: int = 0
+        # MTPLX_SESSION_BANK_SHED_BOUNDARIES, resolved ONCE here (see the gate's
+        # docstring for the 2026-09-01 15.79 s receipt this exists to fix).
+        self.shed_gdn_boundaries_to_fit: bool = _shed_boundaries_enabled()
+        self.boundary_shed_puts: int = 0
+        self.boundary_shed_records: int = 0
 
     # Capability marker for generation: near_prefix_candidates accepts
     # min_restore_tokens so resident-duplicate eligibility mirrors the
@@ -519,7 +725,32 @@ class SessionBank:
 
     @property
     def total_nbytes(self) -> int:
-        return sum(entry.nbytes for entry in self._entries.values())
+        # Snapshot the values: /health reads this from a server thread while
+        # the model owner mutates the dict inside put() (#487 -- a
+        # "dictionary changed size during iteration" 500 counts as a
+        # watchdog miss in the app). list() of a dict is atomic under the GIL.
+        #
+        # held_nbytes, not nbytes (#456): a live-reference lease has no
+        # snapshot and recorded 0 here while pinning a whole paged KV. Every
+        # reader of this total is a memory guard, and each one failed the same
+        # way: the admission shed (gated on a non-zero total) reported
+        # "nothing sheddable", shrink_to_bytes never entered its loop, and the
+        # dynamic ceiling (working set = active - weights - this total) took
+        # the lease for working set and evicted the durable snapshots instead.
+        return sum(entry.held_nbytes for entry in list(self._entries.values()))
+
+    @property
+    def lease_entries(self) -> int:
+        return sum(1 for entry in list(self._entries.values()) if entry.live_ref_only)
+
+    @property
+    def lease_nbytes(self) -> int:
+        """The part of ``total_nbytes`` held by live-reference leases."""
+        return sum(
+            entry.held_nbytes
+            for entry in list(self._entries.values())
+            if entry.live_ref_only
+        )
 
     def effective_max_bytes(self) -> int:
         """The byte budget in force right now.
@@ -571,7 +802,9 @@ class SessionBank:
             return set()
         cutoff = time.monotonic() - self.active_pin_ttl_s
         return {
-            sid for sid, ts in self._session_last_active.items() if ts >= cutoff
+            sid
+            for sid, ts in list(self._session_last_active.items())
+            if ts >= cutoff
         }
 
     def warn_oversized_snapshot_skip(
@@ -692,6 +925,26 @@ class SessionBank:
         def live_ref_entry(reason: str, nbytes: int) -> SessionBankEntry | None:
             if not keep_live_ref or not cache:
                 return None
+            # The draft head's committed history (#499). A caller hands it
+            # over either as a live reference or as a snapshot, and the
+            # server's generation-final commit always uses the snapshot.
+            # The lease used to drop that snapshot while keeping its epoch,
+            # so with MTP on it could never be restored: the restore took
+            # the trunk reference, found no history and failed with
+            # no_snapshot_coverage, and the idle-lane spill wrote an SSD
+            # copy that _restore_cold refuses (ssd_missing_mtp_history).
+            # Every turn past the per-session budget then prefilled cold
+            # (570 s at 150K tokens in the report). The history is one
+            # attention layer, small next to the trunk that made the
+            # snapshot oversized, and trunk reference plus history
+            # snapshot is the pairing every durable generation-final
+            # entry already restores with. A live reference, when the
+            # caller gave one, serves instead and no copy is held.
+            kept_mtp_history = (
+                None
+                if mtp_history_cache_ref is not None
+                else _clone_tree(mtp_history_snapshot)
+            )
             entry = SessionBankEntry(
                 token_ids=tokens,
                 token_hash=token_prefix_hash(tokens),
@@ -706,12 +959,25 @@ class SessionBank:
                 live_ref_only=True,
                 nbytes=0,
                 oversized_nbytes=max(0, int(nbytes)),
+                lease_pinned_nbytes=(
+                    _live_cache_nbytes(cache)
+                    + _live_cache_nbytes(mtp_history_cache_ref)
+                ),
+                lease_aux_nbytes=(
+                    _tree_nbytes(logits)
+                    + _tree_nbytes(hidden)
+                    + _tree_nbytes(kept_mtp_history)
+                    + sum(
+                        _snapshot_nbytes(r[1]) + _tree_nbytes(r[2])
+                        for r in normalized_boundaries
+                    )
+                ),
                 session_id=session_id,
                 template_hash=template_hash,
                 mtp_history_policy=mtp_history_policy,
                 draft_head_identity=draft_head_identity,
                 policy_fingerprint=policy_fingerprint,
-                mtp_history_snapshot=None,
+                mtp_history_snapshot=kept_mtp_history,
                 snapshot_epoch=int(snapshot_epoch),
                 mtp_snapshot_epoch=(
                     int(mtp_snapshot_epoch)
@@ -719,6 +985,7 @@ class SessionBank:
                     else (
                         int(snapshot_epoch)
                         if mtp_history_cache_ref is not None
+                        or kept_mtp_history is not None
                         else None
                     )
                 ),
@@ -738,6 +1005,7 @@ class SessionBank:
                 }
             )
             self._entries[tokens] = entry
+            self._release_stale_session_leases(entry)
             self._supersede_contained_prefixes(tokens)
             self._evict_if_needed(protected_tokens=tokens)
             return entry
@@ -765,6 +1033,7 @@ class SessionBank:
                     "budget": int(self.per_session_max_bytes),
                 }
             )
+            self._record_oversized_skip(session_id, tokens, int(nbytes_override))
             return None
         lazy_kv = _lazy_snapshot_enabled()
         trunk_snapshot_started = time.perf_counter()
@@ -809,6 +1078,35 @@ class SessionBank:
             )
         )
         entry_nbytes = int(nbytes_override if nbytes_override is not None else computed_nbytes)
+        if (
+            self.shed_gdn_boundaries_to_fit
+            and nbytes_override is None
+            and normalized_boundaries
+            and entry_nbytes > self.per_session_max_bytes
+        ):
+            kept, shed_nbytes, shed = self._shed_boundaries_to_fit(
+                normalized_boundaries, entry_nbytes
+            )
+            # Only apply a shed that actually rescues the entry. When the BASE
+            # snapshot alone is over budget, dropping records changes nothing
+            # about the outcome, so leave the entry exactly as it was and let
+            # the unchanged refusal below report the real size.
+            if shed and shed_nbytes <= self.per_session_max_bytes:
+                normalized_boundaries, entry_nbytes = kept, shed_nbytes
+                self.boundary_shed_puts += 1
+                self.boundary_shed_records += shed
+                self.eviction_log.append(
+                    {
+                        "reason": "shed_gdn_boundaries",
+                        "session_id": session_id,
+                        "prefix_len": len(tokens),
+                        "token_hash": token_prefix_hash(tokens),
+                        "nbytes": int(entry_nbytes),
+                        "budget": int(self.per_session_max_bytes),
+                        "boundaries_shed": int(shed),
+                        "boundaries_kept": len(normalized_boundaries),
+                    }
+                )
         self.last_put_nbytes = int(entry_nbytes)
         if entry_nbytes > self.per_session_max_bytes:
             self.last_put_skipped_oversized_snapshot = True
@@ -829,6 +1127,7 @@ class SessionBank:
                     "budget": int(self.per_session_max_bytes),
                 }
             )
+            self._record_oversized_skip(session_id, tokens, int(entry_nbytes))
             return None
         entry = SessionBankEntry(
             token_ids=tokens,
@@ -868,6 +1167,7 @@ class SessionBank:
             self._schedule_snapshot_settle(entry, timing_out=timing_out)
         self._enqueue_cold_entry(entry, timing_out=timing_out)
         self._entries[tokens] = entry
+        self._release_stale_session_leases(entry)
         self._supersede_contained_prefixes(tokens)
         self._evict_if_needed(protected_tokens=tokens)
         return entry
@@ -921,6 +1221,7 @@ class SessionBank:
                     "budget": int(self.per_session_max_bytes),
                 }
             )
+            self._record_oversized_skip(session_id, tokens, int(entry_nbytes))
             return None
         snapshot = CacheSnapshot(
             states=tuple(_clone_tree(item) for item in cache_snapshot.states),
@@ -952,9 +1253,57 @@ class SessionBank:
         )
         self._enqueue_cold_entry(entry)
         self._entries[tokens] = entry
+        self._release_stale_session_leases(entry)
         self._supersede_contained_prefixes(tokens)
         self._evict_if_needed(protected_tokens=tokens)
         return entry
+
+    def shares_ram_prefix(
+        self, token_ids: list[int] | tuple[int, ...], *, min_tokens: int
+    ) -> bool:
+        """Whether any RAM entry shares at least ``min_tokens`` of prefix.
+
+        The cheap question a request-arrival optimisation needs: will the
+        prefill start at token 0, or will a restore (exact, near, or block
+        prefix -- any of them begins by matching this many tokens) move its
+        start past the first chunk?  One tuple-slice compare per entry, no
+        cold-tier scan, no lookup side effects.
+        """
+        n = max(1, int(min_tokens))
+        if len(token_ids) < n:
+            return False
+        head = tuple(int(token) for token in token_ids[:n])
+        for prefix in self._entries:
+            if len(prefix) >= n and prefix[:n] == head:
+                return True
+        return False
+
+    def longest_shared_prefix_tokens(
+        self,
+        token_ids: list[int] | tuple[int, ...],
+        *,
+        session_id: str | None = None,
+    ) -> int:
+        """Longest common prefix, in tokens, between ``token_ids`` and any RAM
+        entry (optionally only this session's entries).
+
+        The restore path serves prompts that no entry is an exact prefix of:
+        a block-prefix restore rewinds to the last safe boundary under the
+        common prefix and re-prefills the tail (an agent follow-up after a
+        forced tool round, a retokenized tail). A memory estimate that asks
+        only ``longest_prefix`` (exact containment) reads 0 for such prompts
+        and calls the session compacted. One compare per entry, no cold-tier
+        scan, no lookup side effects.
+        """
+        tokens = tuple(int(token) for token in token_ids)
+        best = 0
+        for prefix, entry in self._entries.items():
+            if session_id is not None and entry.session_id != session_id:
+                continue
+            matched = common_prefix_len(tokens, prefix)
+            if matched > best:
+                best = matched
+        return best
 
     def longest_prefix(self, token_ids: list[int] | tuple[int, ...]) -> SessionBankEntry | None:
         tokens = tuple(int(token) for token in token_ids)
@@ -1149,6 +1498,19 @@ class SessionBank:
         # The bar deliberately ignores incompatible/lease-only RAM entries
         # (they cannot serve, so they must not shadow a valid cold row).
         ram_best_matched = int(serve_compatible_best_matched)
+        if floor > 0:
+            # The caller's own gate discards every near/block candidate with
+            # matched <= min_restore_tokens (its exact-prefix RAM entry
+            # already serves that much), so a cold row at or below the floor
+            # can never be served through this lane -- hydrating it is a
+            # multi-GB SSD decode on the request thread for a candidate the
+            # sort discards unread. Measured 0.59-0.66 s of unattributed
+            # prompt-state wall on EVERY warm agent turn (py-spy on the
+            # 2026-09-03 candidate daemon: the exact entry was skipped by
+            # the `_cand <= floor` guard above, so the bar read 0 and the
+            # same turn's own SSD twin hydrated each time). Strictly-better
+            # cold rows and cold-only recovery (floor 0) are unchanged.
+            ram_best_matched = max(ram_best_matched, floor + 1)
         cold_match = self._cold_near_prefix_candidate(
             tokens,
             max_token_gap=gap_limit,
@@ -1291,6 +1653,17 @@ class SessionBank:
             draft_head_identity=metadata.get("draft_head_identity"),
             policy_fingerprint=metadata.get("policy_fingerprint"),
             mtp_history_snapshot=_clone_tree(record.mtp_history_snapshot),
+            cache_snapshot_prefix_len=(
+                int(record.cache_snapshot_prefix_len)
+                if getattr(record, "cache_snapshot_prefix_len", None) is not None
+                else None
+            ),
+            mtp_history_snapshot_prefix_len=(
+                int(record.mtp_history_snapshot_prefix_len)
+                if getattr(record, "mtp_history_snapshot_prefix_len", None)
+                is not None
+                else None
+            ),
             snapshot_epoch=int(metadata.get("snapshot_epoch") or len(record.token_ids)),
             mtp_snapshot_epoch=(
                 int(metadata["mtp_snapshot_epoch"])
@@ -1307,6 +1680,46 @@ class SessionBank:
         setattr(entry, "ssd_cached_tokens", matched)
         setattr(entry, "ssd_restore_s", float(getattr(record, "restore_s", 0.0) or 0.0))
         return entry, matched
+
+    def _record_oversized_skip(
+        self, session_id: str | None, tokens: tuple[int, ...] | list[int], nbytes: int
+    ) -> None:
+        record = {
+            "session_id": session_id,
+            "prefix_len": len(tokens),
+            "token_hash": token_prefix_hash(tokens),
+            "nbytes": int(nbytes),
+            "budget": int(self.per_session_max_bytes),
+            "at_s": time.time(),
+        }
+        self._oversized_skips[session_id] = record
+        self.last_oversized_skip = dict(record)
+
+    def _oversized_skip_covering(
+        self, session_id: str | None, token_ids: list[int] | tuple[int, ...]
+    ) -> dict[str, Any] | None:
+        record = self._oversized_skips.get(session_id)
+        if record is None:
+            return None
+        n = int(record["prefix_len"])
+        tokens = tuple(int(token) for token in token_ids)
+        if len(tokens) < n or token_prefix_hash(tokens[:n]) != record["token_hash"]:
+            return None
+        return record
+
+    def _note_oversized_miss(
+        self, session_id: str | None, token_ids: list[int] | tuple[int, ...]
+    ) -> bool:
+        """A miss on a conversation whose snapshot was refused for size is
+        reported as that refusal, not as the cold tier's prefix miss."""
+        record = self._oversized_skip_covering(session_id, token_ids)
+        if record is None:
+            return False
+        self.last_miss_reason = CacheMissReason.OVERSIZED_SNAPSHOT_SKIPPED.value
+        if self.last_prefix_diagnostic is not None:
+            self.last_prefix_diagnostic["miss_reason"] = self.last_miss_reason
+            self.last_prefix_diagnostic["oversized_skip"] = dict(record)
+        return True
 
     def restore(
         self,
@@ -1491,18 +1904,21 @@ class SessionBank:
         # restore must land on a token where the recurrent state is *known*,
         # not merely where the KV can trim. Restoring KV to `matched` while
         # recurrent state stays at the stored end silently degrades answers
-        # (Desktop QA, pre-v2). Tiny gaps (<= near-prefix gap limit) keep the
-        # long-shipped tokenizer-drift tolerance; anything larger requires a
-        # stored boundary <= matched and restores there instead, with the
-        # caller re-prefilling (boundary, prompt_end].
+        # (Desktop QA, pre-v2). The attention KV can be trimmed exactly for
+        # any gap; the GDN/conv state cannot be trimmed at all, so on a
+        # recurrent entry EVERY partial restore -- including the 1-8 token
+        # "tokenizer drift" seams a re-rendered agent turn produces -- must
+        # land on a stored recurrent boundary <= matched, with the caller
+        # re-prefilling (boundary, prompt_end]. Until 2026-09-08 gaps up to
+        # the near-prefix limit kept the KV-only tolerance on hybrid entries
+        # too, which decoded the whole turn on GDN state that had consumed up
+        # to eight tokens the new prompt does not contain plus one token
+        # twice (three audits reproduced it; the tolerance only ever held on
+        # attention-only models, where the trim IS the boundary).
         restore_point = matched
         boundary_snapshot: CacheSnapshot | None = None
         boundary_hidden: Any | None = None
-        gap_from_entry = int(entry.prefix_len) - matched
-        needs_boundary = (
-            bool(entry.has_recurrent)
-            and gap_from_entry > _near_prefix_tiny_gap_limit()
-        )
+        needs_boundary = bool(entry.has_recurrent)
         if needs_boundary:
             boundary = entry.recurrent_boundary_at_or_below(matched)
             if boundary is None:
@@ -1531,17 +1947,66 @@ class SessionBank:
                     )
                     return None
 
+        # A cold block-prefix candidate can represent the long entry's token
+        # identity while only hydrating KV blocks through the safe restore
+        # point.  Never ask restore_cache to trim bytes that were purposely
+        # not read from SSD; a malformed partial record fails closed.
+        cache_snapshot_prefix_len = int(
+            getattr(entry, "cache_snapshot_prefix_len", None)
+            or entry.prefix_len
+        )
+        mtp_prefix_recorded = getattr(
+            entry, "mtp_history_snapshot_prefix_len", None
+        )
+        mtp_snapshot_prefix_len = (
+            int(mtp_prefix_recorded)
+            if mtp_prefix_recorded is not None
+            else int(entry.prefix_len)
+        )
+        required_cache_prefix_len = (
+            restore_point if boundary_snapshot is not None else restore_point - 1
+        )
+        if cache_snapshot_prefix_len < required_cache_prefix_len:
+            self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
+            return None
+        if (
+            entry.mtp_history_snapshot is not None
+            and mtp_snapshot_prefix_len < max(0, restore_point - 1)
+        ):
+            self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
+            return None
+
         actual_restore_mode = "clone"
-        mtp_history_trim_tokens = max(0, int(entry.prefix_len) - restore_point)
+        if mtp_prefix_recorded is None:
+            # Legacy full and live-reference snapshots are trimmed by the
+            # prompt-prefix gap.  Their physical MTP offset may be windowed,
+            # so it cannot be treated as an absolute token position.
+            mtp_history_trim_tokens = max(
+                0, int(entry.prefix_len) - restore_point
+            )
+        else:
+            # Prefix-decoded committed MTP history records its physical span.
+            # It is built from prompt_ids[1:], so a boundary at N retains N-1
+            # history rows and needs no further trim when decoded to that size.
+            mtp_history_trim_tokens = max(
+                0, mtp_snapshot_prefix_len - max(0, restore_point - 1)
+            )
         # Boundary restores land the KV at the full boundary (no seed forward
         # will run — it would advance recurrent state past the captured
         # boundary a second time). Non-boundary restores keep the seed-forward
         # slot semantics.
-        trim_to_target = (
-            (lambda c: _trim_cache_ref_to_tokens(c, restore_point))
-            if boundary_snapshot is not None
-            else (lambda c: _trim_cache_ref_to_prefix(c, restore_point))
-        )
+        if cache_snapshot_prefix_len == required_cache_prefix_len:
+            # The cold decoder supplied precisely the state this consumer
+            # needs.  Calling the legacy trim here would remove valid KV rows
+            # (or demand an absent long tail) after a partial hydration.
+            def trim_to_target(_cache: list[Any]) -> bool:
+                return True
+        else:
+            trim_to_target = (
+                (lambda c: _trim_cache_ref_to_tokens(c, restore_point))
+                if boundary_snapshot is not None
+                else (lambda c: _trim_cache_ref_to_prefix(c, restore_point))
+            )
         # Passive-probe maintenance splits: CPU-side perf_counter spans only,
         # written into the caller-owned served_out dict (request-local, same
         # non-shared contract as put's timing_out). No evaluation points are
@@ -1585,7 +2050,18 @@ class SessionBank:
             # Overwrite recurrent (non-trimmable) states with the interior
             # boundary capture; trimmable entries are None in these snapshots.
             _overwrite_started = time.perf_counter()
-            restore_cache(cache, boundary_snapshot, restore_meta_state=False)
+            restore_cache(
+                cache,
+                boundary_snapshot,
+                # Prefix-decoded cold entries intentionally omitted the
+                # full-entry meta state.  Their recurrent metadata must come
+                # from the selected boundary together with its state.  A
+                # custom factory only changes how the target cache is made;
+                # it must not suppress this boundary-specific metadata.
+                restore_meta_state=(
+                    getattr(entry, "cache_snapshot_prefix_len", None) is not None
+                ),
+            )
             if _mnt is not None:
                 _mnt["recurrent_overwrite_s"] = (
                     time.perf_counter() - _overwrite_started
@@ -1634,8 +2110,13 @@ class SessionBank:
         )
 
     def clear(self, *, session_id: str | None = None) -> int:
+        # Cleared entries let go of their live caches like evicted ones do
+        # (see _evict_entry): /admin/cache/clear and the admission shed's
+        # superseded-session clear are both expected to give memory back.
         if session_id is None:
             count = len(self._entries)
+            for entry in list(self._entries.values()):
+                entry.release_live_refs()
             self._entries.clear()
             return count
         victims = [
@@ -1644,7 +2125,9 @@ class SessionBank:
             if entry.session_id == session_id
         ]
         for tokens in victims:
-            self._entries.pop(tokens, None)
+            entry = self._entries.pop(tokens, None)
+            if entry is not None:
+                entry.release_live_refs()
         return len(victims)
 
     def archive_cold_tier(self) -> dict[str, Any]:
@@ -1670,11 +2153,26 @@ class SessionBank:
             "effective_max_bytes": self.effective_max_bytes(),
             "dynamic_ceiling_bytes": self.last_dynamic_ceiling_bytes,
             "dynamic_ceiling_errors": self.dynamic_ceiling_errors,
+            # Engagement receipt for MTPLX_SESSION_BANK_PROTECTED_TERMINAL: a lane
+            # that reads flat in an A/B must still be able to prove it ran.
+            "protect_newest_extending": bool(self.protect_newest_extending),
+            "protected_rejections": int(self.protected_rejections),
+            # MTPLX_SESSION_BANK_SHED_BOUNDARIES: boundary_shed_puts > 0 is the
+            # proof that entries which used to be refused wholesale are now
+            # being admitted with a reduced boundary set.
+            "shed_gdn_boundaries_to_fit": bool(self.shed_gdn_boundaries_to_fit),
+            "boundary_shed_puts": int(self.boundary_shed_puts),
+            "boundary_shed_records": int(self.boundary_shed_records),
             "per_session_max_bytes": self.per_session_max_bytes,
             "idle_ttl_s": self.idle_ttl_s,
             "entries": len(self._entries),
             "total_nbytes": self.total_nbytes,
+            # #456: leases were invisible here ("entries: 4, total_nbytes: 0"
+            # was the only outside sign of a pinned paged KV per turn).
+            "lease_entries": self.lease_entries,
+            "lease_nbytes": self.lease_nbytes,
             "last_miss_reason": self.last_miss_reason,
+            "last_oversized_skip": self.last_oversized_skip,
             "last_restore_source": self.last_restore_source,
             "last_ssd_restore_s": self.last_ssd_restore_s,
             "last_prefix_diagnostic": self.last_prefix_diagnostic,
@@ -1700,6 +2198,7 @@ class SessionBank:
                     "policy_fingerprint": entry.policy_fingerprint,
                     "hits": entry.hits,
                     "nbytes": entry.nbytes,
+                    "held_nbytes": entry.held_nbytes,
                     "created_at_s": entry.created_at_s,
                     "last_access_s": entry.last_access_s,
                     "has_live_ref": entry.cache_ref is not None,
@@ -1714,7 +2213,9 @@ class SessionBank:
                         for record in (getattr(entry, "gdn_boundaries", None) or [])
                     ],
                 }
-                for entry in sorted(self._entries.values(), key=lambda item: item.prefix_len)
+                for entry in sorted(
+                    list(self._entries.values()), key=lambda item: item.prefix_len
+                )
             ],
             "eviction_log": list(self.eviction_log)[-16:],
         }
@@ -1902,6 +2403,29 @@ class SessionBank:
                 time.perf_counter() - sync_started
             )
 
+    def _hydrate_boundaries_for_persistence(self, entry: SessionBankEntry) -> None:
+        """Boundary hydration for the idle-lane persistence jobs.
+
+        It runs on the model-owner thread like the encode that follows it, so
+        it polls the cold tier's foreground signal between records and raises
+        ColdEncodeInterrupted for the job's re-dispatch. Tiers without the
+        accessor (test doubles, older tiers) hydrate uninterrupted.
+        """
+        should_abort: Callable[[], bool] | None = None
+        accessor = getattr(self.cold_tier, "encode_should_abort", None)
+        if callable(accessor):
+            try:
+                should_abort = accessor()
+            except Exception:
+                should_abort = None
+        try:
+            entry._ensure_boundaries_loaded(should_abort=should_abort)
+        except ColdEncodeInterrupted:
+            note = getattr(self.cold_tier, "note_encode_yield", None)
+            if callable(note):
+                note()
+            raise
+
     def _cold_enqueue_job(
         self, entry: SessionBankEntry, put_entry: Callable[..., Any]
     ) -> None:
@@ -1911,7 +2435,6 @@ class SessionBank:
         # silently downgrade its whole lineage on the next restart — so
         # hydrate first. Runs on the postcommit/idle lane; the loader fails
         # closed on a corrupt payload.
-        entry._ensure_boundaries_loaded()
         capabilities = ["ar_insert"]
         if entry.logits is not None and entry.hidden is not None:
             capabilities.append("mtp_full")
@@ -1926,6 +2449,10 @@ class SessionBank:
             and int(entry.nbytes) >= int(spill_threshold)
         )
         try:
+            # Hydration is part of the same owner-thread job, so it takes the
+            # same foreground signal and the same re-dispatch as the encode
+            # (issue #505: it ran before the try, unchecked).
+            self._hydrate_boundaries_for_persistence(entry)
             try:
                 if use_spill:
                     stored = spill(
@@ -2045,10 +2572,12 @@ class SessionBank:
             return False
         try:
             snapshot = snapshot_cache_lazy_hybrid(entry.cache_ref)
+            # Either form of the draft history goes to disk: without it a
+            # committed-policy restore refuses the record (#499).
             mtp_snapshot = (
                 snapshot_cache_lazy_hybrid(entry.mtp_history_cache_ref)
                 if entry.mtp_history_cache_ref is not None
-                else None
+                else entry.mtp_history_snapshot
             )
         except RuntimeError as exc:
             # e.g. the paged long-context guard refuses to materialize
@@ -2064,20 +2593,20 @@ class SessionBank:
                 }
             )
             return False
-        entry._ensure_boundaries_loaded()
-        view = replace(
-            entry,
-            cache_snapshot=snapshot,
-            mtp_history_snapshot=mtp_snapshot,
-            nbytes=int(entry.oversized_nbytes or 0),
-            live_ref_only=False,
-            cache_ref=None,
-            mtp_history_cache_ref=None,
-        )
-        capabilities = ["ar_insert"]
-        if view.logits is not None and view.hidden is not None:
-            capabilities.append("mtp_full")
         try:
+            self._hydrate_boundaries_for_persistence(entry)
+            view = replace(
+                entry,
+                cache_snapshot=snapshot,
+                mtp_history_snapshot=mtp_snapshot,
+                nbytes=int(entry.oversized_nbytes or 0),
+                live_ref_only=False,
+                cache_ref=None,
+                mtp_history_cache_ref=None,
+            )
+            capabilities = ["ar_insert"]
+            if view.logits is not None and view.hidden is not None:
+                capabilities.append("mtp_full")
             stored = spill(view, capabilities=capabilities, raise_on_yield=True)
         except ColdEncodeInterrupted:
             # A foreground request arrived mid-encode. Re-dispatch for the
@@ -2126,9 +2655,11 @@ class SessionBank:
         policy_fingerprint: str | None,
     ) -> SessionBankRestore | None:
         if self.cold_tier is None:
+            self._note_oversized_miss(session_id, token_ids)
             return None
         lookup = getattr(self.cold_tier, "lookup", None)
         if not callable(lookup):
+            self._note_oversized_miss(session_id, token_ids)
             return None
         record = lookup(
             token_ids,
@@ -2156,6 +2687,7 @@ class SessionBank:
                 self.last_miss_reason = str(cold_miss)
                 if self.last_prefix_diagnostic is not None:
                     self.last_prefix_diagnostic["miss_reason"] = self.last_miss_reason
+            self._note_oversized_miss(session_id, token_ids)
             return None
         if hidden_variant is not None and (
             getattr(record, "logits", None) is None
@@ -2218,6 +2750,9 @@ class SessionBank:
         entry.hits += 1
         entry.last_access_s = time.time()
         self._entries[entry.token_ids] = entry
+        # The session is being served from disk into a fresh cache: any
+        # lease it still holds pins a cache this turn is not using (#456).
+        self._release_stale_session_leases(entry)
         self._evict_if_needed(protected_tokens=entry.token_ids)
         self.last_restore_source = "ssd"
         self.last_ssd_restore_s = float(getattr(record, "restore_s", 0.0) or 0.0)
@@ -2266,6 +2801,47 @@ class SessionBank:
             if entry.session_id == session_id
         )
 
+    def _release_stale_session_leases(self, newest: SessionBankEntry) -> None:
+        """A session keeps at most one lease: the one just committed (#456).
+
+        A lease exists because the snapshot alone is over the per-session byte
+        budget, so two of them are the session holding at least twice its
+        budget. And the older one is dead weight by construction: a lease is
+        single-use, and a session that commits again either consumed it (the
+        entry is an empty shell now, still holding its boundary records) or
+        could not use it and prefilled into a NEW cache, in which case the old
+        lease pins a whole paged KV that nothing will ever read. That second
+        case leaked one cache per turn: leases were exempt from supersede in
+        both directions and from per-session retention, and recorded 0 bytes,
+        so no budget could see them either. Measured on a 64 GB M4 Max: +3.7
+        GiB of active memory per turn with ``entries: 4, total_nbytes: 0``.
+
+        Called at INSERTION, never at consumption. ``put()`` inherits recurrent
+        boundary records from the longest stored prefix, and between turns that
+        prefix is the consumed lease; dropping it earlier would strip the next
+        entry's records and push a divergent turn onto a cold prefill.
+
+        Sessions without an id are left to the byte budget, which now counts
+        leases (``total_nbytes``): an agent compaction mints a new id, and
+        unrelated anonymous conversations must not release each other's state.
+        A forked conversation under one session id loses the older fork's
+        lease; that fork falls back to its durable entries, the SSD tier, or a
+        prefill. The alternative is the over-commit this replaces.
+        """
+
+        session_id = newest.session_id
+        if not session_id:
+            return
+        stale = [
+            entry
+            for entry in self._entries.values()
+            if entry is not newest
+            and entry.live_ref_only
+            and entry.session_id == session_id
+        ]
+        for entry in stale:
+            self._evict_entry(entry, reason="superseded_session_lease")
+
     def _supersede_contained_prefixes(self, tokens: tuple[int, ...]) -> None:
         """Evict RAM entries that are strict token-prefixes of a new entry.
 
@@ -2311,6 +2887,19 @@ class SessionBank:
             and entry.hidden_variant == container.hidden_variant
         ]
         for entry in victims:
+            if container.has_recurrent:
+                # Token containment alone is not state coverage. A recurrent
+                # container with only a 2K checkpoint cannot replace an exact
+                # 16K entry; doing so turned Hermes' next tool turn into a
+                # 31K re-prefill. Keep the smaller entry unless every restore
+                # point it supplies is present in the container as well.
+                points = [entry.prefix_len, *(int(r[0]) for r in entry.gdn_boundaries)]
+                if entry.gdn_boundary_loader is not None or any(
+                    (boundary := container.recurrent_boundary_at_or_below(point)) is None
+                    or int(boundary[0]) != point
+                    for point in points
+                ):
+                    continue
             self._evict_entry(entry, reason="superseded_by_longer_prefix")
         self._enforce_session_entry_retention(
             container.session_id, protected_tokens=tokens
@@ -2343,6 +2932,72 @@ class SessionBank:
         )
         for entry in entries[cap:]:
             self._evict_entry(entry, reason="session_entry_retention")
+
+    def _shed_boundaries_to_fit(
+        self,
+        boundaries: list[tuple[int, CacheSnapshot, Any]],
+        entry_nbytes: int,
+    ) -> tuple[list[tuple[int, CacheSnapshot, Any]], int, int]:
+        """Drop boundary records until the entry fits its per-session budget.
+
+        Returns ``(kept, nbytes, shed_count)``. ``kept`` keeps the input's
+        ascending-position ordering, so callers see the same shape they passed.
+
+        Records are dropped FURTHEST-FROM-THE-TAIL first, and the newest record
+        is never dropped while any is kept. That is deliberately not
+        ``generation._thin_gdn_boundary_records``'s geometric policy, which
+        preserves a deep-divergence anchor: under byte pressure the anchor is
+        the first thing that has to go, because agent divergence concentrates
+        near the prompt tail (the same reason MTPLX_GDN_BOUNDARY_TAIL_INTERVAL
+        gives the final chunk a finer grid). The trade is explicit: a
+        deep-divergence match may find no boundary at or below it and fail
+        closed to a cold prefill -- which is exactly what it does TODAY, when
+        the whole entry is refused. Shedding is never worse and is usually the
+        difference between a 0.5 s restore and a 15.8 s re-prefill.
+
+        Shedding stops at zero records: an entry whose BASE snapshot already
+        exceeds the budget is still refused by the caller, unchanged.
+        """
+
+        budget = int(self.per_session_max_bytes)
+        sizes = [
+            _snapshot_nbytes(record[1]) + _tree_nbytes(record[2])
+            for record in boundaries
+        ]
+        total = int(entry_nbytes)
+        kept = list(boundaries)
+        kept_sizes = list(sizes)
+        shed = 0
+        # kept/kept_sizes are sorted ascending by position (put normalizes
+        # them), so index 0 is the record furthest from the tail.
+        while kept and total > budget:
+            total -= kept_sizes.pop(0)
+            kept.pop(0)
+            shed += 1
+        return kept, int(total), int(shed)
+
+    def _newest_extending_entry(
+        self, tokens: tuple[int, ...] | None
+    ) -> SessionBankEntry | None:
+        """The newest banked entry that STRICTLY extends ``tokens``.
+
+        Port of oMLX ``_newest_extending_entry`` (exact_resident.py:87-103):
+        insertion recency wins, deliberately NOT length -- a longer but older
+        branch of a diverged transcript is not the branch the client is on.
+        ``self._entries`` is a plain dict, so ``reversed()`` is newest-first by
+        insertion for exactly the same reason oMLX's is.
+
+        Returns None when the gate is off, so the whole rule costs one boolean
+        read on the default path.
+        """
+
+        if not self.protect_newest_extending or not tokens:
+            return None
+        width = len(tokens)
+        for key, entry in reversed(self._entries.items()):
+            if len(key) > width and key[:width] == tokens:
+                return entry
+        return None
 
     def _evict_if_needed(self, *, protected_tokens: tuple[int, ...] | None = None) -> None:
         while True:
@@ -2404,8 +3059,30 @@ class SessionBank:
                         candidates = idle
             victim = min(
                 candidates,
-                key=lambda entry: (entry.last_access_s, -entry.nbytes, entry.created_at_s),
+                key=lambda entry: (
+                    entry.last_access_s,
+                    -entry.held_nbytes,
+                    entry.created_at_s,
+                ),
             )
+            terminal = self._newest_extending_entry(protected_tokens)
+            if terminal is not None and victim is terminal and len(candidates) > 1:
+                # Protected-terminal rule (see _protected_terminal_enabled):
+                # the shorter fallback being published must not be what evicts
+                # the newest terminal extending it. Order only -- if the
+                # terminal is the LAST candidate standing it is still evicted,
+                # because the budget has to be met and refusing here would
+                # spin this loop forever.
+                self.protected_rejections += 1
+                candidates = [entry for entry in candidates if entry is not terminal]
+                victim = min(
+                    candidates,
+                    key=lambda entry: (
+                        entry.last_access_s,
+                        -entry.held_nbytes,
+                        entry.created_at_s,
+                    ),
+                )
             self._evict_entry(victim, reason=reason)
 
     def shrink_to_bytes(
@@ -2453,7 +3130,7 @@ class SessionBank:
                 key=lambda entry: (
                     entry.session_id in active,
                     entry.last_access_s,
-                    -entry.nbytes,
+                    -entry.held_nbytes,
                     entry.created_at_s,
                 ),
             )
@@ -2470,13 +3147,135 @@ class SessionBank:
             evicted += 1
         return evicted
 
+    def shrink_for_admission(
+        self,
+        target_bytes: int,
+        *,
+        protect_tokens: list[int] | tuple[int, ...] | None = None,
+        reason: str = "prefill_admission_chain",
+    ) -> tuple[int, int]:
+        """Escalating eviction for the admission shed (#447).
+
+        Runs only when the pre-prefill projection says the request in front
+        of us is likely to die on the sustained-pressure abort, after the
+        superseded clear and the ``protect_active`` LRU pass both came up
+        short: a deep session's sibling snapshots — forked generations of
+        the same conversation whose retokenized histories diverge, so
+        ``_supersede_contained_prefixes`` never collapses them — are all
+        active-protected there. A 12.6 GiB bank served a 7 GiB deficit
+        with zero evictions and the request 507'd.
+
+        Phase 1 walks non-terminal entries (any session keeps its highest
+        ``prefix_len`` entry — the one the protected-terminal order guards).
+        Phase 2, only if the deficit stands, takes remaining entries in the
+        take-anything order of real memory pressure (active sessions last).
+        Both phases spare the entry the imminent prompt restores from
+        (``protect_tokens``), and every eviction is RAM-only: the SSD cold
+        tier still restores a walked entry, so the worst case is a disk
+        read on some session's next turn, not this request's abort.
+        Returns ``(non_terminal_evicted, terminal_evicted)``.
+        """
+        target = max(0, int(target_bytes))
+        protected_keys: set[tuple[int, ...]] = set()
+        if protect_tokens:
+            tokens = tuple(int(token) for token in protect_tokens)
+            best_key = None
+            best_common = 0
+            for key, entry in self._entries.items():
+                common = common_prefix_len(tokens, entry.token_ids)
+                if common > best_common:
+                    best_common = common
+                    best_key = key
+            if best_key is not None:
+                protected_keys.add(best_key)
+
+        def _walk(candidates_fn, order_key) -> int:
+            evicted = 0
+            while self._entries and self.total_nbytes > target:
+                candidates = candidates_fn()
+                if not candidates:
+                    break
+                victim = min(candidates, key=order_key)
+                before = len(self._entries)
+                self._evict_entry(victim, reason=reason)
+                if len(self._entries) >= before:
+                    break
+                evicted += 1
+            return evicted
+
+        def _evictable(entry) -> bool:
+            # Entries holding a live cache reference are the live session's
+            # own arrays (the same bar _supersede_contained_prefixes sets);
+            # walking one frees nothing and costs the running session its
+            # state. Measured: the first decode after such an eviction ran
+            # at 15 tok/s against 63 stock.
+            return entry.cache_ref is None and not entry.live_ref_only
+
+        def _evictable_under_deficit(entry) -> bool:
+            # Phase 2 only (#456). The bar above protects the session that is
+            # about to restore, and ``protected_keys`` already names that
+            # entry. Every OTHER lease pins a cache no running request reads:
+            # a restore takes the reference away from its entry, so a session
+            # that is generating holds none. Those leases were the memory the
+            # shed could not reach ("bank 0, nothing sheddable", then a 507
+            # that only a restart cleared). Releasing one costs that session
+            # a disk restore or a prefill on its next turn.
+            return _evictable(entry) or entry.live_ref_only
+
+        def _non_terminal_candidates():
+            terminal: dict[str, int] = {}
+            for entry in self._entries.values():
+                lineage = entry.session_id or ""
+                if entry.prefix_len > terminal.get(lineage, -1):
+                    terminal[lineage] = entry.prefix_len
+            return [
+                entry
+                for key, entry in self._entries.items()
+                if key not in protected_keys
+                and _evictable(entry)
+                and entry.prefix_len < terminal.get(entry.session_id or "", -1)
+            ]
+
+        non_terminal = _walk(
+            _non_terminal_candidates,
+            lambda entry: (
+                entry.last_access_s,
+                -entry.held_nbytes,
+                entry.created_at_s,
+            ),
+        )
+        if self.total_nbytes <= target:
+            return non_terminal, 0
+
+        active = self._active_session_ids()
+        terminal_evicted = _walk(
+            lambda: [
+                entry
+                for key, entry in self._entries.items()
+                if key not in protected_keys and _evictable_under_deficit(entry)
+            ],
+            lambda entry: (
+                entry.session_id in active,
+                entry.last_access_s,
+                -entry.held_nbytes,
+                entry.created_at_s,
+            ),
+        )
+        return non_terminal, terminal_evicted
+
     def _evict_entry(self, entry: SessionBankEntry, *, reason: str) -> None:
         entry.eviction_reason = reason
+        # Read before the references go: this is what the eviction gives back.
+        held_nbytes = int(entry.held_nbytes)
         if self._entries.pop(entry.token_ids, None) is None:
             for key, value in list(self._entries.items()):
                 if value is entry:
                     self._entries.pop(key, None)
                     break
+        # An evicted entry can never be restored from the bank again, but the
+        # object can outlive the dict (a finished request's outcome points at
+        # it). Without this an "evicted" lease kept its paged KV allocated.
+        entry.release_live_refs()
         self.eviction_log.append(
             {
                 "reason": reason,
@@ -2484,6 +3283,8 @@ class SessionBank:
                 "prefix_len": entry.prefix_len,
                 "token_hash": entry.token_hash,
                 "nbytes": entry.nbytes,
+                "held_nbytes": held_nbytes,
+                "live_ref_only": bool(entry.live_ref_only),
                 "last_access_s": entry.last_access_s,
                 "session_active": bool(
                     entry.session_id

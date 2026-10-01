@@ -381,3 +381,37 @@ def test_max_status_without_mlx(tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stderr
     payload = json.loads(proc.stdout)
     assert "detection" in payload
+
+
+def test_gc_without_mlx(tmp_path: Path) -> None:
+    """``mtplx gc`` is a maintenance command for a store that may be full
+    when MLX itself is broken (#493): it must never import the tensor codec."""
+    bank = tmp_path / "session-bank"
+    orphan = bank / "blobs" / "ab" / ("ab" + "c" * 62 + ".bin")
+    orphan.parent.mkdir(parents=True)
+    orphan.write_bytes(b"x" * 4096)
+    proc = _run_no_mlx(
+        tmp_path,
+        ["-c", "import mtplx.cache_bank.reconcile; import mtplx.cache_bank; print('ok')"],
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "ok"
+
+    proc = _run_no_mlx(tmp_path, ["-m", "mtplx.cli", "gc", "--dir", str(bank), "--json"])
+    assert proc.returncode == 0, proc.stderr
+    assert "Traceback" not in proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["orphan_blob_files"] == 1
+    assert payload["orphan_blob_bytes"] == 4096
+    assert payload["deleted"] is False
+    assert orphan.exists()
+
+    proc = _run_no_mlx(
+        tmp_path,
+        ["-m", "mtplx.cli", "gc", "--dir", str(bank), "--apply", "--force", "--json"],
+    )
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["files_deleted"] == 1
+    assert not orphan.exists()
+

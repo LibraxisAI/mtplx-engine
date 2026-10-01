@@ -269,7 +269,10 @@ def qsa_indexer_prepare_queries_metal(
 
     ``raw_q`` and the result have shape ``[1,S,H,D]``.  ``pos_start`` may be
     a one-element int32 array so a compiled graph can replay at new absolute
-    positions without baking an offset into its trace.
+    positions without baking an offset into its trace.  It is a ROTARY
+    position, not a KV index: the fixed verify lane passes its bank's rotary
+    origin, which for an image request is the logical offset plus the
+    request's image delta (``graphbank.TensorOffsetQSACache.rope_offset``).
     """
 
     head_dim, rotary_dim = _validate_common(

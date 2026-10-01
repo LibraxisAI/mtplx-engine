@@ -53,7 +53,17 @@ def test_large_prefill_is_phase_gated_with_device_scoped_auto_default():
     assert "qsa_prefill_lane_auto_supported()" in enabled
     assert 'current_attention_phase() == "prefill"' in route
     assert "int(rows) >= _qsa_prefill_min_rows()" in route
-    assert "int(total_tokens) - int(rows) >= _qsa_prefill_min_context()" in route
+    # The gate reads the EARLIEST query's history.  Since 2026-09-18 the floor
+    # passes through _qsa_prefill_crossover, which may only LOWER it, and only
+    # for forwards of 2,048 rows or more (MTPLX_QSA_PREFILL_WIDE_MIN_CONTEXT).
+    assert "int(total_tokens) - int(rows) >= _qsa_prefill_floor(rows)" in route
+    assert "_qsa_prefill_crossover(rows, _qsa_prefill_min_context())" in _source(
+        _top_function("_qsa_prefill_floor")
+    )
+    crossover = _source(_top_function("_qsa_prefill_crossover"))
+    assert "int(rows) >= _QSA_PREFILL_WIDE_ROWS" in crossover
+    assert "return min(int(general), wide)" in crossover
+    assert "return int(general)" in crossover
     assert 'os.environ.get("MTPLX_QSA_PREFILL_MIN_CONTEXT") or 32768' in (
         selector_floor
     )
@@ -64,8 +74,12 @@ def test_large_prefill_is_phase_gated_with_device_scoped_auto_default():
     )
     assert "_qsa_large_prefill_enabled(rows, total_tokens)" in flash_route
     assert (
-        "int(total_tokens) - int(rows) >= _qsa_prefill_flash_min_context()"
+        "int(total_tokens) - int(rows) >= _qsa_prefill_flash_floor(rows)"
         in flash_route
+    )
+    assert (
+        "_qsa_prefill_crossover(rows, _qsa_prefill_flash_min_context())"
+        in _source(_top_function("_qsa_prefill_flash_floor"))
     )
 
 
@@ -125,13 +139,20 @@ def test_indexer_routes_large_prefill_to_compact_blocks_in_both_paths():
     assert "and (decode or S < _qsa_prefill_min_rows())" in rows
 
 
-def test_compile_capture_is_limited_to_one_canonical_prefill_width():
+def test_compile_capture_is_limited_to_the_full_chunk_widths():
+    """One canonical width, plus the family's wide prefill chunk when the lane
+    arms it (2026-09-18): two traces at most, never one per suffix tail."""
+
     supported = _source(_class_method("QSAIndexer", "_compiled_route_supported"))
     constructor = _source(_class_method("QSAIndexer", "_get_compiled_indexer_core"))
     assert (
         'mode not in ("prefill_blocks", "update_only")' in supported
-        and "rows != _qsa_prefill_compile_rows()" in supported
+        and "rows not in _qsa_prefill_compile_row_set()" in supported
     )
+    row_set = _source(_top_function("_qsa_prefill_compile_row_set"))
+    assert "rows = {_qsa_prefill_compile_rows()}" in row_set
+    assert 'os.environ.get("MTPLX_QWEN4_PREFILL_WIDE_CHUNK")' in row_set
+    assert "if wide > 2048:" in row_set
     assert 'mode == "update_only"' in supported
     assert 'current_attention_phase() == "prefill"' in supported
     assert (

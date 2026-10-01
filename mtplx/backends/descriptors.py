@@ -486,6 +486,15 @@ QWEN3_8_REASONING_CODEC = ReasoningCodec(
     effort_levels=("xhigh", "medium", "low"),
     default_effort="medium",
 )
+# Prism's Bonsai 2 card explicitly excludes low: the model behaves near
+# xhigh at that setting. Chat and agents default to medium: at xhigh the
+# 2.12.0 stopwatch task spent 577 s and 21,848 reasoning tokens without an
+# answer, and a 16 GB Mac has an 8K window.
+BONSAI2_REASONING_CODEC = replace(
+    QWEN3_8_REASONING_CODEC,
+    effort_levels=("xhigh", "medium"),
+    default_effort="medium",
+)
 # Families whose reasoning codec overrides a shared/generic lane
 # descriptor, keyed to the ONLY lanes they ride. Both conditions must
 # hold — family AND active backend — because the family sniff falls back
@@ -563,6 +572,32 @@ def sampler_defaults_for_model(
     if family == "qwen4_exp":
         return QWEN4_EXP_SAMPLER_DEFAULTS
     return resolved.sampler_defaults
+
+
+def family_settings_for_model(
+    model_ref: str | None = None,
+    inspection: dict[str, Any] | None = None,
+    descriptor: BackendDescriptor | None = None,
+) -> tuple[str, dict[str, Any] | None]:
+    """(family, its model-tuned settings block or None).
+
+    The blocks live in ``mtplx/backends/family_settings.py``: prefill chunk
+    and compiled width, score workspace, cleanup and clear cadences, KV bytes
+    per token and prewarm geometry (derived from config.json), depth-policy
+    priors, copy-lane parameters, first verify reserve, and the draft depths
+    whose verify has a compiled route. A family without a block serves the
+    shared profile values and ``mtplx doctor --explain`` says so.
+    """
+
+    from mtplx.backends.family_settings import family_settings
+
+    resolved = descriptor or descriptor_from_inspection(inspection)
+    family = model_family_from_inspection(
+        inspection,
+        model_ref=model_ref,
+        descriptor=resolved,
+    )
+    return family, family_settings(family)
 
 
 def draft_semantics_for_model(
@@ -1100,6 +1135,17 @@ def _text_markers(model_ref: str | None, inspection: dict[str, Any] | None) -> s
     return " ".join(str(part or "") for part in parts).lower()
 
 
+def _architecture_markers(inspection: dict[str, Any] | None) -> str:
+    """The identity fields a checkpoint declares about itself (config and
+    backend ids), without the folder or repo name ``_text_markers`` adds."""
+    data = {
+        key: value
+        for key, value in _inspection_dict(inspection).items()
+        if key not in ("model_dir", "runtime_model")
+    }
+    return _text_markers(None, data)
+
+
 # Stock Qwen3 sizes collide with the 3.8 version token: in "qwen3-8b" or
 # "qwen3-80b" the digit-run ending in "b" right after the token is a
 # parameter count, not a version, and must not claim the qwen3_8 family.
@@ -1111,11 +1157,23 @@ _QWEN3_8_MARKER = re.compile(r"qwen3[._-]?8(?!\d*b)")
 # contract must not claim them by name. They resolve to the generic default
 # descriptor until a dedicated qwen4 contract exists.
 _QWEN4_PREVIEW_MARKER = re.compile(r"flash[._-]?next|qwen[._-]?4")
+_BONSAI2_MARKERS = ("bonsai-2-27b", "bonsai-3.8-27b", "bonsai-38-27b")
+# The MiMo V2.6 Qwen 9B catalog pack (repo and folder names, catalog and served
+# ids) is Xiaomi's Qwen3.5-9B fine-tune. Its names carry no Qwen version token,
+# so a ref-only lookup (before the checkpoint is inspected) resolved it to
+# "unknown", or to qwen3_6 through the shared lane default. "MiMo" names the
+# publisher, not the architecture: these return qwen3_5, never the mimo family,
+# which stays keyed on the checkpoint's own architecture fields below.
+_MIMO_QWEN35_MARKERS = ("mimo-v2.6-qwen-9b", "mimo-v26-qwen-9b")
 
 
 def _explicit_qwen_family_marker(text: str) -> str | None:
     if _QWEN4_PREVIEW_MARKER.search(text):
         return None
+    if any(marker in text for marker in _BONSAI2_MARKERS):
+        return "qwen3_8"
+    if any(marker in text for marker in _MIMO_QWEN35_MARKERS):
+        return "qwen3_5"
     if _QWEN3_8_MARKER.search(text):
         return "qwen3_8"
     if "qwen3.6" in text or "qwen3_6" in text or "qwen36" in text or "qwen3-6" in text:
@@ -1155,9 +1213,13 @@ def _artifact_family_texts(model_ref: str) -> tuple[str, str]:
                 provenance = provenance if isinstance(provenance, dict) else {}
                 inputs = provenance.get("forge_inputs")
                 inputs = inputs if isinstance(inputs, dict) else {}
+                controls = data.get("model_controls")
+                controls = controls if isinstance(controls, dict) else {}
                 parts.extend(
                     str(value or "")
                     for value in (
+                        data.get("model_family"),
+                        controls.get("model_family"),
                         data.get("public_model_id"),
                         data.get("served_model_id"),
                         data.get("model_id"),
@@ -1211,6 +1273,16 @@ def model_family_from_inspection(
         return "deepseek"
     if backend_id == GLM_MTP_DESCRIPTOR.backend_id or "glm" in text:
         return "glm"
+    if "mimo" in _architecture_markers(inspection):
+        # mimo-mtp has shipped a native backend with can_run_verified since
+        # before this function existed, but no branch here ever returned its
+        # family, so every MiMo artifact resolved to "unknown" and forge build
+        # exited 1 at the tune gate after a successful convert and calibrate.
+        # Only the checkpoint's own model_type, architecture and arch ids
+        # count: Xiaomi also ships Qwen-architecture distills named MiMo
+        # (MiMo-V2.6-Distill-Qwen-9B), and a folder-name match served those
+        # on the MiMo contract, depth 1 only with reasoning off.
+        return "mimo"
     if "lfm2" in text:
         return "lfm2"
     family = _explicit_qwen_family_marker(text)
@@ -1250,6 +1322,19 @@ def tune_policy_for_model(
         return GEMMA4_ASSISTANT_DESCRIPTOR.tune_policy
     if family == "step":
         return STEP3P5_MTP_DESCRIPTOR.tune_policy
+    if family == "qwen4_exp":
+        # Qwen 3.8 Flash-Next: backend qwen4_exp, can_run_verified=True, packs
+        # record mtp_depth_max 3. The allowlist stopped at qwen3_8, so tune
+        # called the model unsupported.
+        return TunePolicy(
+            supported=True,
+            candidates=("AR", "D1", "D2", "D3"),
+        )
+    if family == "mimo":
+        # D1 only: mimo_mtp_patch.mtp_forward raises on mtp_depth > 1, and
+        # vLLM's proposer is single-token too, so offering D2+ would advertise
+        # depths the backend refuses.
+        return TunePolicy(supported=True, candidates=("AR", "D1"))
     return TunePolicy(
         supported=False,
         unsupported_reason="Tune is supported for Qwen 3.5, Qwen 3.6, Qwen 3.8, and Gemma 4 MTPLX models only.",
@@ -1340,6 +1425,11 @@ def reasoning_policy_for_model(
         descriptor=descriptor,
     )
     if family == "qwen3_8":
+        text = _text_markers(model_ref, inspection)
+        if model_ref:
+            text += " " + " ".join(_artifact_family_texts(str(model_ref)))
+        if any(marker in text for marker in _BONSAI2_MARKERS):
+            return BONSAI2_REASONING_CODEC
         return QWEN3_8_REASONING_CODEC
     if family == "qwen4_exp":
         return QWEN4_EXP_REASONING_CODEC

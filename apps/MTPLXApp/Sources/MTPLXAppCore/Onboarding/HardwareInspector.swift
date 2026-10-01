@@ -55,7 +55,7 @@ public struct HardwareInspector: Sendable {
         if let cliResult = try? await detectViaCLI() {
             return cliResult
         }
-        return detectViaSysctl()
+        return Self.detectLocalHardware()
     }
 
     // MARK: - CLI path
@@ -101,7 +101,7 @@ public struct HardwareInspector: Sendable {
     /// `ProcessInfo.physicalMemory`. Loses GPU cores and machine
     /// identifier but is sufficient for chip-tier classification and
     /// memory feasibility.
-    private func detectViaSysctl() -> DetectedHardware {
+    public static func detectLocalHardware() -> DetectedHardware {
         let chipName = Self.sysctlString("machdep.cpu.brand_string") ?? "Apple Silicon"
         let generation = Self.parseAppleSiliconGeneration(from: chipName)
         return DetectedHardware(

@@ -628,7 +628,8 @@ class MTPBatchGenerationService:
         # the same suffix delete here so the response, usage, and token_times
         # all report the trimmed truth. (The repeated tokens already went out
         # on any live stream; wire-vs-usage divergence is the same accepted
-        # trade-off as the serial holdback-free fire, generation.py F35 note.)
+        # trade-off as the serial holdback-free fire, generation.py F35 note.
+        # A long_cycle stop trims nothing: its trim_start is the row length.)
         if repetition_stop is not None:
             trim_start = max(0, min(len(job.tokens), int(repetition_stop.trim_start)))
             del job.tokens[trim_start:]
@@ -687,7 +688,7 @@ class MTPBatchGenerationService:
             ),
             "repetition_stop_triggered": repetition_stop is not None,
             "repetition_stop_reason": (
-                "exact_repeated_token_suffix" if repetition_stop is not None else None
+                str(repetition_stop.reason) if repetition_stop is not None else None
             ),
             "repetition_stop_block_tokens": (
                 0 if repetition_stop is None else int(repetition_stop.block_tokens)

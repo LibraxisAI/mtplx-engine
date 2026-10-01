@@ -68,6 +68,104 @@ public enum PortPreflight {
         }
     }
 
+    /// Issue #409 (app path): a stopping MTPLX daemon keeps its listener
+    /// while it drains, but its `/health` stops answering first, so a plain
+    /// probe reads our own draining server as `.foreign` for those few
+    /// seconds — every stop/start (and the first launch after an in-app
+    /// update, whose predecessor is still draining) then moved the
+    /// configured port to +1. Long enough to cover a normal drain, short
+    /// enough that a genuinely foreign listener does not stall a launch.
+    /// SYNC PAIR: mtplx/daemon_client.py wait_for_port_settle.
+    public static let settleTimeoutSeconds: TimeInterval = 5
+    public static let settlePollSeconds: TimeInterval = 0.25
+
+    /// `classify`, re-probed while the answer is `.foreign` until it settles
+    /// or the window closes. Any other classification is terminal and
+    /// returns immediately. Separates a TRANSIENT occupant (our own draining
+    /// server, a socket in the tail of TIME_WAIT, a listener mid-restart)
+    /// from a STEADY foreign listener that is still there after the window.
+    public static func classifySettled(
+        baseURL: URL,
+        apiKey: String?,
+        settleTimeoutSeconds: TimeInterval = settleTimeoutSeconds,
+        pollSeconds: TimeInterval = settlePollSeconds
+    ) async -> PortOccupantKind {
+        let deadline = Date().addingTimeInterval(max(0, settleTimeoutSeconds))
+        var occupant = await classify(baseURL: baseURL, apiKey: apiKey)
+        while case .foreign = occupant, Date() < deadline {
+            try? await Task.sleep(nanoseconds: UInt64(max(0.01, pollSeconds) * 1_000_000_000))
+            occupant = await classify(baseURL: baseURL, apiKey: apiKey)
+        }
+        return occupant
+    }
+
+    /// Issue #503: a daemon this app launched that wedged mid-inference
+    /// (hard freeze, reboot, kill -STOP) keeps its listening socket while
+    /// `/health` never answers, so `classify` reads it as `.foreign` and
+    /// the settle window cannot expire it. Only process identity separates
+    /// our own frozen daemon from a stranger's app: every daemon the
+    /// supervisor launches carries `MTPLX_APP_LAUNCH_ID` in its environment.
+    public struct AppOwnedListener: Equatable, Sendable {
+        public let pid: pid_t
+        public let launchID: String
+    }
+
+    /// The app-launched process holding `port`'s listening socket, if any.
+    /// Nil for a free port, a stranger's listener, a CLI-started `mtplx
+    /// serve` (no marker), or when the lookup itself fails.
+    public static func appOwnedListener(port: Int) -> AppOwnedListener? {
+        for pid in listeningProcessIDs(port: port) {
+            if let launchID = DaemonSupervisor.appLaunchID(ofProcess: pid) {
+                return AppOwnedListener(pid: pid, launchID: launchID)
+            }
+        }
+        return nil
+    }
+
+    /// PIDs with a TCP listener on `port`, via `/usr/sbin/lsof` (bounded;
+    /// empty on any failure, including lsof's exit status 1 for no match).
+    static func listeningProcessIDs(port: Int) -> [pid_t] {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        process.arguments = ["-nP", "-iTCP:\(port)", "-sTCP:LISTEN", "-t"]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        let watchdog = SubprocessWatchdog(process)
+        do {
+            try process.run()
+        } catch {
+            return []
+        }
+        let drain = SubprocessPipeDrain(output)
+        guard watchdog.wait(for: process, timeout: 10) else { return [] }
+        drain.join()
+        return drain.snapshot()
+            .split(whereSeparator: \.isNewline)
+            .compactMap { pid_t(String($0).trimmingCharacters(in: .whitespacesAndNewlines)) }
+            .filter { $0 > 1 }
+    }
+
+    /// Poll until `port` can be bound or the window closes: a reaped
+    /// listener's socket takes a moment to close.
+    public static func waitUntilBindable(
+        _ port: Int,
+        bindHost: String,
+        timeoutSeconds: TimeInterval,
+        pollSeconds: TimeInterval = 0.1
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(max(0, timeoutSeconds))
+        while true {
+            if portIsBindable(port, bindHost: bindHost) {
+                return true
+            }
+            if Date() >= deadline {
+                return false
+            }
+            try? await Task.sleep(nanoseconds: UInt64(max(0.01, pollSeconds) * 1_000_000_000))
+        }
+    }
+
     /// First port strictly after `port` that the daemon's own bind address
     /// can take. `bindHost` must be the CONFIGURED bind host: a wildcard
     /// daemon needs INADDR_ANY free, which a loopback-only check misses

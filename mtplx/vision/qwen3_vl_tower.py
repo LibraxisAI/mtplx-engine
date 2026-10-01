@@ -45,6 +45,56 @@ def resolve_vision_prefix(weight_map: dict) -> str | None:
     return None
 
 
+# A safetensors header is JSON behind an 8-byte length; the largest pack
+# header on record is under 1 MB, so anything past this is not a header.
+_MAX_SAFETENSORS_HEADER_BYTES = 64 * 1024 * 1024
+
+
+def _safetensors_header_keys(path: Path) -> list[str] | None:
+    try:
+        with path.open("rb") as handle:
+            prefix = handle.read(8)
+            if len(prefix) < 8:
+                return None
+            length = int.from_bytes(prefix, "little")
+            if length <= 0 or length > _MAX_SAFETENSORS_HEADER_BYTES:
+                return None
+            header = json.loads(handle.read(length).decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(header, dict):
+        return None
+    return [str(key) for key in header if key != "__metadata__"]
+
+
+def checkpoint_weight_map(path: str | Path) -> dict[str, str] | None:
+    """Tensor name -> shard file for a model folder.
+
+    Reads ``model.safetensors.index.json`` when the pack has one. A pack that
+    ships its weights without an index (Prism ML's Bonsai packs keep the
+    language model and the vision tower in one ``model.safetensors``) is
+    mapped from the shard headers instead; only the JSON header of each file
+    is read, never tensor data.
+    """
+    model_dir = Path(path)
+    index_path = model_dir / "model.safetensors.index.json"
+    if index_path.is_file():
+        try:
+            index = json.loads(index_path.read_text())
+        except (OSError, ValueError, UnicodeDecodeError):
+            return None
+        weight_map = index.get("weight_map") if isinstance(index, dict) else None
+        return weight_map if isinstance(weight_map, dict) else None
+    weight_map = {}
+    for shard in sorted(model_dir.glob("model*.safetensors")):
+        keys = _safetensors_header_keys(shard)
+        if keys is None:
+            return None
+        for key in keys:
+            weight_map[key] = shard.name
+    return weight_map or None
+
+
 @dataclass
 class Qwen3VLVisionConfig:
     model_type: str = "qwen3_5"
@@ -299,8 +349,9 @@ class Qwen3VLVisionTower(nn.Module):
 
         tower = cls(Qwen3VLVisionConfig.from_dict(vision_config))
 
-        index = json.loads((model_dir / "model.safetensors.index.json").read_text())
-        weight_map: dict[str, str] = index["weight_map"]
+        weight_map = checkpoint_weight_map(model_dir)
+        if weight_map is None:
+            raise ValueError(f"{model_dir} has no readable weight index or shards")
         prefix = resolve_vision_prefix(weight_map)
         if prefix is None:
             raise ValueError(

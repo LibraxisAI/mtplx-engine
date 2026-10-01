@@ -39,6 +39,8 @@ from typing import Optional, Tuple
 
 import mlx.core as mx
 
+from mtplx.demotions import note as _note_demotion
+
 _HEADER = """
 #include <metal_stdlib>
 using namespace metal;
@@ -281,6 +283,18 @@ def _timed_call(branch: str, t_len: int, fn):
     return y, s
 
 
+# Always-on engagement receipt (plain ints): how many prefill-sized GDN calls
+# took the blocked kernel, and how many took the stock path while the patch
+# was installed. Decode-sized calls (T below the route floor) are not counted
+# and pay one shape comparison.
+ROUTE_COUNTS: dict[str, int] = {"routed": 0, "stock_prefill_sized": 0}
+_NOT_ENGAGED_REASON = (
+    "a prefill-sized GDN call took the stock path: masked call, vectorized "
+    "gating, a shape outside the kernel's gate, the CPU device, or "
+    "MTPLX_GDN_BLOCKED_PREFILL_FORCE_STOCK"
+)
+
+
 def blocked_prefill_env_enabled() -> bool:
     return str(os.environ.get("MTPLX_GDN_BLOCKED_PREFILL", "")).strip().lower() in {
         "1", "true", "yes", "on",
@@ -374,6 +388,7 @@ def install_gdn_blocked_prefill_patch() -> dict:
                             )
                         except Exception:
                             pass
+                ROUTE_COUNTS["routed"] += 1
                 if component_timing:
                     return _timed_call(
                         "blocked",
@@ -394,6 +409,12 @@ def install_gdn_blocked_prefill_patch() -> dict:
                     )
                 except Exception:
                     pass
+        if q.ndim == 4 and q.shape[1] >= min_t:
+            # A prefill-sized call on the stock path while the kernel was
+            # requested. Every serve-level A/B of this kernel before
+            # 2026-07-31 was null for exactly this reason and nothing said so.
+            ROUTE_COUNTS["stock_prefill_sized"] += 1
+            _note_demotion("gdn_blocked_prefill_not_engaged", _NOT_ENGAGED_REASON)
         if component_timing and q.ndim == 4 and q.shape[1] >= min_t:
             return _timed_call(
                 "stock",

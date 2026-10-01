@@ -78,6 +78,21 @@ def test_server_parser_accepts_native_app_launch_id():
     assert args.app_launch_id == "native-123"
 
 
+def test_server_parser_accepts_ordered_retrieval_model_roots():
+    args = parse_args(
+        [
+            "--warmup-tokens",
+            "0",
+            "--retrieval-model-root",
+            "/models/archive",
+            "--retrieval-model-root",
+            "/models/external",
+        ]
+    )
+
+    assert args.retrieval_model_roots == ["/models/archive", "/models/external"]
+
+
 def test_direct_server_parser_exposes_mtp_batch_numerics():
     args = parse_args(["--mtp-batch-numerics", "b1-exact", "--warmup-tokens", "0"])
 
@@ -906,7 +921,6 @@ def test_mtp_batch_installs_qwen35b_optimized_kernel_routes_at_construction():
 
 
 _QWEN4_EXP_FAMILY_ENV_DEFAULTS = (
-    "MTPLX_AR_PIPELINE",
     "MTPLX_COMPILED_GDN",
     "MTPLX_FAMILY_CAPTURE_COMMIT",
     "MTPLX_FUSED_HC_V3",
@@ -938,12 +952,23 @@ def test_qwen4_exp_family_defaults_octet_and_nax_neutralize(tmp_path, monkeypatc
         verify_strategy="capture_commit",
         model=str(tmp_path),
     )
-    for key in (*_QWEN4_EXP_FAMILY_ENV_DEFAULTS, "MTPLX_NAX_VERIFY"):
+    for key in (
+        *_QWEN4_EXP_FAMILY_ENV_DEFAULTS,
+        "MTPLX_BATCH_TARGET_ARRAYS",
+        "MTPLX_LAZY_TARGET_DISTRIBUTIONS",
+        "MTPLX_QWEN4_BATCHED_TARGET_DISTRIBUTIONS",
+        "MTPLX_NAX_VERIFY",
+    ):
         monkeypatch.delenv(key, raising=False)
 
     overrides = openai._server_runtime_env_overrides(args, {})
     for key in _QWEN4_EXP_FAMILY_ENV_DEFAULTS:
         assert overrides.get(key) == "1", key
+    # The PR #391 lane (davidtai) is geometry-gated: a bare qwen4_exp config
+    # keeps turbo's lazy target-distribution defaults untouched, the one
+    # measured fixed-M4 geometry pins the batched pair by default (below).
+    assert "MTPLX_BATCH_TARGET_ARRAYS" not in overrides
+    assert "MTPLX_LAZY_TARGET_DISTRIBUTIONS" not in overrides
     assert overrides.get("MTPLX_NAX_VERIFY") == "0"
 
     # Every emitted key must survive the boot-time validator — the 08-27
@@ -953,22 +978,45 @@ def test_qwen4_exp_family_defaults_octet_and_nax_neutralize(tmp_path, monkeypatc
 
     assert normalize_runtime_env_overrides(overrides) == overrides
 
+    # The opt-in gate pins the batched pair, from an operator export ...
+    monkeypatch.setenv("MTPLX_QWEN4_BATCHED_TARGET_DISTRIBUTIONS", "1")
+    batched = openai._server_runtime_env_overrides(args, {})
+    assert batched.get("MTPLX_BATCH_TARGET_ARRAYS") == "1"
+    assert batched.get("MTPLX_LAZY_TARGET_DISTRIBUTIONS") == "0"
+    assert normalize_runtime_env_overrides(batched) == batched
+    # ... or from the pack contract's runtime_env_overrides.
+    monkeypatch.delenv("MTPLX_QWEN4_BATCHED_TARGET_DISTRIBUTIONS", raising=False)
+    from_pack = openai._server_runtime_env_overrides(
+        args, {"MTPLX_QWEN4_BATCHED_TARGET_DISTRIBUTIONS": "1"}
+    )
+    assert from_pack.get("MTPLX_BATCH_TARGET_ARRAYS") == "1"
+    assert from_pack.get("MTPLX_LAZY_TARGET_DISTRIBUTIONS") == "0"
+    assert normalize_runtime_env_overrides(from_pack) == from_pack
+
     # Operator env beats every family default (the launch-time export lane).
+    monkeypatch.setenv("MTPLX_QWEN4_BATCHED_TARGET_DISTRIBUTIONS", "1")
     monkeypatch.setenv("MTPLX_FUSED_GDN_STEP", "0")
+    monkeypatch.setenv("MTPLX_BATCH_TARGET_ARRAYS", "0")
+    monkeypatch.setenv("MTPLX_LAZY_TARGET_DISTRIBUTIONS", "1")
     monkeypatch.setenv("MTPLX_NAX_VERIFY", "1")
     monkeypatch.setenv("MTPLX_QSA_GATHER", "0")
     pinned = openai._server_runtime_env_overrides(args, {})
     assert "MTPLX_FUSED_GDN_STEP" not in pinned
+    assert "MTPLX_BATCH_TARGET_ARRAYS" not in pinned
+    assert "MTPLX_LAZY_TARGET_DISTRIBUTIONS" not in pinned
     assert "MTPLX_NAX_VERIFY" not in pinned
     assert "MTPLX_QSA_GATHER" not in pinned
 
-    # Non-family models get neither the octet nor the neutralize.
+    # Non-family models get neither the octet nor the neutralize, and the
+    # opt-in gate (still exported here) pins nothing outside the family.
     plain = tmp_path / "plain"
     plain.mkdir()
     (plain / "config.json").write_text(
         json.dumps({"model_type": "qwen3_next"}), encoding="utf-8"
     )
     monkeypatch.delenv("MTPLX_FUSED_GDN_STEP", raising=False)
+    monkeypatch.delenv("MTPLX_BATCH_TARGET_ARRAYS", raising=False)
+    monkeypatch.delenv("MTPLX_LAZY_TARGET_DISTRIBUTIONS", raising=False)
     monkeypatch.delenv("MTPLX_NAX_VERIFY", raising=False)
     other = openai._server_runtime_env_overrides(
         SimpleNamespace(
@@ -978,8 +1026,105 @@ def test_qwen4_exp_family_defaults_octet_and_nax_neutralize(tmp_path, monkeypatc
         ),
         {},
     )
-    for key in (*_QWEN4_EXP_FAMILY_ENV_DEFAULTS, "MTPLX_NAX_VERIFY"):
+    for key in (
+        *_QWEN4_EXP_FAMILY_ENV_DEFAULTS,
+        "MTPLX_BATCH_TARGET_ARRAYS",
+        "MTPLX_LAZY_TARGET_DISTRIBUTIONS",
+        "MTPLX_NAX_VERIFY",
+    ):
         assert key not in other, key
+
+    # The measured fixed-M4 geometry (Flash-Next) pins the batched pair by
+    # default (2026-09-02 lane flip); an explicit =0 export still wins.
+    monkeypatch.delenv("MTPLX_QWEN4_BATCHED_TARGET_DISTRIBUTIONS", raising=False)
+    flash_next = tmp_path / "flash-next"
+    flash_next.mkdir()
+    (flash_next / "config.json").write_text(
+        json.dumps(_flash_next_fixed_m4_config()), encoding="utf-8"
+    )
+    geometry_args = SimpleNamespace(
+        generation_mode="mtp",
+        verify_strategy="batched",
+        model=str(flash_next),
+    )
+    lane = openai._server_runtime_env_overrides(geometry_args, {})
+    assert lane.get("MTPLX_QWEN4_BATCHED_TARGET_DISTRIBUTIONS") == "1"
+    assert lane.get("MTPLX_BATCH_TARGET_ARRAYS") == "1"
+    assert lane.get("MTPLX_LAZY_TARGET_DISTRIBUTIONS") == "0"
+    assert lane.get("MTPLX_NAX_VERIFY") == "0"
+    assert normalize_runtime_env_overrides(lane) == lane
+    monkeypatch.setenv("MTPLX_QWEN4_BATCHED_TARGET_DISTRIBUTIONS", "0")
+    dark = openai._server_runtime_env_overrides(geometry_args, {})
+    assert "MTPLX_QWEN4_BATCHED_TARGET_DISTRIBUTIONS" not in dark
+    assert "MTPLX_BATCH_TARGET_ARRAYS" not in dark
+    assert "MTPLX_LAZY_TARGET_DISTRIBUTIONS" not in dark
+
+
+@pytest.mark.parametrize("client", ["chat", "opencode", "pi", "hermes"])
+@pytest.mark.parametrize("flash_next", [True, False])
+def test_client_launch_defaults_preserve_model_distribution_policy(
+    tmp_path, monkeypatch, client, flash_next
+):
+    """A client preset is not an operator override of the model's fast path."""
+    from mtplx.commands.public import (
+        _apply_hermes_memory_env_defaults,
+        _apply_opencode_memory_env_defaults,
+        _apply_pi_history_budget_env_defaults,
+    )
+    from mtplx.profiles import apply_profile_env
+
+    for key in tuple(os.environ):
+        if key.startswith("MTPLX_"):
+            monkeypatch.delenv(key)
+    config = _flash_next_fixed_m4_config() if flash_next else {"model_type": "qwen3_next"}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    launch_env = {}
+    if client != "chat":
+        {
+            "opencode": _apply_opencode_memory_env_defaults,
+            "pi": _apply_pi_history_budget_env_defaults,
+            "hermes": _apply_hermes_memory_env_defaults,
+        }[client](launch_env)
+    for key, value in launch_env.items():
+        monkeypatch.setenv(key, value)
+    args = SimpleNamespace(generation_mode="mtp", verify_strategy="batched", model=str(tmp_path))
+    overrides = openai._server_runtime_env_overrides(args, {})
+    apply_profile_env("turbo", environ=launch_env, runtime_env_overrides=overrides)
+    assert launch_env["MTPLX_LAZY_TARGET_DISTRIBUTIONS"] == ("0" if flash_next else "1")
+    assert launch_env["MTPLX_BATCH_TARGET_ARRAYS"] == ("1" if flash_next else "0")
+    # Removing the lazy-distribution pin alone activates this dormant
+    # launcher pin, shortens D3 to three verify rows and bypasses fixed M4.
+    assert "MTPLX_LAZY_BONUS_VERIFY" not in launch_env
+
+
+def _flash_next_fixed_m4_config() -> dict:
+    """The one measured Flash-Next geometry (qwen4_fixed_verify predicate)."""
+
+    return {
+        "model_type": "qwen4_exp",
+        "text_config": {
+            "model_type": "qwen4_exp_text",
+            "hidden_size": 2560,
+            "num_hidden_layers": 48,
+            "hc_count": 4,
+            "hc_lowrank": 320,
+            "indexer_compress_ratio": 4,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 48,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "ple_layer_ids": [2],
+            "ngram_size": 3,
+            "ngram_vocab_size_base": 20_000_000,
+            "heads_per_ngram": 8,
+            "ple_embed_dim": 2560,
+            "ngram_sidecar": True,
+            "num_experts": 512,
+            "num_experts_per_tok": 10,
+            "moe_intermediate_size": 640,
+            "vocab_size": 248_320,
+        },
+    }
 
 
 def test_server_parser_accepts_tool_prompt_and_template_profile():
@@ -1348,6 +1493,18 @@ def test_metrics_envelope_excludes_ssd_restore_from_decode_timing():
     assert envelope["decode_elapsed_s"] == 5.0
     assert envelope["decode_tok_s"] == 12.8
     assert envelope["display_decode_tok_s"] == 12.8
+
+
+def test_decode_timing_preserves_native_prompt_setup_accounting():
+    rate, seconds = openai._decode_timing({
+        "generated_tokens": 5252,
+        "elapsed_s": 140.07,
+        "prompt_eval_time_s": 13.35,
+        "prompt_state_total_time_s": 24.44,
+        "decode_elapsed_s": 115.63,
+    })
+    assert seconds == pytest.approx(115.63)
+    assert rate == pytest.approx(5252 / 115.63)
 
 
 def test_ar_batch_keeps_tool_history_turns_in_fair_lane():
@@ -1876,6 +2033,8 @@ def _fake_state(*, api_key: str | None = None, rate_limit: int = 0):
     argv = ["--warmup-tokens", "0", "--rate-limit", str(rate_limit)]
     if api_key:
         argv.extend(["--api-key", api_key])
+    # The default --model is the Qwen 3.8 27B, so the launch sampler is that
+    # family's own 1.0 / 0.95 / 20, the same values /health reports.
     args = parse_args(argv)
     return SimpleNamespace(
         args=args,
@@ -2462,7 +2621,7 @@ def test_openai_server_health_metrics_and_models_fake_state():
     assert health.json()["profile"]["model_id"] == "mtplx-test-model"
     assert health.json()["profile"]["profile_default_model_id"] != "mtplx-test-model"
     assert health.json()["profile"]["sampler"] == {
-        "temperature": 0.6,
+        "temperature": 1.0,
         "top_p": 0.95,
         "top_k": 20,
     }
@@ -2524,6 +2683,138 @@ def test_openai_server_health_profile_sampler_reports_active_override():
         "top_p": 0.95,
         "top_k": 20,
     }
+
+
+_FAMILY_SAMPLER = {"temperature": 1.0, "top_p": 0.95, "top_k": 20}
+_CODING_SAMPLER = {"temperature": 0.6, "top_p": 0.95, "top_k": 20}
+# case -> (folder, config model_type, mtplx_runtime.json, sampler served).
+# Test names stay free of family markers: pytest puts the test name in
+# tmp_path, and a marker there would decide the family instead of the pack.
+_DIRECT_BOOT_PACKS = {
+    # Bonsai 2, a Qwen 3.8-27B derivative on the prism model type, in a
+    # folder with no family marker: the pack's own runtime family decides.
+    "bonsai-2": (
+        "pack",
+        "prism_hadamard_qwen35",
+        {"model_family": "qwen3_8", "sampler": _FAMILY_SAMPLER},
+        _FAMILY_SAMPLER,
+    ),
+    "qwen-3.8-27b": (
+        "Qwen3.8-27B-MTPLX-Optimized-Speed",
+        "qwen3_5",
+        {"sampler": _FAMILY_SAMPLER},
+        _FAMILY_SAMPLER,
+    ),
+    "qwen-3.6-27b": (
+        "Qwen3.6-27B-MTPLX-Optimized-Speed",
+        "qwen3_5",
+        {"sampler": _CODING_SAMPLER},
+        _CODING_SAMPLER,
+    ),
+    # A 3.5 pack stamped 1.0 keeps the coding sampler: only a family that
+    # owns its sampler resolves one, a pack stamp alone never does.
+    "qwen-3.5-stamped-1.0": (
+        "Qwen3.5-4B-MTPLX-Optimized-Speed",
+        "qwen3_5",
+        {"sampler": _FAMILY_SAMPLER},
+        _CODING_SAMPLER,
+    ),
+}
+
+
+def _direct_boot_pack(tmp_path: Path, case: str) -> tuple[Path, dict]:
+    folder, model_type, runtime, expected = _DIRECT_BOOT_PACKS[case]
+    pack = tmp_path / folder
+    pack.mkdir()
+    (pack / "config.json").write_text(
+        json.dumps(
+            {"model_type": model_type, "text_config": {"model_type": "qwen3_5_text"}}
+        ),
+        encoding="utf-8",
+    )
+    (pack / "mtplx_runtime.json").write_text(json.dumps(runtime), encoding="utf-8")
+    return pack, expected
+
+
+def _launch_sampler(args) -> dict:
+    return {"temperature": args.temperature, "top_p": args.top_p, "top_k": args.top_k}
+
+
+@pytest.mark.parametrize("case", sorted(_DIRECT_BOOT_PACKS))
+def test_direct_daemon_boot_serves_the_family_sampler(tmp_path, case):
+    """A daemon started as `python -m mtplx.server.openai` with no sampler
+    flags serves what `mtplx serve` would inject. Bonsai 2 started this way
+    sampled every request at 0.6 while /health said 1.0 (2026-09-22)."""
+
+    pack, expected = _direct_boot_pack(tmp_path, case)
+
+    args = parse_args(["--model", str(pack), "--warmup-tokens", "0"])
+
+    assert _launch_sampler(args) == expected
+
+
+def test_direct_daemon_boot_keeps_explicit_sampler_flags(tmp_path):
+    pack, _expected = _direct_boot_pack(tmp_path, "bonsai-2")
+
+    typed = parse_args(
+        ["--model", str(pack), "--warmup-tokens", "0", "--temperature", "0.7"]
+    )
+    assert _launch_sampler(typed) == {"temperature": 0.7, "top_p": 0.95, "top_k": 20}
+
+    # `mtplx serve` forwards a config.toml pin as a flag. A pin equal to the
+    # generic default still wins: presence decides, not the value.
+    pinned = parse_args(
+        [
+            "--model",
+            str(pack),
+            "--warmup-tokens",
+            "0",
+            "--temperature",
+            "0.6",
+            "--top-p",
+            "0.9",
+            "--top-k",
+            "40",
+        ]
+    )
+    assert _launch_sampler(pinned) == {"temperature": 0.6, "top_p": 0.9, "top_k": 40}
+
+
+@pytest.mark.parametrize("case", ["bonsai-2", "qwen-3.6-27b"])
+def test_direct_daemon_health_matches_the_request_sampler(tmp_path, monkeypatch, case):
+    pack, expected = _direct_boot_pack(tmp_path, case)
+    state = _fake_state()
+    state.args = parse_args(
+        ["--model", str(pack), "--warmup-tokens", "0", "--rate-limit", "0"]
+    )
+    state.runtime.tokenizer = CaptureTokenizer()
+    captured: dict[str, object] = {}
+
+    def fake_run_generation(_state, _prompt_ids, **kwargs):
+        captured.update(kwargs)
+        return _fake_generation("READY")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+    client = TestClient(create_app(state))
+
+    health = client.get("/health").json()
+    sampling = health["startup"]["model_controls"]["sampling"]
+    assert {key: sampling[key] for key in expected} == expected
+    assert health["profile"]["sampler"] == expected
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={"messages": [{"role": "user", "content": "Say READY"}], "max_tokens": 4},
+    )
+
+    assert response.status_code == 200
+    stats = captured["request_observability"]
+    assert {
+        "temperature": stats["effective_temperature"],
+        "top_p": stats["effective_top_p"],
+        "top_k": stats["effective_top_k"],
+    } == expected
 
 
 def test_chat_completion_response_reports_served_model_when_request_model_is_stale(
@@ -3059,7 +3350,7 @@ def test_chat_request_controls_are_server_owned_without_override(monkeypatch):
     assert response.status_code == 200
     assert captured["generation_mode"] == "mtp"
     assert captured["depth"] == 3
-    assert captured["temperature"] == 0.6
+    assert captured["temperature"] == 1.0
     assert captured["top_p"] == 0.95
     assert captured["top_k"] == 20
     _messages, template_kwargs = state.runtime.tokenizer.calls[0]
@@ -4006,7 +4297,7 @@ def test_completion_request_controls_are_server_owned_without_override(monkeypat
     # Server-owned controls resolve to the launch sampler at the prologue
     # (shared RequestPolicy path, same as chat) — the client's 0.01/0.2/1
     # must never reach generation.
-    assert captured["temperature"] == 0.6
+    assert captured["temperature"] == 1.0
     assert captured["top_p"] == 0.95
     assert captured["top_k"] == 20
     stats = captured["request_observability"]
@@ -4024,7 +4315,7 @@ def test_completion_request_controls_are_server_owned_without_override(monkeypat
         "top_p",
         "top_k",
     ]
-    assert stats["effective_temperature"] == 0.6
+    assert stats["effective_temperature"] == 1.0
     assert stats["effective_top_p"] == 0.95
     assert stats["effective_top_k"] == 20
 
@@ -4102,6 +4393,128 @@ class CaptureTokenizer:
 
     def decode(self, tokens, **_kwargs):
         return "".join(chr(int(token)) for token in tokens)
+
+
+class JSONToolPrefixTokenizer(CaptureTokenizer):
+    """Like native Qwen templates, render tools in incoming JSON key order."""
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.calls.append((messages, kwargs))
+        text = json.dumps(kwargs.get("tools") or [], ensure_ascii=False) + "\n"
+        text += "\n".join(
+            f"{message['role']}:{message.get('content') or ''}"
+            for message in messages
+        )
+        if kwargs.get("add_generation_prompt"):
+            text += "\nassistant:"
+        return self.encode(text) if kwargs.get("tokenize", True) else text
+
+
+def test_tool_schema_object_order_does_not_change_rendered_prefix(monkeypatch):
+    monkeypatch.setenv("MTPLX_CHAT_ENCODE_CACHE", "off")
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "lookup",
+            "description": "Look up a value",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "Query"}},
+                "required": ["query"],
+            },
+        },
+    }
+
+    def reverse_objects(value):
+        if isinstance(value, dict):
+            return {key: reverse_objects(item) for key, item in reversed(value.items())}
+        if isinstance(value, list):
+            return [reverse_objects(item) for item in value]
+        return value
+
+    prefixes = []
+    for index, spec in enumerate((tool, reverse_objects(tool))):
+        normalized = openai._normalize_tool_specs([spec])
+        assert normalized == [tool]  # No schema fields or values disappear.
+        ids = openai._encode_messages(
+            JSONToolPrefixTokenizer(),
+            [openai.ChatMessage(role="user", content=f"Turn {index}")],
+            enable_thinking=False,
+            tool_prompt_mode="native",
+            tools=normalized,
+        )
+        prefixes.append("".join(map(chr, ids)).split("\n", 1)[0])
+    assert prefixes[0] == prefixes[1]
+
+
+@pytest.mark.parametrize("after_tool", [False, True])
+def test_disabled_tool_turn_contract_is_not_saved_as_client_history(after_tool):
+    messages = [openai.ChatMessage(role="user", content="Explain the result.")]
+    if after_tool:
+        messages += [
+            openai.ChatMessage(role="assistant", content="", tool_calls=[{
+                "id": "lookup-1", "type": "function", "function": {
+                    "name": "session_status", "arguments": "{}",
+                },
+            }]),
+            openai.ChatMessage(role="tool", tool_call_id="lookup-1", content="7"),
+        ]
+    request = openai.ChatCompletionRequest(
+        messages=messages, tools=[_tool_schema()], tool_choice="none"
+    )
+    policy = openai.resolve_request_policy(
+        _fake_state(), request, headers={"x-mtplx-client": "mtplx_app"}, metadata={}
+    )
+    assert len(policy.messages_for_generation) == len(messages) + 1
+    assert "MTPLX " in policy.messages_for_generation[-1].content
+    # The client echoes its own messages, not our request-only instruction.
+    # Banking the suffix as history made a 2,820-token answer replay on the
+    # next native chat turn, despite a successfully stored final snapshot.
+    assert policy.raw_messages_for_postcommit == messages
+    assert policy.prompt_tool_specs == policy.postcommit_tool_specs
+
+
+@pytest.mark.parametrize("client_hint", ["mtplx_app", "opencode", "pi", "hermes"])
+def test_tool_choice_none_keeps_cached_schema_but_disables_calls(monkeypatch, client_hint):
+    state = _fake_state()
+    foreground = ForegroundState()
+    state.lock = foreground.lock
+    state.has_foreground = foreground.has_foreground
+    state.runtime.tokenizer = JSONToolPrefixTokenizer()
+    state.args.stats_footer = False
+    captured = []
+
+    def fake_run_generation(_state, prompt_ids, **kwargs):
+        captured.append((list(prompt_ids), kwargs["session_policy_fingerprint"]))
+        return _fake_generation("The result is available.")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+    client = TestClient(create_app(state))
+    messages = [
+        {"role": "user", "content": "Look up the current value."},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "lookup-1", "type": "function", "function": {
+                "name": "session_status", "arguments": "{}",
+            },
+        }]},
+        {"role": "tool", "tool_call_id": "lookup-1", "content": "The value is 7."},
+    ]
+    for choice in ("auto", "none"):
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"x-mtplx-cache-mode": "bypass", "x-mtplx-client": client_hint},
+            json={"messages": messages, "tools": [_tool_schema()], "tool_choice": choice},
+        )
+        assert response.status_code == 200
+        if choice == "none":
+            assert not response.json()["choices"][0]["message"].get("tool_calls")
+    prompts = ["".join(map(chr, ids)) for ids, _fingerprint in captured]
+    assert prompts[0].split("\n", 1)[0] == prompts[1].split("\n", 1)[0]
+    # OpenCode's compact lane puts the tool name in its stable digest;
+    # native/hybrid lanes carry the full JSON schema prefix.
+    assert "session_status" in prompts[1]
+    assert captured[0][1] == captured[1][1]
+    assert "MTPLX post-tool answer turn:" in prompts[1]
 
 
 class StepTemplateIgnoringThinkingTokenizer(CaptureTokenizer):
@@ -5993,6 +6406,104 @@ def test_pi_tool_result_orphan_tool_tail_retries_without_stream_leak(monkeypatch
         "orphan_tool_control_markup"
     )
     assert final[-1]["mtplx_stats"]["raw_tool_markup_suppressed"] is True
+
+
+def test_reasoning_only_turn_that_quotes_tool_markup_is_still_repaired(monkeypatch):
+    """A quoted tool tag is prose, not an attempted call.
+
+    2.11.4 user-seat probe: with tools declared, the model quoted
+    ``</parameter>`` from a pasted traceback a few words into its thinking and
+    then ended the turn. The reasoning-only repair stood down because the raw
+    text contained a tool tag, and the client received an empty message.
+    """
+    state = _fake_streaming_session_state()
+    state.args.stream_interval = 1
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+    texts = [
+        "The traceback shows a stray `</parameter>` on line 1785, then `</function>` and `",
+        "Line 1785 is leftover tool markup. Delete the last three lines of the file.",
+    ]
+    calls: list[str] = []
+
+    def fake_run_generation(_state, prompt_ids, **kwargs):
+        text = texts[len(calls)]
+        calls.append(text)
+        tokens = [ord(char) for char in text]
+        token_callback = kwargs.get("token_callback")
+        if token_callback is not None:
+            for token in tokens:
+                token_callback([token])
+        return {
+            "text": text,
+            "tokens": tokens,
+            "stats": {
+                **(kwargs.get("request_observability") or {}),
+                "generation_mode": kwargs["generation_mode"],
+                "mtp_depth": kwargs["depth"],
+                "completion_tokens": len(tokens),
+                "decode_tok_s": 24.0,
+            },
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": len(tokens),
+            "finish_reason": "stop",
+        }
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass", "x-mtplx-client": "pi"},
+        json={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Line 1785 of the file is literally </parameter>. What went wrong?",
+                },
+            ],
+            "tools": [_tool_schema()],
+            "tool_choice": "auto",
+            "stream": True,
+            "max_tokens": 128,
+            "enable_thinking": True,
+        },
+    ) as response:
+        body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    payloads = _stream_payloads(body)
+    reasoning = "".join(
+        choice.get("delta", {}).get("reasoning_content", "")
+        for payload in payloads
+        for choice in payload.get("choices", [])
+    )
+    content = "".join(
+        choice.get("delta", {}).get("content", "")
+        for payload in payloads
+        for choice in payload.get("choices", [])
+    )
+    final = [payload for payload in payloads if payload["choices"][0]["finish_reason"]]
+
+    assert calls == texts
+    assert "`</parameter>`" in reasoning
+    assert "</parameter>" not in content
+    assert content.strip() == texts[1]
+    assert final[-1]["mtplx_stats"]["reasoning_completion_repair_attempted"] is True
+    assert final[-1]["mtplx_stats"]["reasoning_completion_repair_succeeded"] is True
+
+
+def test_attempted_tool_call_still_stands_the_reasoning_repair_down():
+    """The other half of the rule: a call that opens inside thinking, or any
+    tool markup after the thinking block, is an attempt and keeps belonging
+    to the tool-parse fallbacks."""
+    attempts = openai._generated_text_attempts_tool_call
+    common = dict(thinking_enabled=True, start_inside_thinking=True, tool_names=["read"])
+    assert not attempts("The error names `</parameter>` and `</tool_call>`.", **common)
+    assert not attempts("Notes.\n</parameter>\n</function>\n</tool_call>", **common)
+    assert attempts("Reading it.\n<tool_call>\n<function=read>\n<parameter=filePath>", **common)
+    assert attempts("Done thinking.</think>\n\n<function=read>\n<parameter=filePath>", **common)
+    assert attempts("Done thinking.</think>\n\nsrc/Game.ts\n</parameter>\n</function>", **common)
 
 
 def test_pi_tool_result_reasoning_only_final_turn_repairs_without_visible_leak(
@@ -8971,7 +9482,7 @@ def test_opencode_chitchat_preserves_agent_tools_without_direct_reply_contract(
     assert stats["opencode_prompt_contract_profile"] == "opencode_agent"
     assert stats["transcript_replaced_client_system_messages"] == 0
     assert stats["sampler_policy"] == "opencode_default_sampler"
-    assert stats["effective_temperature"] == 0.6
+    assert stats["effective_temperature"] == 1.0
     assert stats["effective_top_p"] == 0.95
     assert stats["effective_top_k"] == 20
     # F9: server-injected sampler normalization is launch_default OWNERSHIP,
@@ -9017,10 +9528,10 @@ def test_chat_tools_add_no_tool_contract_when_non_chitchat_disables_tools(monkey
     )
 
     assert response.status_code == 200
-    messages, kwargs = state.runtime.tokenizer.calls[0]
+    messages, _kwargs = state.runtime.tokenizer.calls[0]
     rendered = "\n".join(str(message.get("content") or "") for message in messages)
     stats = seen["request_observability"]
-    assert "tools" not in kwargs
+    assert stats["request_filtered_tool_count"] == 0
     assert "MTPLX direct reply turn:" in rendered
     assert "Start with the final user-facing answer" in rendered
     assert stats["no_tools_contract_active"] is True
@@ -9100,7 +9611,8 @@ def test_final_round_after_tools_gets_post_tool_answer_contract(monkeypatch):
     messages, kwargs = state.runtime.tokenizer.calls[0]
     rendered = "\n".join(str(message.get("content") or "") for message in messages)
     stats = seen["request_observability"]
-    assert "tools" not in kwargs
+    assert [tool["function"]["name"] for tool in kwargs["tools"]] == ["web_search"]
+    assert stats["request_filtered_tool_count"] == 0
     assert "MTPLX post-tool answer turn:" in rendered
     assert "Match the depth the user asked for" in rendered
     # The model must be anchored to today and told fresher tool results
@@ -9554,8 +10066,35 @@ def test_tool_contract_honors_forced_function_choice():
         tool_choice={"type": "function", "function": {"name": "submit_answer"}},
     )
 
-    assert "requires the `submit_answer` tool call" in with_contract[0]["content"]
-    assert "instead of a normal text answer" in with_contract[0]["content"]
+    # The forced clause rides a transient trailing user turn, not msg0: a
+    # per-request tool_choice must not change the session's cached prefix
+    # (agent-session gate, 2026-09-03: one forced round re-prefilled 40k
+    # tokens twice). The system contract itself is tool_choice-invariant.
+    assert "requires the" not in with_contract[0]["content"]
+    assert [message["role"] for message in with_contract] == ["system", "user", "user"]
+    tail = with_contract[-1]["content"]
+    assert tail.startswith(openai._MTPLX_FORCED_TOOL_CHOICE_SENTINEL_HEAD)
+    assert "requires the `submit_answer` tool call" in tail
+    assert "instead of a normal text answer" in tail
+    auto = openai._with_mtplx_tool_contract(
+        [{"role": "user", "content": "Solve it."}],
+        tools=[_named_tool_schema("submit_answer")],
+        tool_choice="auto",
+    )
+    assert auto[0]["content"] == with_contract[0]["content"]
+    assert [message["role"] for message in auto] == ["system", "user"]
+
+
+def test_forced_tool_choice_sentinel_is_a_registered_transient_suffix():
+    heads = [text[:48] for text in openai._transient_trailing_user_sentinel_texts()]
+    assert openai._MTPLX_FORCED_TOOL_CHOICE_SENTINEL_HEAD[:48] in heads
+    forced = openai._mtplx_forced_tool_choice_text(
+        {"type": "function", "function": {"name": "write"}}
+    )
+    assert forced[:48] == openai._MTPLX_FORCED_TOOL_CHOICE_SENTINEL_HEAD[:48]
+    assert openai._mtplx_forced_tool_choice_text("auto") == (
+        openai._MTPLX_FORCED_TOOL_CHOICE_SENTINEL_HEAD
+    )
 
 
 def test_tool_contract_keeps_every_tool_name_when_over_budget():
@@ -10090,9 +10629,12 @@ def test_read_only_force_answer_stream_postcommit_uses_client_history(monkeypatc
         "glob",
         "grep",
     ]
+    # The force-answer contract is a transient trailing turn; since
+    # 2026-09-03 the fingerprint carries no tail-contract flag at all (a
+    # transition round must reuse the session's banked prefix).
     assert (
-        "read_only_force_answer_contract=0"
-        in captured["generation_final_policy_fingerprint"]
+        "read_only_force_answer_contract"
+        not in captured["generation_final_policy_fingerprint"]
     )
     assert "tool_prompt_mode=compact" in captured["generation_final_policy_fingerprint"]
     assert (
@@ -10104,15 +10646,15 @@ def test_read_only_force_answer_stream_postcommit_uses_client_history(monkeypatc
         not in captured["generation_final_policy_fingerprint"]
     )
     assert (
-        "read_only_force_answer_contract=0"
-        in captured["generation_session_policy_fingerprint"]
+        "read_only_force_answer_contract"
+        not in captured["generation_session_policy_fingerprint"]
     )
     assert (
         "read_only_force_answer:v1"
         not in captured["generation_session_policy_fingerprint"]
     )
     assert (
-        "read_only_force_answer_contract=0" in captured["scheduled_policy_fingerprint"]
+        "read_only_force_answer_contract" not in captured["scheduled_policy_fingerprint"]
     )
     assert "tool_prompt_mode=compact" in captured["scheduled_policy_fingerprint"]
     assert (
@@ -11384,10 +11926,27 @@ def test_chat_stream_tool_call_preamble_is_stored_for_postcommit(monkeypatch):
         }
 
 
-def test_chat_stream_hermes_suppresses_tool_call_preamble(monkeypatch):
+@pytest.mark.parametrize("with_vision", [False, True])
+def test_chat_stream_hermes_suppresses_tool_call_preamble(monkeypatch, with_vision):
     state = _fake_streaming_session_state()
     state.args.stream_interval = 1
     state.args.enable_thinking = False
+    if with_vision:
+        state._vision_spec_cache = SimpleNamespace()
+        splice = SimpleNamespace(
+            image_pad_token_id=999999, image_digests=[123], pad_counts=[1], total_rows=1,
+        )
+        monkeypatch.setattr(openai, "_vision_extract_and_flatten", lambda messages: (messages, [object()]))
+        monkeypatch.setattr(openai, "_materialize_vision_splice", lambda state, images, ids: (ids + [999999], splice))
+    commits = []
+    def capture_final(*_args, **kwargs):
+        commits.append(kwargs)
+        return {"stored": False, "mode": "unsafe", "reason": "tool_call_history_rewrite"}
+    def capture_idle(*_args, **kwargs):
+        commits.append(kwargs)
+        return {"stored": False, "mode": "async_pending"}
+    monkeypatch.setattr(openai, "_store_generation_final_history_snapshot", capture_final)
+    monkeypatch.setattr(openai, "_schedule_idle_postcommit_snapshot", capture_idle)
     monkeypatch.setattr(
         openai,
         "_run_generation",
@@ -11400,7 +11959,7 @@ def test_chat_stream_hermes_suppresses_tool_call_preamble(monkeypatch):
     with TestClient(create_app(state)) as client:
         response = client.post(
             "/v1/chat/completions",
-            headers={"x-mtplx-client": "hermes"},
+            headers={"x-mtplx-client": "hermes", "x-mtplx-session-id": "hermes-preamble"},
             json={
                 "messages": [{"role": "user", "content": "Status."}],
                 "tools": [_tool_schema()],
@@ -11421,6 +11980,14 @@ def test_chat_stream_hermes_suppresses_tool_call_preamble(monkeypatch):
         payload["choices"][0].get("finish_reason") == "tool_calls"
         for payload in payloads
     )
+    assert len(commits) == 2
+    for commit in commits:
+        assert commit["assistant_content"] == ""
+        assert commit["strip_tool_call_preamble_text"] is True
+    if with_vision:
+        # Even the unsafe/idle-postcommit arm must not publish raw image
+        # placeholders as a session frontier that different pixels can adopt.
+        assert state.sessions.peek("hermes-preamble").committed_token_ids == ()
 
 
 def test_chat_stream_hermes_defers_content_until_native_tool_extraction(monkeypatch):
@@ -12366,7 +12933,7 @@ def test_chat_stream_missing_required_tool_argument_still_emits_model_tool_call(
 def test_server_state_emits_startup_progress(monkeypatch, capsys):
     monkeypatch.setattr(openai, "apply_profile_env", lambda _profile, **_kwargs: None)
     monkeypatch.setattr(openai, "profile_env_status", lambda _profile, **_kwargs: {})
-    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda **kwargs: {})
     monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
     monkeypatch.setattr(
         openai, "_configure_mlx_cache_limit", lambda _args: {"configured": False}
@@ -12417,7 +12984,7 @@ def test_server_state_applies_clear_cache_every_after_profile(monkeypatch):
 
     monkeypatch.setattr(openai, "apply_profile_env", capture_apply_profile_env)
     monkeypatch.setattr(openai, "profile_env_status", capture_profile_env_status)
-    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda **kwargs: {})
     monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
     monkeypatch.setattr(
         openai,
@@ -12469,7 +13036,7 @@ def test_server_state_applies_clear_cache_every_after_profile(monkeypatch):
 def _monkeypatch_server_state_load(monkeypatch):
     monkeypatch.setattr(openai, "apply_profile_env", lambda _profile, **_kwargs: None)
     monkeypatch.setattr(openai, "profile_env_status", lambda _profile, **_kwargs: {})
-    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda **kwargs: {})
     monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
     monkeypatch.setattr(
         openai, "_configure_mlx_cache_limit", lambda _args: {"configured": False}
@@ -12547,7 +13114,7 @@ def test_server_state_keeps_kv_quant_for_supported_family(monkeypatch):
 def test_server_state_reports_model_load_failure(monkeypatch, capsys):
     monkeypatch.setattr(openai, "apply_profile_env", lambda _profile, **_kwargs: None)
     monkeypatch.setattr(openai, "profile_env_status", lambda _profile, **_kwargs: {})
-    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda **kwargs: {})
     monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
     monkeypatch.setattr(
         openai, "_configure_mlx_cache_limit", lambda _args: {"configured": False}
@@ -12574,7 +13141,7 @@ def test_server_state_passes_step_adapter_quant_contract_to_load(monkeypatch):
     captured = {}
     monkeypatch.setattr(openai, "apply_profile_env", lambda _profile, **_kwargs: None)
     monkeypatch.setattr(openai, "profile_env_status", lambda _profile, **_kwargs: {})
-    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda **kwargs: {})
     monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
     monkeypatch.setattr(
         openai,
@@ -12660,23 +13227,86 @@ def test_stop_sequence_stream_monitor_holds_back_partial_matches():
     assert flushed.emitted_text == "abc E"
 
 
-def test_chat_stream_stop_sequence_trims_and_cancels_generation(monkeypatch):
-    state = _fake_streaming_session_state()
-    state.args.stream_interval = 1
-    client = TestClient(create_app(state))
-    cancel_seen: dict[str, bool] = {}
+@pytest.fixture(params=[True, False], ids=["during_callback", "after_callback"])
+def _ordered_stop_generation(monkeypatch, request):
+    """Exercise both real cancellation checks without relying on thread timing."""
+    import asyncio
+
+    cancel_during_callback = request.param
+    hello_tokens = [ord(char) for char in "Hello "]
+    stop_tokens = [ord(char) for char in "STOP\n"]
+    cancel_seen: dict[str, object] = {}
+    cancel_events: list[Event] = []
+    queued_tokens: list[list[int]] = []
+    queues = []
+
+    def token_ids(item):
+        if item[0] != "tokens":
+            return None
+        return item[1]["tokens"] if isinstance(item[1], dict) else item[1]
+
+    class OrderedStopQueue(openai._LoopFedStreamQueue):
+        def __init__(self, loop):
+            super().__init__(loop)
+            self.stop_callback_returned = asyncio.Event()
+            queues.append(self)
+
+        def put(self, item):
+            tokens = token_ids(item)
+            if tokens is not None:
+                queued_tokens.append(tokens)
+            super().put(item)
+            if cancel_during_callback and token_ids(item) == stop_tokens:
+                # Let the real consumer cancel before on_tokens performs
+                # its post-put check. Cancellation may unwind this callback.
+                assert cancel_events[0].wait(timeout=10)
+
+        async def get(self, timeout=None):
+            item = await super().get(timeout)
+            if not cancel_during_callback and token_ids(item) == stop_tokens:
+                # Hold only STOP consumption until on_tokens has returned;
+                # the next callback must then trip its pre-put check.
+                await asyncio.wait_for(self.stop_callback_returned.wait(), timeout=10)
+            return item
+
+    monkeypatch.setattr(openai, "_LoopFedStreamQueue", OrderedStopQueue)
 
     def fake_run_generation(_state, _prompt_ids, **kwargs):
         token_callback = kwargs["token_callback"]
         cancel_event = kwargs["cancel_event"]
-        token_callback([ord(char) for char in "Hello "])
-        token_callback([ord(char) for char in "STOP\n"])
-        assert cancel_event.wait(timeout=10), "stop match must cancel generation"
-        cancel_seen["cancelled"] = True
-        token_callback([ord(char) for char in "after"])
-        raise AssertionError("cancelled token callback must raise")
+        cancel_events.append(cancel_event)
+        token_callback(hello_tokens)
+        point = "stop_callback"
+        try:
+            token_callback(stop_tokens)
+            assert not cancel_during_callback, "post-put check must cancel this callback"
+            queues[0]._loop.call_soon_threadsafe(queues[0].stop_callback_returned.set)
+            assert cancel_event.wait(timeout=10), "stop match must cancel generation"
+            point = "later_callback"
+            token_callback([ord(char) for char in "after"])
+            raise AssertionError("cancelled token callback must raise")
+        except openai._StreamCancelled:
+            cancel_seen.update(
+                point=point, cancelled=cancel_event.is_set(), origin=cancel_event.origin
+            )
+            raise
 
     monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+
+    yield
+
+    assert cancel_seen == {
+        "point": "stop_callback" if cancel_during_callback else "later_callback",
+        "cancelled": True,
+        "origin": "stop_sequence",
+    }
+    assert queued_tokens == [hello_tokens, stop_tokens], "no later tokens may be queued"
+
+
+def test_chat_stream_stop_sequence_trims_and_cancels_generation(_ordered_stop_generation):
+    state = _fake_streaming_session_state()
+    state.args.stream_interval = 1
+    client = TestClient(create_app(state))
 
     response = client.post(
         "/v1/chat/completions",
@@ -12703,11 +13333,12 @@ def test_chat_stream_stop_sequence_trims_and_cancels_generation(monkeypatch):
     final = [
         payload for payload in payloads if payload["choices"][0].get("finish_reason")
     ]
+    assert len(final) == 1
     assert final[-1]["choices"][0]["finish_reason"] == "stop"
     assert final[-1]["mtplx_stats"]["stop_sequence_hit"] is True
     assert final[-1]["mtplx_stats"]["stop_sequence_matched"] == "STOP"
-    assert cancel_seen.get("cancelled") is True
-    assert "data: [DONE]" in response.text
+    assert final[-1]["usage"]["completion_tokens"] == len("Hello STOP\n")
+    assert response.text.count("data: [DONE]") == 1
 
 
 def test_chat_stream_stop_sequence_handles_generation_done_race(monkeypatch):
@@ -12939,22 +13570,9 @@ def test_completions_stream_is_incremental_with_terminal_finish_reason(monkeypat
     assert "data: [DONE]" in response.text
 
 
-def test_completions_stream_honors_stop_sequence(monkeypatch):
+def test_completions_stream_honors_stop_sequence(_ordered_stop_generation):
     state = _fake_streaming_session_state()
     client = TestClient(create_app(state))
-    cancel_seen: dict[str, bool] = {}
-
-    def fake_run_generation(_state, _prompt_ids, **kwargs):
-        token_callback = kwargs["token_callback"]
-        cancel_event = kwargs["cancel_event"]
-        token_callback([ord(char) for char in "Hello "])
-        token_callback([ord(char) for char in "STOP\n"])
-        assert cancel_event.wait(timeout=10), "stop match must cancel generation"
-        cancel_seen["cancelled"] = True
-        token_callback([ord(char) for char in "after"])
-        raise AssertionError("cancelled token callback must raise")
-
-    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
 
     response = client.post(
         "/v1/completions",
@@ -12977,10 +13595,12 @@ def test_completions_stream_honors_stop_sequence(monkeypatch):
     final = [
         payload for payload in payloads if payload["choices"][0].get("finish_reason")
     ]
+    assert len(final) == 1
     assert final[-1]["choices"][0]["finish_reason"] == "stop"
     assert final[-1]["mtplx_stats"]["stop_sequence_hit"] is True
-    assert cancel_seen.get("cancelled") is True
-    assert "data: [DONE]" in response.text
+    assert final[-1]["mtplx_stats"]["stop_sequence_matched"] == "STOP"
+    assert final[-1]["usage"]["completion_tokens"] == len("Hello STOP\n")
+    assert response.text.count("data: [DONE]") == 1
 
 
 def test_completions_nonstream_trims_stop_and_reports_real_finish_reason(
@@ -13869,7 +14489,7 @@ def _memory_plan_state_harness(monkeypatch):
     monkeypatch.delenv("MTPLX_WIRED_LIMIT_BYTES", raising=False)
     monkeypatch.setattr(openai, "apply_profile_env", lambda _profile, **_kwargs: None)
     monkeypatch.setattr(openai, "profile_env_status", lambda _profile, **_kwargs: {})
-    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda **kwargs: {})
     monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
     monkeypatch.setattr(
         openai, "_configure_mlx_cache_limit", lambda _args: {"configured": False}
@@ -13999,3 +14619,75 @@ def test_warmup_rows_stay_out_of_dashboard_metrics_ring():
         state, {"request_id": "warm-2", "warmup": True, "completion_tokens": 8}
     )
     assert state.last_metrics[-1]["request_id"] == "real-1"
+
+
+def test_fast_path_env_status_treats_runtime_overrides_as_the_expectation(monkeypatch):
+    """Flash-Next pins MTPLX_SKIP_VERIFY_SNAPSHOT=0 and the batched target
+    distributions on purpose; /health must report those keys as ok against
+    the override the server resolved, not against the profile block."""
+    monkeypatch.setenv("MTPLX_SKIP_VERIFY_SNAPSHOT", "0")
+    monkeypatch.setenv("MTPLX_BATCH_TARGET_ARRAYS", "1")
+    monkeypatch.setenv("MTPLX_LAZY_TARGET_DISTRIBUTIONS", "0")
+
+    plain = openai._fast_path_env_status()
+    assert plain["MTPLX_SKIP_VERIFY_SNAPSHOT"]["ok"] is False
+    assert "source" not in plain["MTPLX_SKIP_VERIFY_SNAPSHOT"]
+
+    overrides = {
+        "MTPLX_SKIP_VERIFY_SNAPSHOT": "0",
+        "MTPLX_BATCH_TARGET_ARRAYS": "1",
+        "MTPLX_LAZY_TARGET_DISTRIBUTIONS": "0",
+    }
+    resolved = openai._fast_path_env_status(runtime_env_overrides=overrides)
+    for key, value in overrides.items():
+        assert resolved[key]["ok"] is True, key
+        assert resolved[key]["expected"] == value
+        assert resolved[key]["source"] == "runtime_override"
+        assert resolved[key]["profile_expected"] == openai.FAST_PATH_ENV[key]
+    # keys the server did not override keep the profile expectation
+    assert "source" not in resolved["MTPLX_LAZY_VERIFY_LOGITS"]
+    assert resolved["MTPLX_LAZY_VERIFY_LOGITS"]["expected"] == openai.FAST_PATH_ENV["MTPLX_LAZY_VERIFY_LOGITS"]
+
+
+@pytest.mark.parametrize("hint", ["pi", "opencode", None])
+def test_live_app_ownership_applies_to_actual_request_policy(monkeypatch, hint):
+    from mtplx.backends.descriptors import QWEN3_8_REASONING_CODEC
+
+    state = _fake_state()
+    state.runtime.tokenizer = StreamingTokenizer()
+    state.args.reasoning = "on"
+    state.args.enable_thinking = True
+    state.args.reasoning_effort = "xhigh"
+    state.args.temperature = 1.0
+    state.args.stats_footer = False
+    captured = {}
+    monkeypatch.setattr(openai, "_reasoning_codec_for_state", lambda _state: QWEN3_8_REASONING_CODEC)
+
+    def generate(_state, _prompt_ids, **kwargs):
+        captured.update(kwargs)
+        return _fake_generation("ok")
+
+    monkeypatch.setattr(openai, "_run_generation", generate)
+    client = TestClient(create_app(state))
+    headers = {"x-mtplx-cache-mode": "bypass"}
+    if hint:
+        headers["x-mtplx-client"] = hint
+    body = {
+        "messages": [{"role": "user", "content": "hi"}], "stream": False,
+        "reasoning_effort": "medium", "enable_thinking": True,
+        "temperature": 0.55, "top_p": 1.0,
+    }
+    for policy in ("app", "client", "app"):
+        response = client.post("/v1/mtplx/settings", json={"managed_client_controls": policy})
+        assert response.status_code == 200, response.text
+        assert response.json()["managed_client_controls"] == policy
+        response = client.post("/v1/chat/completions", headers=headers, json=body)
+        assert response.status_code == 200, response.text
+        owned = policy == "app" and hint is not None
+        obs = captured["request_observability"]
+        assert obs["request_reasoning_effort"] == ("xhigh" if owned else "medium")
+        assert captured["temperature"] == (1.0 if owned else 0.55)
+        assert obs["thinking_controls_allowed"] is not owned
+
+    assert client.post("/v1/mtplx/settings", json={"managed_client_controls": "typo"}).status_code == 400
+    assert state.args.managed_client_controls == "app"

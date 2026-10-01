@@ -45,6 +45,7 @@ public final class OnboardingOrchestrator: ObservableObject {
         autoTuner: AutoTuner = AutoTuner(),
         runtimeSetup: RuntimeSetupService = RuntimeSetupService(),
         feasibility: ModelFeasibility = ModelFeasibility(),
+        modelLibrary: ModelLibrary = .default,
         initialState: OnboardingFeatureState = OnboardingFeatureState()
     ) {
         self.hardwareInspector = hardwareInspector
@@ -53,6 +54,7 @@ public final class OnboardingOrchestrator: ObservableObject {
         self.autoTuner = autoTuner
         self.runtimeSetup = runtimeSetup
         self.feasibility = feasibility
+        self.modelLibrary = modelLibrary
         self.state = initialState
         self.runtimeSetupRows = []
         self.isRunningRuntimeSetup = false
@@ -71,6 +73,7 @@ public final class OnboardingOrchestrator: ObservableObject {
     private let autoTuner: AutoTuner
     private let runtimeSetup: RuntimeSetupService
     private let feasibility: ModelFeasibility
+    private var modelLibrary: ModelLibrary
 
     // MARK: - Cancellable task handles
 
@@ -160,7 +163,7 @@ public final class OnboardingOrchestrator: ObservableObject {
             state.record(LocalModelProbe(
                 verdict: .notFound,
                 path: path,
-                message: "Paste a local model folder first."
+                message: tr("Paste a local model folder first.")
             ))
             return
         }
@@ -173,7 +176,7 @@ public final class OnboardingOrchestrator: ObservableObject {
             state.record(LocalModelProbe(
                 verdict: .notFound,
                 path: trimmed,
-                message: "That folder doesn't exist on this Mac.",
+                message: tr("That folder doesn't exist on this Mac."),
                 diagnostic: expanded
             ))
             return
@@ -183,7 +186,7 @@ public final class OnboardingOrchestrator: ObservableObject {
             state.record(LocalModelProbe(
                 verdict: .incomplete,
                 path: trimmed,
-                message: "That folder is not a complete MTPLX model yet.",
+                message: tr("That folder is not a complete MTPLX model yet."),
                 diagnostic: "Need config/tokenizer/runtime metadata, full model weights, and an MTP sidecar."
             ))
             return
@@ -193,7 +196,7 @@ public final class OnboardingOrchestrator: ObservableObject {
         state.record(LocalModelProbe(
             verdict: .ready,
             path: trimmed,
-            message: "\(Self.modelFamilyLabel(family)) model ready from this folder.",
+            message: tr("%@ model ready from this folder.", Self.modelFamilyLabel(family)),
             diagnostic: expanded
         ))
     }
@@ -219,7 +222,16 @@ public final class OnboardingOrchestrator: ObservableObject {
     /// method around so onboarding callsites don't have to be
     /// rewritten and the single source of truth is the option type.
     public func isModelInstalled(_ model: MTPLXModelOption) -> Bool {
-        model.isInstalled
+        model.isInstalled(in: modelLibrary)
+    }
+
+    public func installedLocalPath(for model: MTPLXModelOption) -> String? {
+        model.installedLocalPath(in: modelLibrary)
+    }
+
+    public func configureModelLibrary(_ library: ModelLibrary) {
+        guard !isDownloading else { return }
+        modelLibrary = library
     }
 
     // MARK: - Feasibility (read-only convenience)
@@ -228,12 +240,13 @@ public final class OnboardingOrchestrator: ObservableObject {
         let hw = state.hardware
         let chipTier = hw?.tier ?? .unknown
         let ramGiB = hw?.unifiedMemoryGiB ?? 0
-        let diskFreeGiB = model.isInstalled ? Double.greatestFiniteMagnitude : freeDiskGiB()
+        let installed = model.isInstalled(in: modelLibrary)
         return feasibility.evaluate(
             model: model,
             chipTier: chipTier,
             ramGiB: ramGiB,
-            diskFreeGiB: diskFreeGiB
+            diskFreeGiB: installed ? Double.greatestFiniteMagnitude : freeDiskGiB(),
+            downloadedBytes: installed ? 0 : downloadedBytes(forRepo: model.hfModelID)
         )
     }
 
@@ -242,10 +255,14 @@ public final class OnboardingOrchestrator: ObservableObject {
     }
 
     public func freeDiskGiB() -> Double {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let values = try? home.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-        let bytes = values?.volumeAvailableCapacityForImportantUsage ?? 0
-        return Double(bytes) / 1_073_741_824.0
+        ModelStoreVolume.freeGiB(at: ModelStoreVolume.measurementURL(for: modelLibrary.primaryDirectory))
+    }
+
+    /// Bytes an interrupted pull already left in `repo`'s model folder.
+    func downloadedBytes(forRepo repo: String) -> Int64 {
+        ModelDownloader.recursiveSize(
+            of: modelDownloader.cachedModelPath(for: repo, cacheRoot: modelLibrary.primaryDirectory)
+        )
     }
 
     private static func modelFamilyLabel(_ family: String) -> String {
@@ -332,13 +349,16 @@ public final class OnboardingOrchestrator: ObservableObject {
     public func startDownload() {
         guard !isDownloading, let repo = state.resolvedRepoID else { return }
         let totalBytes = state.resolvedModel?.sizeBytes
-        // Disk pre-flight before spawning the subprocess. Mirrors the
-        // daemon's `required_download_free_bytes` heuristic (model * 2.5).
+        // Disk pre-flight before spawning the subprocess, with the rule
+        // `mtplx pull` itself enforces: the bytes still to fetch + 5 GiB.
         // For `Other`, we don't know the size yet, so we skip this gate
         // — the user accepted the risk by pasting a custom repo.
         if let bytes = totalBytes, bytes > 0 {
             let freeGiB = freeDiskGiB()
-            let neededGiB = Double(bytes) / 1_073_741_824.0 * ModelFeasibility.diskMultiplier
+            let neededGiB = ModelFeasibility.requiredFreeDiskGiB(
+                sizeBytes: bytes,
+                downloadedBytes: downloadedBytes(forRepo: repo)
+            )
             if freeGiB < neededGiB {
                 downloadFailure = String(
                     format: "Not enough free disk space. Need %.0f GB free, you have %.0f GB.",
@@ -351,13 +371,15 @@ public final class OnboardingOrchestrator: ObservableObject {
         downloadProgress = nil
         isDownloading = true
         let downloader = modelDownloader
+        let cacheRoot = modelLibrary.primaryDirectory
         let extraEnvironment = MTPLXAppConfiguration.hfMirrorEnvironment(hfMirrorEndpoint) ?? [:]
         downloadTask?.cancel()
-        downloadTask = Task.detached(priority: .userInitiated) { [weak self, downloader, repo, totalBytes, extraEnvironment] in
+        downloadTask = Task.detached(priority: .userInitiated) { [weak self, downloader, repo, totalBytes, extraEnvironment, cacheRoot] in
             for await event in downloader.stream(
                 repo: repo,
                 totalBytes: totalBytes,
-                extraEnvironment: extraEnvironment
+                extraEnvironment: extraEnvironment,
+                cacheRoot: cacheRoot
             ) {
                 if Task.isCancelled { break }
                 await MainActor.run {
@@ -375,7 +397,7 @@ public final class OnboardingOrchestrator: ObservableObject {
             snapshot.bytesPerSecond = 0
             snapshot.etaSeconds = nil
             snapshot.stalledSeconds = 0
-            snapshot.statusMessage = "Paused"
+            snapshot.statusMessage = tr("Paused")
             downloadProgress = snapshot
         }
     }
@@ -384,7 +406,7 @@ public final class OnboardingOrchestrator: ObservableObject {
     /// mirror field rendered directly under the banner; everything else
     /// passes through untouched.
     nonisolated static func downloadFailureMessage(stderrTail: String, mirrorActive: Bool) -> String {
-        let base = stderrTail.isEmpty ? "Download failed." : stderrTail
+        let base = stderrTail.isEmpty ? tr("Download failed.") : stderrTail
         let lower = base.lowercased()
         let networkShaped = lower.contains("timed out")
             || lower.contains("connection")
@@ -445,7 +467,7 @@ public final class OnboardingOrchestrator: ObservableObject {
                 snapshot.stalledSeconds = seconds
                 snapshot.bytesPerSecond = 0
                 snapshot.etaSeconds = nil
-                snapshot.statusMessage = "Waiting on Hugging Face"
+                snapshot.statusMessage = tr("Waiting on Hugging Face")
                 downloadProgress = snapshot
             }
         case .complete(let bytes, let path):
@@ -460,7 +482,7 @@ public final class OnboardingOrchestrator: ObservableObject {
                     isComplete: false,
                     statusMessage: "Incomplete"
                 )
-                downloadFailure = "Download finished, but files the source repo ships are still missing from the model folder. Press Retry to resume the Hugging Face download."
+                downloadFailure = tr("Download finished, but files the source repo ships are still missing from the model folder. Press Retry to resume the Hugging Face download.")
                 isDownloading = false
                 return
             }
@@ -492,7 +514,7 @@ public final class OnboardingOrchestrator: ObservableObject {
                 snapshot.bytesPerSecond = 0
                 snapshot.etaSeconds = nil
                 snapshot.stalledSeconds = 0
-                snapshot.statusMessage = "Paused"
+                snapshot.statusMessage = tr("Paused")
                 downloadProgress = snapshot
             }
         }
@@ -518,7 +540,7 @@ public final class OnboardingOrchestrator: ObservableObject {
         }
         let modelPath = resolvedTuneModelPath()
         guard let modelPath else {
-            tuneFailure = "No model selected to tune."
+            tuneFailure = tr("No model selected to tune.")
             return
         }
         isTuning = true
@@ -549,11 +571,28 @@ public final class OnboardingOrchestrator: ObservableObject {
             skipTuneForModelDefaults()
             return
         }
-        // Used by the ThermalForge-missing fallback. depth=2 is the
-        // codebase's documented safe Qwen heuristic.
+        // A pack's measured default outranks the generic Qwen heuristic.
+        // In particular, Bonsai declares D1; choosing D2 here made skipping
+        // onboarding tuning slower than the same model's CLI defaults.
+        var candidate = TuneCandidate.d2
+        if let modelPath = resolvedTuneModelPath(),
+           let metadata = MTPLXRuntimeMetadata.read(
+               at: URL(fileURLWithPath: NSString(string: modelPath).expandingTildeInPath)
+                   .appendingPathComponent("mtplx_runtime.json").path
+           ) {
+            if metadata.rawJSON["recommended_generation_mode"] as? String == "ar" {
+                candidate = .ar
+            } else if let depth = metadata.rawJSON["mtp_depth_default"] as? Int
+                ?? metadata.rawJSON["recommended_mtp_depth"] as? Int,
+                depth > 0,
+                depth <= (metadata.mtpDepthMax ?? 3),
+                let declared = state.tuneCandidates.first(where: { $0.controlValue == depth }) {
+                candidate = declared
+            }
+        }
         tuneResult = TuneResult(
-            bestCandidate: .d2,
-            bestDepth: 2,
+            bestCandidate: candidate,
+            bestDepth: candidate.controlValue,
             bestTokS: 0,
             bestMultiplierVsAR: 0,
             allCandidates: []
@@ -598,7 +637,7 @@ public final class OnboardingOrchestrator: ObservableObject {
             isTuning = false
         case .failed(_, let stderrTail):
             tuneStatusMessage = nil
-            tuneFailure = stderrTail.isEmpty ? "Tuning failed." : stderrTail
+            tuneFailure = stderrTail.isEmpty ? tr("Tuning failed.") : stderrTail
             isTuning = false
         case .cancelled:
             tuneStatusMessage = nil
@@ -607,7 +646,8 @@ public final class OnboardingOrchestrator: ObservableObject {
     }
 
     private func resolvedTuneModelPath() -> String? {
-        if let local = state.resolvedModel?.installedLocalPath {
+        if let model = state.resolvedModel,
+           let local = model.installedLocalPath(in: modelLibrary) {
             return local
         }
         // The tune subprocess can also resolve an HF id directly via

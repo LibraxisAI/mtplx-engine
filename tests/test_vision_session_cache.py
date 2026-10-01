@@ -109,6 +109,116 @@ class TestVisionBankKeyIds:
         assert vision_bank_key_ids(prompt, splice) is None
 
 
+class TestFlashNextPositionSchemeKey:
+    """The version salt of Flash-Next entries roped through the M-RoPE table.
+
+    Builds 2.10.1 to 2.11.3 wrote those entries under the unsalted key, and
+    their copy-round, repair and final-commit rows sit |delta| positions off.
+    The key this build writes must never match one of them at or past an
+    image, while every other key stays what it was.
+    """
+
+    PROMPT = (1, 2, PAD, PAD, PAD, PAD, 3, 4)
+    DIGEST = 0x1234ABCD
+    GRID = (1, 4, 4)
+
+    def splice(self, *, table=True, delta=-2, grid=GRID, dense=None):
+        return VisionSplice(
+            image_pad_token_id=PAD,
+            embeddings=mx.zeros((4, 8)),
+            image_digests=(self.DIGEST,),
+            pad_counts=(4,),
+            image_grids=(grid,),
+            mrope_table=mx.zeros((3, len(self.PROMPT)), dtype=mx.int32) if table else None,
+            mrope_delta=delta,
+            dense_mrope=dense,
+        )
+
+    def key_older_builds_wrote(self):
+        """Written out by hand: digest and row index, nothing else."""
+        from mtplx.vision.splice import _BANK_KEY_MASK, _BANK_KEY_MIX
+
+        keyed = list(self.PROMPT)
+        for row, pos in enumerate(i for i, t in enumerate(self.PROMPT) if t == PAD):
+            keyed[pos] = _BANK_KEY_FLAG | (
+                (self.DIGEST ^ (row * _BANK_KEY_MIX)) & _BANK_KEY_MASK
+            )
+        return keyed
+
+    def test_salt_is_the_hashed_scheme_tag(self):
+        import hashlib
+
+        from mtplx.vision.mrope import BANK_KEY_SCHEME
+        from mtplx.vision.splice import (
+            _BANK_KEY_MASK,
+            _DENSE_MROPE_KEY_SALT,
+            _QWEN4_MROPE_KEY_SALT,
+        )
+
+        # A new scheme is a new tag and a new salt; keys written under this
+        # one stay readable across processes and on disk.
+        assert BANK_KEY_SCHEME == "qwen4_mrope_v2"
+        digest = hashlib.blake2b(BANK_KEY_SCHEME.encode(), digest_size=8).digest()
+        assert _QWEN4_MROPE_KEY_SALT == int.from_bytes(digest, "big") & _BANK_KEY_MASK
+        assert _QWEN4_MROPE_KEY_SALT not in (0, _DENSE_MROPE_KEY_SALT)
+
+    def test_roped_request_never_matches_the_key_older_builds_wrote(self):
+        old = self.key_older_builds_wrote()
+        new = vision_bank_key_ids(self.PROMPT, self.splice())
+        pads = [i for i, token in enumerate(self.PROMPT) if token == PAD]
+        # A prefix match can still reach the image through the shared text...
+        assert all(new[i] == old[i] for i in range(len(self.PROMPT)) if i not in pads)
+        # ...and never goes past its first row.
+        assert all(new[i] != old[i] for i in pads)
+        assert all(new[i] & _BANK_KEY_FLAG for i in pads)
+        assert len({new[i] for i in pads}) == len(pads)
+        # Stable: the same request keys the same way, turn after turn.
+        assert vision_bank_key_ids(self.PROMPT, self.splice()) == new
+        longer = [*self.PROMPT, 5, 6]
+        table = mx.zeros((3, len(longer)), dtype=mx.int32)
+        follow_up = self.splice()
+        follow_up.mrope_table = table
+        assert vision_bank_key_ids(longer, follow_up)[: len(new)] == new
+
+    def test_sequentially_roped_image_request_keeps_the_key_it_always_had(self):
+        # No table and no delta (a family without the contract, or a table
+        # that could not be built): every forward ropes at the raw index, on
+        # older builds too, so those entries are sound and stay reachable.
+        sequential = vision_bank_key_ids(self.PROMPT, self.splice(table=False, delta=0))
+        assert sequential == self.key_older_builds_wrote()
+
+    def test_key_is_salted_exactly_when_the_attention_scope_is_armed(self):
+        import contextlib
+
+        from mtplx import generation
+        from mtplx.attention_context import vision_rope_state
+
+        old = self.key_older_builds_wrote()
+        for table, delta in ((True, -2), (True, 0), (False, -2), (False, 0)):
+            splice = self.splice(table=table, delta=delta)
+            scope = generation._vision_rope_scope_for(splice)
+            armed = not isinstance(scope, contextlib.nullcontext)
+            with scope:
+                assert (vision_rope_state() is not None) == armed
+            salted = vision_bank_key_ids(self.PROMPT, splice) != old
+            assert salted == armed == (table or delta != 0)
+
+    def test_grid_and_scheme_are_part_of_the_key(self):
+        from types import SimpleNamespace
+
+        pads = [i for i, token in enumerate(self.PROMPT) if token == PAD]
+        roped = vision_bank_key_ids(self.PROMPT, self.splice())
+        other_grid = vision_bank_key_ids(self.PROMPT, self.splice(grid=(1, 2, 8)))
+        assert all(roped[i] != other_grid[i] for i in pads)
+        # The dense path keeps its own scheme: same pixels, other keys.
+        dense = vision_bank_key_ids(
+            self.PROMPT,
+            self.splice(table=False, delta=0, dense=SimpleNamespace()),
+        )
+        assert all(dense[i] != roped[i] for i in pads)
+        assert all(dense[i] != self.key_older_builds_wrote()[i] for i in pads)
+
+
 class TestImageContentDigest:
     def test_digest_stable_and_content_sensitive(self):
         from mtplx.server.openai import _image_content_digest

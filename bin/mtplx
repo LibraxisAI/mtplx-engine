@@ -116,4 +116,4 @@ fi
 exec env \
     PYTHONPATH="$PYTHONPATH_ROOTS${PYTHONPATH:+:$PYTHONPATH}" \
     PYTHONPYCACHEPREFIX="$PYCACHE_ROOT" \
-    "$VENV_PY" -m mtplx.cli "$@"
+    "$VENV_PY" -P -m mtplx.cli "$@"

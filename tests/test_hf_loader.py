@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 import time
 from types import ModuleType, SimpleNamespace
@@ -10,14 +11,22 @@ from pathlib import Path
 import pytest
 
 from mtplx.hf_loader import (
+    RepoFile,
+    _safe_destination_for_repo_file,
+    _call_hub_with_anonymous_fallback,
     cached_model_is_complete,
     cached_model_path,
+    directory_size_bytes,
     hf_token_for_download,
+    hf_token_source,
     hf_cache_report,
     list_cached_models,
+    model_library_roots,
+    manifest_bytes_on_disk,
     pull_model,
     remove_cached_model,
     repo_id_from_model_ref,
+    resolve_cached_model_target,
     resolve_model_path,
     safe_model_name,
     validate_mtplx_model_files,
@@ -72,6 +81,12 @@ class _FakeHubSession:
             chunks = [payload]
         else:
             chunks = payload
+        range_header = str((kwargs.get("headers") or {}).get("Range") or "")
+        if range_header.startswith("bytes=") and isinstance(payload, bytes):
+            offset = int(range_header[len("bytes="):].rstrip("-"))
+            if offset >= len(payload):
+                return _FakeHubResponse([], status_code=416)
+            return _FakeHubResponse([payload[offset:]], status_code=206)
         return _FakeHubResponse(chunks)
 
 
@@ -80,6 +95,8 @@ def _install_fake_hub(
     files: dict[str, bytes | list[bytes | tuple[bytes, float]]],
     *,
     captured: dict[str, object] | None = None,
+    blob_ids: dict[str, str] | None = None,
+    sha256: dict[str, str] | None = None,
 ) -> _FakeHubSession:
     captured = captured if captured is not None else {}
     session = _FakeHubSession(files)
@@ -91,7 +108,12 @@ def _install_fake_hub(
             captured["model_info_token"] = kwargs.get("token")
             return SimpleNamespace(
                 siblings=[
-                    SimpleNamespace(rfilename=name, size=sum(len(item[0] if isinstance(item, tuple) else item) for item in payload) if isinstance(payload, list) else len(payload))
+                    SimpleNamespace(
+                        rfilename=name,
+                        size=sum(len(item[0] if isinstance(item, tuple) else item) for item in payload) if isinstance(payload, list) else len(payload),
+                        blob_id=(blob_ids or {}).get(name),
+                        lfs={"sha256": sha256[name]} if sha256 and name in sha256 else None,
+                    )
                     for name, payload in files.items()
                 ]
             )
@@ -159,6 +181,36 @@ def test_safe_model_name_and_cache_path(tmp_path: Path):
     assert cached_model_path("mtplx/example", cache_dir=tmp_path) == tmp_path / "mtplx--example"
 
 
+def _write_complete_model(root: Path, name: str = "mtplx--example") -> Path:
+    model = root / name
+    model.mkdir(parents=True)
+    (model / "config.json").write_text("{}\n", encoding="utf-8")
+    (model / "model.safetensors").write_bytes(b"weights")
+    return model
+
+
+def test_model_library_roots_are_ordered_canonical_and_deduplicated(
+    tmp_path: Path, monkeypatch
+):
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    third = tmp_path / "third"
+    secondary.mkdir()
+    alias = tmp_path / "secondary-alias"
+    alias.symlink_to(secondary, target_is_directory=True)
+    monkeypatch.setenv("MTPLX_MODEL_DIRS", f"{alias}{os.pathsep}{third}")
+
+    roots = model_library_roots(
+        primary, search_dirs=[secondary, primary, secondary]
+    )
+
+    assert roots == (
+        primary.resolve(),
+        secondary.resolve(),
+        third.resolve(),
+    )
+
+
 def test_resolve_model_path_uses_cache_for_hf_refs(tmp_path: Path):
     cached = tmp_path / "mtplx--example"
     cached.mkdir()
@@ -166,6 +218,31 @@ def test_resolve_model_path_uses_cache_for_hf_refs(tmp_path: Path):
     (cached / "model.safetensors").write_bytes(b"1234")
 
     assert resolve_model_path("mtplx/example", cache_dir=tmp_path) == cached
+
+
+def test_resolve_model_path_uses_first_complete_copy_and_explicit_path_first(
+    tmp_path: Path,
+):
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    third = tmp_path / "third"
+    partial = primary / "mtplx--example"
+    partial.mkdir(parents=True)
+    (partial / "config.json").write_text("{}\n", encoding="utf-8")
+    second_copy = _write_complete_model(secondary)
+    third_copy = _write_complete_model(third)
+
+    assert resolve_model_path(
+        "mtplx/example", cache_dir=primary, search_dirs=[secondary, third]
+    ) == second_copy
+    assert resolve_model_path(
+        str(third_copy), cache_dir=primary, search_dirs=[secondary]
+    ) == third_copy
+
+    (partial / "model.safetensors").write_bytes(b"weights")
+    assert resolve_model_path(
+        "mtplx/example", cache_dir=primary, search_dirs=[secondary, third]
+    ) == partial
 
 
 def test_resolve_model_path_rejects_unpinned_laguna_cache(tmp_path: Path):
@@ -211,13 +288,28 @@ def test_cached_model_is_complete_rejects_partial_index_even_with_one_shard(
 
 
 def test_cached_model_is_complete_rejects_incomplete_transfer_marker(tmp_path: Path):
+    # A partial whose final file has not landed is an interrupted transfer.
+    cached = tmp_path / "mtplx--example"
+    cached.mkdir()
+    (cached / "config.json").write_text("{}\n", encoding="utf-8")
+    (cached / "model.safetensors.incomplete").write_bytes(b"partial")
+
+    assert cached_model_is_complete(cached) is False
+
+
+def test_cached_model_is_complete_ignores_partial_next_to_landed_weights(tmp_path: Path):
+    # A partial next to a landed final file is a leftover of an earlier
+    # attempt, not a transfer: the downloader replaces its partial into the
+    # final atomically and unlinks a stale final before re-fetching. Treating
+    # the leftover as "partial" kept a byte-complete folder on an endless
+    # Retry in the app.
     cached = tmp_path / "mtplx--example"
     cached.mkdir()
     (cached / "config.json").write_text("{}\n", encoding="utf-8")
     (cached / "model.safetensors").write_bytes(b"weights")
     (cached / "model.safetensors.incomplete").write_bytes(b"partial")
 
-    assert cached_model_is_complete(cached) is False
+    assert cached_model_is_complete(cached) is True
 
 
 def test_cached_model_is_complete_rejects_shards_that_sort_before_index(
@@ -494,14 +586,268 @@ def test_pull_model_structured_stream_reports_written_bytes(
     assert all(event.get("message") == "Downloading model files" for event in progress_events)
 
 
-def test_hf_token_for_download_uses_explicit_env_only(monkeypatch):
+def test_manifest_bytes_on_disk_counts_only_manifest_files(tmp_path: Path):
+    destination = tmp_path / "mtplx--example"
+    (destination / "sub").mkdir(parents=True)
+    (destination / "config.json").write_bytes(b"{}\n")
+    (destination / "sub" / "shard.safetensors.incomplete").write_bytes(b"12345")
+    (destination / "stale.safetensors").write_bytes(b"0123456789")
+    (destination / "model-00001-of-00002.safetensors").write_bytes(b"x" * 200)
+    leftovers = destination / ".cache" / "huggingface" / "download"
+    leftovers.mkdir(parents=True)
+    (leftovers / "model.safetensors.incomplete").write_bytes(b"y" * 300)
+    manifest = [
+        RepoFile(path="config.json", size_bytes=3),
+        RepoFile(path="sub/shard.safetensors", size_bytes=3),
+        RepoFile(path="stale.safetensors", size_bytes=4),
+        RepoFile(path="missing.json", size_bytes=9),
+    ]
+
+    assert directory_size_bytes(destination) > 500
+    # landed and matching (3) + partial capped at its expected size (3);
+    # the size-mismatched stale copy, the missing file, the shard from a
+    # superseded revision, and the hub staging leftover count nothing.
+    assert manifest_bytes_on_disk(destination, manifest) == 6
+
+
+def test_pull_model_progress_never_exceeds_repo_size_with_stale_files(
+    tmp_path: Path, monkeypatch
+):
+    cached = tmp_path / "mtplx--example"
+    cached.mkdir()
+    (cached / "model-00001-of-00003.safetensors").write_bytes(b"s" * 200)
+    leftovers = cached / ".cache" / "huggingface" / "download"
+    leftovers.mkdir(parents=True)
+    (leftovers / "model-00001-of-00001.safetensors.incomplete").write_bytes(b"l" * 300)
+    index = b'{"weight_map": {"lm_head.weight": "model-00001-of-00001.safetensors"}}\n'
+    _install_fake_hub(
+        monkeypatch,
+        {
+            "config.json": b"{}\n",
+            "model.safetensors.index.json": index,
+            "model-00001-of-00001.safetensors": [
+                (b"w" * 32, 0.02),
+                (b"w" * 32, 0.02),
+            ],
+        },
+    )
+    events: list[dict] = []
+
+    result = pull_model(
+        "mtplx/example",
+        cache_dir=tmp_path,
+        progress_callback=events.append,
+        progress_interval_s=0.01,
+    )
+
+    total = 3 + len(index) + 64
+    assert result["started_size_bytes"] == 0
+    assert result["resumed_existing"] is False
+    assert events[0]["event"] == "start"
+    assert events[0]["size_bytes"] == 0
+    assert directory_size_bytes(cached) > total
+    sized = [event for event in events if event.get("size_bytes") is not None and event.get("total_bytes")]
+    assert sized
+    assert all(event["size_bytes"] <= event["total_bytes"] for event in sized)
+    assert events[-1]["event"] == "complete"
+    assert events[-1]["size_bytes"] == total
+    assert events[-1]["total_bytes"] == total
+
+
+def _stub_login_token(monkeypatch, token: str | None) -> None:
+    """Pin the `hf auth login` token the real huggingface_hub would read from
+    disk, so these tests never depend on this machine's login state."""
+
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "get_token", lambda: token)
+
+
+def test_hf_token_resolution_is_env_then_login_then_anonymous(monkeypatch):
+    # Three token policies used to coexist: pull sent only HF_TOKEN, doctor
+    # reported the login token as present, inspect sent the login token. One
+    # resolver now serves them all, and it is the library's own order.
     monkeypatch.delenv("HF_TOKEN", raising=False)
     monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
 
+    _stub_login_token(monkeypatch, None)
     assert hf_token_for_download() is False
+    assert hf_token_source() is None
+
+    _stub_login_token(monkeypatch, "hf_login")
+    assert hf_token_for_download() == "hf_login"
+    assert hf_token_source() == "login"
 
     monkeypatch.setenv("HF_TOKEN", "hf_explicit")
     assert hf_token_for_download() == "hf_explicit"
+    assert hf_token_source() == "environment"
+
+    monkeypatch.delenv("HF_TOKEN")
+    monkeypatch.setenv("HUGGING_FACE_HUB_TOKEN", "hf_legacy_env")
+    assert hf_token_for_download() == "hf_legacy_env"
+    assert hf_token_source() == "environment"
+
+
+class _Refused(Exception):
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"HTTP {status_code}")
+        self.response = SimpleNamespace(status_code=status_code)
+
+
+def test_rejected_stored_token_is_retried_anonymously_for_public_repos():
+    calls: list[str | bool] = []
+
+    def hub_call(token):
+        calls.append(token)
+        if token:
+            raise _Refused(401)
+        return "public-metadata"
+
+    result, token_used = _call_hub_with_anonymous_fallback(hub_call, "hf_stale")
+
+    assert result == "public-metadata"
+    assert token_used is False
+    assert calls == ["hf_stale", False]
+
+
+def test_gated_repo_reports_the_original_refusal_after_the_anonymous_retry():
+    def hub_call(token):
+        raise _Refused(403 if token else 401)
+
+    with pytest.raises(_Refused) as excinfo:
+        _call_hub_with_anonymous_fallback(hub_call, "hf_valid_but_not_approved")
+
+    assert excinfo.value.response.status_code == 403
+
+
+def test_anonymous_fallback_never_retries_without_a_token_or_on_other_errors():
+    calls: list[str | bool] = []
+
+    def refused(token):
+        calls.append(token)
+        raise _Refused(401)
+
+    with pytest.raises(_Refused):
+        _call_hub_with_anonymous_fallback(refused, False)
+    assert calls == [False]
+
+    calls.clear()
+
+    def offline(token):
+        calls.append(token)
+        raise OSError("offline")
+
+    with pytest.raises(OSError):
+        _call_hub_with_anonymous_fallback(offline, "hf_token")
+    assert calls == ["hf_token"]
+
+
+def test_pull_model_sends_the_login_token_when_one_is_stored(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+    captured: dict[str, object] = {}
+    _install_fake_hub(
+        monkeypatch,
+        {
+            "config.json": b"{}\n",
+            "model.safetensors.index.json": b'{"weight_map": {"lm_head.weight": "model-00001-of-00001.safetensors"}}\n',
+            "model-00001-of-00001.safetensors": b"weights",
+        },
+        captured=captured,
+    )
+    sys.modules["huggingface_hub"].get_token = lambda: "hf_login"
+
+    pull_model("mtplx/example", cache_dir=tmp_path, progress_callback=lambda _e: None, progress_interval_s=0)
+
+    assert captured["model_info_token"] == "hf_login"
+    assert captured["headers_token"] == "hf_login"
+
+
+def test_pull_model_falls_back_to_anonymous_when_the_stored_token_is_rejected(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+    captured: dict[str, object] = {}
+    _install_fake_hub(
+        monkeypatch,
+        {
+            "config.json": b"{}\n",
+            "model.safetensors.index.json": b'{"weight_map": {"lm_head.weight": "model-00001-of-00001.safetensors"}}\n',
+            "model-00001-of-00001.safetensors": b"weights",
+        },
+        captured=captured,
+    )
+    hub = sys.modules["huggingface_hub"]
+    hub.get_token = lambda: "hf_revoked"
+    original_model_info = hub.HfApi.model_info
+    tokens_seen: list[str | bool] = []
+
+    def refusing_model_info(self, **kwargs):
+        tokens_seen.append(kwargs.get("token"))
+        if kwargs.get("token"):
+            raise _Refused(401)
+        return original_model_info(self, **kwargs)
+
+    hub.HfApi.model_info = refusing_model_info
+
+    result = pull_model(
+        "mtplx/example", cache_dir=tmp_path, progress_callback=lambda _e: None, progress_interval_s=0
+    )
+
+    assert result["path"] == str(tmp_path / "mtplx--example")
+    # Each metadata call (freshness marker, then the download) tried the
+    # stored token once and fell back to anonymous.
+    assert len(tokens_seen) >= 2
+    assert tokens_seen[::2] == ["hf_revoked"] * (len(tokens_seen) // 2)
+    assert tokens_seen[1::2] == [False] * (len(tokens_seen) // 2)
+    # Every file fetch sends the credential that actually worked.
+    assert captured["headers_token"] is False
+
+
+def test_hf_cache_report_tells_the_truth_about_the_token(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+
+    _stub_login_token(monkeypatch, None)
+    anonymous = hf_cache_report(cache_dir=tmp_path)
+    assert anonymous["token_present"] is False
+    assert anonymous["token_source"] is None
+    assert anonymous["token_used_by_pull"] is False
+
+    _stub_login_token(monkeypatch, "hf_login")
+    login = hf_cache_report(cache_dir=tmp_path)
+    assert login["token_present"] is True
+    assert login["token_source"] == "login"
+    assert login["token_used_by_pull"] is True
+    assert "hf auth login" in login["token_policy"]
+
+    monkeypatch.setenv("HF_TOKEN", "hf_explicit")
+    env = hf_cache_report(cache_dir=tmp_path)
+    assert env["token_source"] == "environment"
+    assert env["token_used_by_pull"] is True
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("environment", "hugging face token: from HF_TOKEN (used by mtplx pull)"),
+        ("login", "hugging face token: from `hf auth login` (used by mtplx pull)"),
+        (None, "hugging face token: none (public models need none"),
+    ],
+)
+def test_doctor_human_output_states_the_token_policy(capsys, source, expected):
+    from mtplx.commands.public import _render_doctor_report
+
+    report = {
+        "environment": {},
+        "huggingface": {"token_source": source, "token_present": source is not None},
+        "thermal_control": {},
+        "tools": {},
+    }
+
+    assert _render_doctor_report(SimpleNamespace(summary=False, deep=False), report) == 0
+    assert expected in capsys.readouterr().out
 
 
 def test_pull_model_downloads_public_models_anonymously_by_default(
@@ -647,17 +993,18 @@ def test_remove_cached_model_refuses_paths_outside_cache(tmp_path: Path, ref: st
     assert (model / "weights.bin").read_bytes() == b"1234"
 
 
-def test_remove_cached_model_contains_dotdot_refs_inside_cache(tmp_path: Path):
-    # "../.." is not an escape: safe_model_name folds it to the literal child
-    # name "..--..", which stays inside the cache. It must therefore be a
-    # plain miss, not a deletion and not a traversal.
+def test_remove_cached_model_refuses_dotdot_refs(tmp_path: Path):
+    # "../.." names no cached directory. It used to fold to the literal child
+    # "..--.." and report a plain miss; refusing every separator-bearing ref
+    # keeps the fence one rule, and nothing beside the sentinel may move.
     home, cache, model = _traversal_cache(tmp_path)
 
-    result = remove_cached_model("../..", cache_dir=cache)
+    with pytest.raises(ValueError) as excinfo:
+        remove_cached_model("../..", cache_dir=cache)
 
-    assert result["removed"] is False
-    assert Path(result["path"]).parent == cache.resolve()
+    assert repr("../..") in str(excinfo.value)
     assert home.exists()
+    assert cache.exists()
     assert (home / "config.toml").exists()
     assert (model / "weights.bin").read_bytes() == b"1234"
 
@@ -724,6 +1071,368 @@ def test_remove_cli_refuses_traversal_even_with_yes(tmp_path: Path, capsys):
     assert home.exists()
     assert (home / "config.toml").exists()
     assert (model / "weights.bin").read_bytes() == b"1234"
+
+
+def test_multi_root_inventory_retains_duplicate_paths_and_root_identity(tmp_path: Path):
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    first = _write_complete_model(primary)
+    second = _write_complete_model(secondary)
+
+    rows = list_cached_models(cache_dir=primary, search_dirs=[secondary])
+
+    assert [row.path for row in rows] == [first, second]
+    assert [row.root for row in rows] == [primary.resolve(), secondary.resolve()]
+    assert [row.root_index for row in rows] == [0, 1]
+    assert [row.is_primary for row in rows] == [True, False]
+
+
+def test_multi_root_inventory_dedupes_physical_aliases(tmp_path: Path):
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    model = _write_complete_model(primary)
+    secondary.mkdir()
+    (secondary / "mtplx--example").symlink_to(model, target_is_directory=True)
+
+    rows = list_cached_models(cache_dir=primary, search_dirs=[secondary])
+
+    assert [row.path for row in rows] == [model]
+
+
+def test_remove_multi_root_is_ambiguous_and_secondary_is_discovery_only(
+    tmp_path: Path,
+):
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    _write_complete_model(primary)
+    secondary_copy = _write_complete_model(secondary)
+
+    with pytest.raises(ValueError, match="multiple installed copies"):
+        remove_cached_model(
+            "mtplx/example", cache_dir=primary, search_dirs=[secondary]
+        )
+
+    (primary / "mtplx--example").rename(primary / "unrelated")
+    with pytest.raises(ValueError, match="discovery-only root"):
+        remove_cached_model(
+            "mtplx/example", cache_dir=primary, search_dirs=[secondary]
+        )
+    result = remove_cached_model("mtplx/example", cache_dir=secondary)
+    assert result["removed"] is True
+    assert not secondary_copy.exists()
+
+
+def test_remove_with_an_explicit_root_ignores_copies_in_other_folders(tmp_path: Path):
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    primary_copy = _write_complete_model(primary)
+    secondary_copy = _write_complete_model(secondary)
+
+    repo_id, target = resolve_cached_model_target(
+        "mtplx/example",
+        cache_dir=primary,
+        search_dirs=[secondary],
+        explicit_root=True,
+    )
+    assert (repo_id, target) == ("mtplx/example", primary_copy)
+
+    result = remove_cached_model(
+        "mtplx/example",
+        cache_dir=primary,
+        search_dirs=[secondary],
+        explicit_root=True,
+    )
+
+    assert result["removed"] is True
+    assert not primary_copy.exists()
+    assert (secondary_copy / "model.safetensors").is_file()
+
+
+def test_remove_with_an_explicit_root_never_reaches_into_another_folder(
+    tmp_path: Path,
+):
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    secondary = tmp_path / "secondary"
+    secondary_copy = _write_complete_model(secondary)
+
+    result = remove_cached_model(
+        "mtplx/example",
+        cache_dir=primary,
+        search_dirs=[secondary],
+        explicit_root=True,
+    )
+
+    assert result["removed"] is False
+    assert result["path"] == str(primary.resolve() / "mtplx--example")
+    assert (secondary_copy / "model.safetensors").is_file()
+
+
+def test_remove_cli_cache_dir_flag_selects_that_folder_as_the_refusal_advises(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """The app's exact argv. A second copy in a folder named by
+    MTPLX_MODEL_DIRS used to make this ambiguous, and the refusal's own
+    advice (pass --cache-dir) was already being followed."""
+    from mtplx.cli import main
+
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    primary_copy = _write_complete_model(primary)
+    secondary_copy = _write_complete_model(secondary)
+    monkeypatch.setenv("MTPLX_MODEL_DIRS", str(secondary))
+
+    exit_code = main(
+        [
+            "remove", "mtplx--example", "--yes", "--missing-ok", "--json",
+            "--cache-dir", str(primary),
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["removed"] is True
+    assert Path(payload["path"]) == primary_copy
+    assert not primary_copy.exists()
+    assert (secondary_copy / "model.safetensors").is_file()
+
+
+def test_remove_cli_without_cache_dir_flag_still_refuses_an_ambiguous_ref(
+    tmp_path: Path, monkeypatch, capsys
+):
+    from mtplx.cli import main
+
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    primary_copy = _write_complete_model(primary)
+    _write_complete_model(secondary)
+    monkeypatch.setenv("MTPLX_MODEL_DIR", str(primary))
+    monkeypatch.setenv("MTPLX_MODEL_DIRS", str(secondary))
+
+    exit_code = main(["remove", "mtplx/example", "--yes", "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 2
+    assert "multiple installed copies" in payload["detail"]
+    assert primary_copy.is_dir()
+
+
+def test_remove_top_level_symlink_unlinks_without_touching_target(tmp_path: Path):
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    target = _write_complete_model(tmp_path / "external", name="real-model")
+    overlay = primary / "mtplx--example"
+    overlay.symlink_to(target, target_is_directory=True)
+
+    result = remove_cached_model("mtplx/example", cache_dir=primary)
+
+    assert result["removed"] is True
+    assert not overlay.exists()
+    assert target.is_dir()
+    assert (target / "model.safetensors").is_file()
+
+
+@pytest.mark.parametrize("model_ref", [".", "..", "--", "owner--..--model"])
+def test_remove_rejects_paths_that_escape_or_name_the_cache_root(
+    tmp_path: Path, model_ref: str
+):
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    marker = tmp_path / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid cached model reference"):
+        remove_cached_model(model_ref, cache_dir=primary)
+
+    assert primary.is_dir()
+    assert marker.read_text(encoding="utf-8") == "keep"
+
+
+def test_pull_writes_primary_even_when_complete_copy_exists_in_search_root(
+    tmp_path: Path, monkeypatch
+):
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    _write_complete_model(secondary)
+    monkeypatch.setenv("MTPLX_MODEL_DIRS", str(secondary))
+    _install_fake_hub(
+        monkeypatch,
+        {
+            "config.json": b"{}\n",
+            "model.safetensors": b"primary-weights",
+        },
+    )
+
+    result = pull_model(
+        "mtplx/example",
+        cache_dir=primary,
+        progress_callback=lambda _event: None,
+        progress_interval_s=0,
+    )
+
+    assert Path(result["path"]).parent == primary
+    assert (primary / "mtplx--example" / "model.safetensors").read_bytes() == b"primary-weights"
+
+
+def test_pull_rejects_top_level_symlink_destination(tmp_path: Path):
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    target = tmp_path / "target"
+    target.mkdir()
+    overlay = primary / "mtplx--example"
+    overlay.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="top-level symlink"):
+        pull_model("mtplx/example", cache_dir=primary)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can create any directory")
+def test_pull_explains_unavailable_model_root(tmp_path: Path):
+    # A library on a drive that is not connected resolves to a path nobody can
+    # create (mkdir under /Volumes is refused for users); a read-only parent
+    # fails the same way. The error names the model directory and the cause.
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+    root = locked / "ExternalSSD" / "models"
+    try:
+        with pytest.raises(RuntimeError, match="is not available") as excinfo:
+            pull_model("mtplx/example", cache_dir=root)
+    finally:
+        locked.chmod(0o700)
+
+    assert str(root) in str(excinfo.value)
+    assert "not mounted" in str(excinfo.value)
+    assert not root.exists()
+
+
+def test_pull_explains_model_root_symlink_to_unmounted_volume(tmp_path: Path):
+    # The #466 layout: the cache is a symlink onto an external drive. With
+    # the drive unplugged the link dangles and mkdir raised FileExistsError
+    # for the link itself; the error must say the target volume is missing.
+    link = tmp_path / "models"
+    target = tmp_path / "unplugged" / "models"
+    link.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="is not available") as excinfo:
+        pull_model("mtplx/example", cache_dir=link)
+
+    assert str(target) in str(excinfo.value)
+    assert "not mounted" in str(excinfo.value)
+    assert link.is_symlink() and not target.exists()
+
+
+def test_pull_rejects_unsafe_filename_before_snapshot_write(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(
+        "mtplx.hf_loader._query_repo_snapshot",
+        lambda *_args, **_kwargs: (
+            "sha-new",
+            {"../escape": {"size": 1, "blob_id": "bad"}},
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(
+            snapshot_download=lambda **_kwargs: pytest.fail("must not write")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="unsafe file path"):
+        pull_model("mtplx/example", cache_dir=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "repo_path",
+    ["/tmp/escape", "../escape", "nested/../../escape", r"C:\\escape"],
+)
+def test_repo_file_destination_rejects_absolute_and_parent_paths(
+    tmp_path: Path, repo_path: str
+):
+    with pytest.raises(RuntimeError, match="unsafe file path"):
+        _safe_destination_for_repo_file(
+            tmp_path, RepoFile(path=repo_path, size_bytes=None)
+        )
+
+
+def test_repo_file_destination_rejects_nested_symlink_parent(tmp_path: Path):
+    destination = tmp_path / "model"
+    destination.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (destination / "nested").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="unsafe symlink component"):
+        _safe_destination_for_repo_file(
+            destination, RepoFile(path="nested/file.bin", size_bytes=None)
+        )
+
+
+def test_remove_cached_model_unlinks_symlink_without_deleting_target(tmp_path: Path):
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "weights.safetensors").write_bytes(b"weights")
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    link = cache / "mtplx--example"
+    link.symlink_to(external, target_is_directory=True)
+
+    removed = remove_cached_model("mtplx/example", cache_dir=cache)
+
+    assert removed["removed"] is True
+    assert removed["size_bytes_removed"] == 0
+    assert not link.exists()
+    assert not link.is_symlink()
+    assert (external / "weights.safetensors").read_bytes() == b"weights"
+
+
+def test_remove_exact_cache_entry_name_beats_public_alias(tmp_path: Path):
+    from mtplx.artifacts import _KNOWN_PUBLIC_MODEL_ALIASES
+
+    alias, canonical_repo = next(
+        (key, value) for key, value in _KNOWN_PUBLIC_MODEL_ALIASES.items() if "/" not in key
+    )
+    hand_named = tmp_path / alias
+    hand_named.mkdir()
+    (hand_named / "config.json").write_text("{}", encoding="utf-8")
+    canonical = tmp_path / safe_model_name(canonical_repo)
+    canonical.mkdir()
+    (canonical / "config.json").write_text("{}", encoding="utf-8")
+
+    repo_id, target = resolve_cached_model_target(alias, cache_dir=tmp_path)
+    assert target == hand_named
+    assert repo_id == alias
+
+    removed = remove_cached_model(alias, cache_dir=tmp_path)
+
+    assert removed["path"] == str(hand_named)
+    assert not hand_named.exists()
+    assert (canonical / "config.json").exists()
+
+
+def test_remove_alias_still_resolves_when_no_entry_spells_it(tmp_path: Path):
+    from mtplx.artifacts import _KNOWN_PUBLIC_MODEL_ALIASES
+
+    alias, canonical_repo = next(
+        (key, value) for key, value in _KNOWN_PUBLIC_MODEL_ALIASES.items() if "/" not in key
+    )
+    canonical = tmp_path / safe_model_name(canonical_repo)
+    canonical.mkdir()
+
+    repo_id, target = resolve_cached_model_target(alias, cache_dir=tmp_path)
+
+    assert repo_id == canonical_repo
+    assert target == canonical
+
+
+def test_remove_cached_model_refuses_non_directory_cache_entry(tmp_path: Path):
+    entry = tmp_path / "mtplx--example"
+    entry.write_text("not a model directory", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not a directory"):
+        remove_cached_model("mtplx/example", cache_dir=tmp_path)
+
+    assert entry.read_text(encoding="utf-8") == "not a model directory"
 
 
 def test_hf_cache_report_is_no_network(tmp_path: Path, monkeypatch):
@@ -988,3 +1697,200 @@ def test_pull_model_force_sync_skips_reuse(tmp_path: Path, monkeypatch):
 
     assert result["reused_existing"] is False
     assert captured["snapshot_revision"] == "commit-aaa"
+
+
+_SHARD = "model-00001-of-00001.safetensors"
+_INDEX = b'{"weight_map": {"lm_head.weight": "model-00001-of-00001.safetensors"}}\n'
+
+
+def _remote_pack(weights: bytes) -> dict[str, bytes]:
+    return {"config.json": b"{}\n", "model.safetensors.index.json": _INDEX, _SHARD: weights}
+
+
+def _shard_requests(session) -> list[dict]:
+    return [request for request in session.requests if request["url"].endswith(_SHARD)]
+
+
+def test_pull_model_discards_a_partial_from_a_superseded_blob(tmp_path: Path, monkeypatch):
+    cached = tmp_path / "mtplx--example"
+    cached.mkdir()
+    (cached / f"{_SHARD}.incomplete").write_bytes(b"stale-")
+    (cached / ".mtplx-transfer.json").write_text(
+        json.dumps({"repo_id": "mtplx/example", "revision": "old", "files": {_SHARD: {"blob_id": "blob-old"}}}),
+        encoding="utf-8",
+    )
+    session = _install_fake_hub(
+        monkeypatch, _remote_pack(b"fresh-weights"), blob_ids={_SHARD: "blob-new"}
+    )
+    events: list[dict] = []
+
+    pull_model("mtplx/example", cache_dir=tmp_path, progress_callback=events.append, progress_interval_s=0)
+
+    assert (cached / _SHARD).read_bytes() == b"fresh-weights"
+    assert "Range" not in (_shard_requests(session)[0].get("headers") or {})
+    assert events[0]["event"] == "start"
+    assert events[0]["size_bytes"] == 0
+    assert not (cached / ".mtplx-transfer.json").exists()
+
+
+def test_pull_model_resumes_a_partial_from_the_same_blob_and_verifies_it(tmp_path: Path, monkeypatch):
+    cached = tmp_path / "mtplx--example"
+    cached.mkdir()
+    (cached / f"{_SHARD}.incomplete").write_bytes(b"fresh-")
+    (cached / ".mtplx-transfer.json").write_text(
+        json.dumps({"repo_id": "mtplx/example", "revision": None, "files": {_SHARD: {"blob_id": "blob-1"}}}),
+        encoding="utf-8",
+    )
+    session = _install_fake_hub(
+        monkeypatch,
+        _remote_pack(b"fresh-weights"),
+        blob_ids={_SHARD: "blob-1"},
+        sha256={_SHARD: hashlib.sha256(b"fresh-weights").hexdigest()},
+    )
+    events: list[dict] = []
+
+    result = pull_model("mtplx/example", cache_dir=tmp_path, progress_callback=events.append, progress_interval_s=0)
+
+    assert result["resumed_existing"] is True
+    assert events[0]["event"] == "resume"
+    assert events[0]["size_bytes"] == len(b"fresh-")
+    assert (_shard_requests(session)[0]["headers"] or {}).get("Range") == "bytes=6-"
+    assert (cached / _SHARD).read_bytes() == b"fresh-weights"
+    assert not (cached / f"{_SHARD}.incomplete").exists()
+
+
+def test_pull_model_discards_a_partial_nothing_vouches_for(tmp_path: Path, monkeypatch):
+    cached = tmp_path / "mtplx--example"
+    cached.mkdir()
+    (cached / f"{_SHARD}.incomplete").write_bytes(b"who-knows")
+    session = _install_fake_hub(monkeypatch, _remote_pack(b"fresh-weights"), blob_ids={_SHARD: "blob-1"})
+
+    pull_model("mtplx/example", cache_dir=tmp_path, progress_callback=lambda _e: None, progress_interval_s=0)
+
+    assert "Range" not in (_shard_requests(session)[0].get("headers") or {})
+    assert (cached / _SHARD).read_bytes() == b"fresh-weights"
+
+
+def test_pull_model_replaces_a_landed_file_whose_blob_changed(tmp_path: Path, monkeypatch):
+    cached = tmp_path / "mtplx--example"
+    cached.mkdir()
+    (cached / _SHARD).write_bytes(b"old-weights!!")  # same size as the new blob
+    (cached / ".mtplx-transfer.json").write_text(
+        json.dumps({"repo_id": "mtplx/example", "revision": "old", "files": {_SHARD: {"blob_id": "blob-old"}}}),
+        encoding="utf-8",
+    )
+    _install_fake_hub(monkeypatch, _remote_pack(b"fresh-weights"), blob_ids={_SHARD: "blob-new"})
+
+    pull_model("mtplx/example", cache_dir=tmp_path, progress_callback=lambda _e: None, progress_interval_s=0)
+
+    assert (cached / _SHARD).read_bytes() == b"fresh-weights"
+
+
+def test_pull_model_rejects_a_landed_file_whose_sha256_differs(tmp_path: Path, monkeypatch):
+    cached = tmp_path / "mtplx--example"
+    _install_fake_hub(
+        monkeypatch, _remote_pack(b"fresh-weights"), blob_ids={_SHARD: "blob-1"}, sha256={_SHARD: "0" * 64}
+    )
+
+    with pytest.raises(RuntimeError, match="corrupt download"):
+        pull_model("mtplx/example", cache_dir=tmp_path, progress_callback=lambda _e: None, progress_interval_s=0)
+
+    assert not (cached / _SHARD).exists()
+    assert not (cached / f"{_SHARD}.incomplete").exists()
+
+
+# ---- shared Hugging Face cache (issue #445) -------------------------------
+
+
+def _hf_cache_snapshot(root: Path, repo_id: str, sha: str = "0123456789abcdef") -> Path:
+    """Build the layout `huggingface_hub` writes for a downloaded repo."""
+    org, name = repo_id.split("/", 1)
+    repo_root = root / f"models--{org}--{name}"
+    snapshot = repo_root / "snapshots" / sha
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}\n", encoding="utf-8")
+    (snapshot / "model.safetensors").write_bytes(b"weights")
+    refs = repo_root / "refs"
+    refs.mkdir(parents=True, exist_ok=True)
+    (refs / "main").write_text(sha, encoding="utf-8")
+    return snapshot
+
+
+@pytest.fixture
+def hf_hub_cache(tmp_path: Path, monkeypatch) -> Path:
+    """Point huggingface_hub at an empty cache of our own."""
+    constants = pytest.importorskip("huggingface_hub.constants")
+    root = tmp_path / "hf-hub"
+    root.mkdir()
+    monkeypatch.setattr(constants, "HF_HUB_CACHE", str(root))
+    return root
+
+
+def test_resolve_model_path_order_1_explicit_local_path_wins(
+    tmp_path: Path, hf_hub_cache: Path
+):
+    explicit = tmp_path / "on-disk"
+    explicit.mkdir()
+    (explicit / "config.json").write_text("{}\n", encoding="utf-8")
+    _hf_cache_snapshot(hf_hub_cache, "mtplx/example")
+
+    assert resolve_model_path(str(explicit), cache_dir=tmp_path) == explicit
+
+
+def test_resolve_model_path_order_2_private_cache_beats_the_hf_cache(
+    tmp_path: Path, hf_hub_cache: Path
+):
+    """Existing installs must keep resolving exactly where they always did."""
+    private = tmp_path / "mtplx--example"
+    private.mkdir()
+    (private / "config.json").write_text("{}\n", encoding="utf-8")
+    (private / "model.safetensors").write_bytes(b"1234")
+    _hf_cache_snapshot(hf_hub_cache, "mtplx/example")
+
+    assert resolve_model_path("mtplx/example", cache_dir=tmp_path) == private
+
+
+def test_resolve_model_path_order_3_falls_back_to_the_shared_hf_cache(
+    tmp_path: Path, hf_hub_cache: Path
+):
+    """A model another MLX tool already downloaded is not downloaded again."""
+    snapshot = _hf_cache_snapshot(hf_hub_cache, "mtplx/example")
+
+    resolved = resolve_model_path("mtplx/example", cache_dir=tmp_path)
+    assert resolved.resolve() == snapshot.resolve()
+
+
+def test_resolve_model_path_order_4_missing_everywhere_still_asks_for_a_pull(
+    tmp_path: Path, hf_hub_cache: Path
+):
+    with pytest.raises(FileNotFoundError, match="mtplx pull mtplx/example"):
+        resolve_model_path("mtplx/example", cache_dir=tmp_path)
+
+
+def test_resolve_model_path_ignores_an_incomplete_hf_snapshot(
+    tmp_path: Path, hf_hub_cache: Path
+):
+    """A half-downloaded shared snapshot must not be served as a real model."""
+    snapshot = _hf_cache_snapshot(hf_hub_cache, "mtplx/example")
+    (snapshot / "model.safetensors").unlink()
+
+    with pytest.raises(FileNotFoundError, match="mtplx pull mtplx/example"):
+        resolve_model_path("mtplx/example", cache_dir=tmp_path)
+
+
+def test_resolve_model_path_survives_a_hub_lookup_that_raises(
+    tmp_path: Path, monkeypatch
+):
+    """A broken or ancient huggingface_hub must not break local resolution."""
+    private = tmp_path / "mtplx--example"
+    private.mkdir()
+    (private / "config.json").write_text("{}\n", encoding="utf-8")
+    (private / "model.safetensors").write_bytes(b"1234")
+
+    import huggingface_hub
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("hub is unavailable")
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", explode)
+    assert resolve_model_path("mtplx/example", cache_dir=tmp_path) == private

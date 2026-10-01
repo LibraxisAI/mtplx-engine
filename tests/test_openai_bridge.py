@@ -1925,8 +1925,22 @@ def test_thinking_stream_splitter_keeps_tool_call_markup_out_of_reasoning():
     assert "<function=read>" in content
 
 
-def test_thinking_stream_splitter_keeps_orphan_parameter_markup_out_of_reasoning():
-    splitter = _ThinkingContentStreamSplitter(thinking_enabled=True)
+def test_thinking_stream_splitter_keeps_orphan_parameter_markup_in_reasoning():
+    """The tail of a call with no opener is not a call.
+
+    Until 2.11.4 any tool-control tag ended the thinking block, so this tail
+    was pushed to the content channel, where nothing could parse it either.
+    The same rule sent the rest of a think block to the visible chat whenever
+    the model quoted ``</parameter>`` from a pasted traceback. A thinking
+    block now ends at ``</think>`` or at the opener of a real call, and at
+    nothing else (tests/test_thinking_splitter_marker_quotes.py).
+    """
+    # Constructed the way the stream lane does: no end-of-turn recovery of
+    # unclosed reasoning, so the channels show what the splitter decided.
+    splitter = _ThinkingContentStreamSplitter(
+        thinking_enabled=True,
+        recover_unclosed_reasoning_as_content=False,
+    )
 
     chunks = []
     chunks.extend(splitter.feed("I should inspect the tool result.\n\n<par"))
@@ -1938,10 +1952,9 @@ def test_thinking_stream_splitter_keeps_orphan_parameter_markup_out_of_reasoning
     content = "".join(text for field, text in chunks if field == "content")
 
     assert "I should inspect the tool result." in reasoning
-    assert "<parameter=keys>" not in reasoning
-    assert "</parameter>" not in reasoning
-    assert "<parameter=keys>" in content
-    assert "</tool_call>" in content
+    assert "<parameter=keys>" in reasoning
+    assert "</tool_call>" in reasoning
+    assert content == ""
 
 
 def _no_tools_splitter():
@@ -2230,62 +2243,46 @@ def test_generation_params_marks_server_cap_when_configured(monkeypatch):
     assert limits["context_cap_applied"] is False
 
 
-def test_repetition_stop_arms_for_capped_requests(monkeypatch):
-    """#311: the literal-repetition stop arms on EVERY request. A client cap
-    is a token budget, not a licence to loop — Pi's maxTokens=8192 request
-    burned 5,803 '!' tokens with the old uncapped-only predicate."""
+_REQUEST_SHAPES = (
+    # Uncapped.
+    {"uncapped_response_requested": True, "server_max_response_tokens": None},
+    # Client-capped (the #311 shape).
+    {"uncapped_response_requested": False, "server_max_response_tokens": None},
+    # Server-capped.
+    {"uncapped_response_requested": True, "server_max_response_tokens": 4096},
+)
+
+
+def test_repetition_stop_is_off_by_default_for_every_request(monkeypatch):
+    """2.12.0: the repetition stops cut legitimate repeated code (a Tetris
+    board literal, identical patch hunks), so no request arms them unless the
+    operator opts in. A set-but-empty variable counts as unset."""
     monkeypatch.delenv("MTPLX_UNCAPPED_REPETITION_STOP", raising=False)
     monkeypatch.delenv("MTPLX_REPETITION_STOP", raising=False)
-    assert (
-        _uncapped_repetition_stop_enabled(
-            {
-                "uncapped_response_requested": True,
-                "server_max_response_tokens": None,
-            }
-        )
-        is True
-    )
-    # Capped request (the #311 shape): armed.
-    assert (
-        _uncapped_repetition_stop_enabled(
-            {
-                "uncapped_response_requested": False,
-                "server_max_response_tokens": None,
-            }
-        )
-        is True
-    )
-    # Server-capped: armed.
-    assert (
-        _uncapped_repetition_stop_enabled(
-            {
-                "uncapped_response_requested": True,
-                "server_max_response_tokens": 4096,
-            }
-        )
-        is True
-    )
-    # Both env names disarm; the new one wins over the historical one.
-    monkeypatch.setenv("MTPLX_UNCAPPED_REPETITION_STOP", "off")
-    assert (
-        _uncapped_repetition_stop_enabled(
-            {
-                "uncapped_response_requested": True,
-                "server_max_response_tokens": None,
-            }
-        )
-        is False
-    )
+    for shape in _REQUEST_SHAPES:
+        assert _uncapped_repetition_stop_enabled(dict(shape)) is False
+    monkeypatch.setenv("MTPLX_REPETITION_STOP", "")
+    for shape in _REQUEST_SHAPES:
+        assert _uncapped_repetition_stop_enabled(dict(shape)) is False
+
+
+def test_repetition_stop_opt_in_arms_for_capped_requests(monkeypatch):
+    """#311: once opted in, the stop arms on EVERY request. A client cap is
+    a token budget, not a licence to loop — Pi's maxTokens=8192 request
+    burned 5,803 '!' tokens with the old uncapped-only predicate."""
+    monkeypatch.delenv("MTPLX_UNCAPPED_REPETITION_STOP", raising=False)
     monkeypatch.setenv("MTPLX_REPETITION_STOP", "1")
-    assert (
-        _uncapped_repetition_stop_enabled(
-            {
-                "uncapped_response_requested": False,
-                "server_max_response_tokens": 4096,
-            }
-        )
-        is True
-    )
+    for shape in _REQUEST_SHAPES:
+        assert _uncapped_repetition_stop_enabled(dict(shape)) is True
+    # The historical name opts in too; the new name wins when both are set.
+    monkeypatch.delenv("MTPLX_REPETITION_STOP", raising=False)
+    monkeypatch.setenv("MTPLX_UNCAPPED_REPETITION_STOP", "on")
+    assert _uncapped_repetition_stop_enabled(dict(_REQUEST_SHAPES[1])) is True
+    monkeypatch.setenv("MTPLX_REPETITION_STOP", "off")
+    assert _uncapped_repetition_stop_enabled(dict(_REQUEST_SHAPES[1])) is False
+    monkeypatch.setenv("MTPLX_UNCAPPED_REPETITION_STOP", "off")
+    monkeypatch.setenv("MTPLX_REPETITION_STOP", "1")
+    assert _uncapped_repetition_stop_enabled(dict(_REQUEST_SHAPES[2])) is True
 
 
 def test_repetition_stop_detects_single_token_punctuation_loop():
@@ -2759,3 +2756,183 @@ def test_anthropic_usage_clamps_cached_over_prompt():
     )
     assert out["input_tokens"] == 0
     assert out["cache_read_input_tokens"] == 100
+
+
+# --- #441: Anthropic image blocks reach the vision tower ---------------------
+
+_TINY_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA"
+    "60e6kgAAAABJRU5ErkJggg=="
+)
+
+
+def _anthropic_image_block(data: str = _TINY_PNG_B64) -> dict:
+    return {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": data},
+    }
+
+
+def test_anthropic_text_only_content_stays_a_plain_string():
+    from mtplx.server.openai import (
+        _anthropic_content_to_chat_content,
+        _anthropic_content_to_text,
+    )
+
+    content = [
+        {"type": "text", "text": "hello"},
+        {"type": "thinking", "thinking": " pondering"},
+        {"type": "tool_result", "content": [{"type": "text", "text": " world"}]},
+    ]
+
+    rendered = _anthropic_content_to_chat_content(content)
+
+    assert isinstance(rendered, str)
+    assert rendered == _anthropic_content_to_text(content)
+    assert _anthropic_content_to_chat_content("plain") == "plain"
+    assert _anthropic_content_to_chat_content(None) == ""
+
+
+def test_anthropic_image_blocks_become_image_url_parts_in_order():
+    from mtplx.server.openai import _anthropic_content_to_chat_content
+
+    parts = _anthropic_content_to_chat_content(
+        [
+            {"type": "text", "text": "What is "},
+            {"type": "text", "text": "in this image?"},
+            _anthropic_image_block(),
+            {"type": "text", "text": "Answer briefly."},
+            {"type": "image", "source": {"type": "url", "url": "https://x/y.png"}},
+        ]
+    )
+
+    assert parts == [
+        {"type": "text", "text": "What is in this image?"},
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{_TINY_PNG_B64}"},
+        },
+        {"type": "text", "text": "Answer briefly."},
+        {"type": "image_url", "image_url": {"url": "https://x/y.png"}},
+    ]
+
+
+def test_anthropic_malformed_image_block_keeps_the_text_rendering():
+    from mtplx.server.openai import (
+        _anthropic_content_to_chat_content,
+        _anthropic_content_to_text,
+        _anthropic_image_block_to_openai_part,
+    )
+
+    broken = [
+        {"type": "image", "source": {"type": "base64", "data": ""}},
+        {"type": "image", "source": "not-a-dict"},
+        {"type": "image"},
+        {"type": "image", "source": {"type": "file", "file_id": "f1"}},
+    ]
+    for block in broken:
+        assert _anthropic_image_block_to_openai_part(block) is None
+
+    rendered = _anthropic_content_to_chat_content(broken)
+
+    assert isinstance(rendered, str)
+    assert rendered == _anthropic_content_to_text(broken)
+
+
+def test_anthropic_user_message_with_image_carries_parts_to_the_vision_path():
+    from mtplx.server.openai import (
+        AnthropicMessage,
+        _anthropic_message_to_chat_messages,
+        _vision_extract_and_flatten,
+        _VISION_PLACEHOLDER,
+    )
+
+    messages = _anthropic_message_to_chat_messages(
+        AnthropicMessage(
+            role="user",
+            content=[
+                {"type": "text", "text": "Read this: "},
+                _anthropic_image_block(),
+            ],
+        )
+    )
+
+    assert len(messages) == 1
+    assert messages[0].role == "user"
+    assert isinstance(messages[0].content, list)
+
+    flattened, images = _vision_extract_and_flatten(messages)
+
+    assert len(images) == 1
+    assert images[0][:8] == b"\x89PNG\r\n\x1a\n"
+    assert flattened[0].content == "Read this: " + _VISION_PLACEHOLDER
+
+
+def test_anthropic_tool_result_image_stays_an_image_on_the_tool_message():
+    """Claude Code's Read tool returns an image file as an ``image`` block
+    nested inside ``tool_result``; it must reach the tool message as a part,
+    not as base64 prose."""
+    from mtplx.server.openai import (
+        AnthropicMessage,
+        _anthropic_message_to_chat_messages,
+        _vision_extract_and_flatten,
+        _VISION_PLACEHOLDER,
+    )
+
+    messages = _anthropic_message_to_chat_messages(
+        AnthropicMessage(
+            role="user",
+            content=[
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": [
+                        {"type": "text", "text": "file contents:"},
+                        _anthropic_image_block(),
+                    ],
+                },
+                {"type": "text", "text": "What does it show?"},
+            ],
+        )
+    )
+
+    assert [m.role for m in messages] == ["tool", "user"]
+    assert messages[0].tool_call_id == "toolu_1"
+    assert messages[0].content[0] == {"type": "text", "text": "file contents:"}
+    assert messages[0].content[1]["type"] == "image_url"
+    assert messages[1].content == "What does it show?"
+
+    flattened, images = _vision_extract_and_flatten(messages)
+
+    assert len(images) == 1
+    assert flattened[0].content == "file contents:" + _VISION_PLACEHOLDER
+    assert flattened[1].content == "What does it show?"
+
+
+def test_anthropic_request_with_image_round_trips_to_chat_request():
+    from mtplx.server.openai import (
+        AnthropicMessage,
+        AnthropicMessagesRequest,
+        _anthropic_to_chat_request,
+    )
+
+    request = AnthropicMessagesRequest(
+        model="mtplx",
+        max_tokens=32,
+        messages=[
+            AnthropicMessage(
+                role="user",
+                content=[{"type": "text", "text": "hi"}, _anthropic_image_block()],
+            ),
+            AnthropicMessage(role="assistant", content="hello"),
+            AnthropicMessage(role="user", content="text only"),
+        ],
+    )
+
+    chat = _anthropic_to_chat_request(request)
+
+    assert chat.messages[0].role == "user"
+    assert chat.messages[0].content[0] == {"type": "text", "text": "hi"}
+    assert chat.messages[0].content[1]["type"] == "image_url"
+    assert chat.messages[1].content == "hello"
+    assert chat.messages[2].content == "text only"

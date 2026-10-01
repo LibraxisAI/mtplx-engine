@@ -4,9 +4,18 @@ import XCTest
 final class OnboardingFeatureStateTests: XCTestCase {
     // MARK: goNext / goBack walk the canonical case order
 
+    func testLanguageIsTheFirstStep() {
+        XCTAssertEqual(OnboardingStep.allCases.first, .language)
+        XCTAssertEqual(OnboardingStep.language.index, 0)
+        XCTAssertEqual(OnboardingStep.welcome.index, 1)
+        XCTAssertEqual(OnboardingStep.tune.index, OnboardingStep.allCases.count - 1)
+        XCTAssertTrue(OnboardingFeatureState(step: .language).canAdvance)
+    }
+
     func testGoNextWalksThroughEveryStep() {
         var s = OnboardingFeatureState()
-        XCTAssertEqual(s.step, .welcome)
+        XCTAssertEqual(s.step, .language)
+        s.goNext(); XCTAssertEqual(s.step, .welcome)
         s.goNext(); XCTAssertEqual(s.step, .hardwareScan)
         s.goNext(); XCTAssertEqual(s.step, .modelPick)
         s.goNext(); XCTAssertEqual(s.step, .runtimeSetup)
@@ -20,14 +29,15 @@ final class OnboardingFeatureStateTests: XCTestCase {
         XCTAssertEqual(s.step, .tune)
     }
 
-    func testGoBackWalksReverseAndStopsAtWelcome() {
+    func testGoBackWalksReverseAndStopsAtLanguage() {
         var s = OnboardingFeatureState(step: .tune)
         s.goBack(); XCTAssertEqual(s.step, .download)
         s.goBack(); XCTAssertEqual(s.step, .runtimeSetup)
         s.goBack(); XCTAssertEqual(s.step, .modelPick)
         s.goBack(); XCTAssertEqual(s.step, .hardwareScan)
         s.goBack(); XCTAssertEqual(s.step, .welcome)
-        s.goBack(); XCTAssertEqual(s.step, .welcome) // clamped
+        s.goBack(); XCTAssertEqual(s.step, .language)
+        s.goBack(); XCTAssertEqual(s.step, .language) // clamped
     }
 
     func testRuntimeSetupSitsBetweenModelPickAndDownload() {
@@ -397,6 +407,21 @@ final class OnboardingFeatureStateTests: XCTestCase {
         XCTAssertFalse(s.supportsTune)
         XCTAssertEqual(s.tuneCandidates, [])
         XCTAssertFalse(s.canAdvance)
+    }
+
+    @MainActor
+    func testPausedDownloadBytesCountTowardTheDiskGate() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mtplx-paused-download-\(UUID().uuidString)", isDirectory: true)
+        let folder = root.appendingPathComponent("Example--Paused", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data(count: 4096).write(to: folder.appendingPathComponent("model-00001-of-00002.safetensors"))
+        try Data(count: 1024).write(to: folder.appendingPathComponent("model-00002-of-00002.safetensors.incomplete"))
+
+        let orchestrator = OnboardingOrchestrator(modelLibrary: ModelLibrary(primaryDirectory: root.path))
+        XCTAssertEqual(orchestrator.downloadedBytes(forRepo: "Example/Paused"), 5120)
+        XCTAssertEqual(orchestrator.downloadedBytes(forRepo: "Example/NotStarted"), 0)
     }
 
     @MainActor

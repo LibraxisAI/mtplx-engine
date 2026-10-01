@@ -9,12 +9,28 @@ dense ``[S, T]`` mask and never gathers a per-row K/V tensor.
 The production geometry has an especially useful reuse axis: all twelve query
 heads in one GQA group share both a KV head and the indexer's selection.  One
 simdgroup therefore owns ``(query row, KV head)`` and treats those heads as the
-live rows of a padded M=16 matrix. Each selected N=32 token tile is gathered
-once into one 16 KiB threadgroup allocation. Metal 4 MPP ``matmul2d`` computes
-QK for all twelve heads, the same allocation is overwritten with V-transpose,
-and a second ``matmul2d`` computes PV. Scores, online-softmax statistics, and
-the output accumulator remain fp32. A final padded tile handles the row's
-zero-to-three-token causal tail.
+live rows of a padded M=16 matrix.  Metal 4 MPP ``matmul2d`` computes QK for
+all twelve heads over one N=32 token tile, sixteen head dims a step, and a
+second ``matmul2d`` with an untransposed right operand computes PV.  Scores,
+online-softmax statistics, and the output accumulator remain fp32.  A final
+padded tile handles the row's zero-to-three-token causal tail.
+
+Two sources compute that, bit for bit the same (2026-09-18: every output
+element equal over fourteen cases, contexts 2,060 to 131,072, both dtypes,
+validity holes, ids past the visible blocks, strided views):
+
+* ``_SOURCE`` (default, "direct"): every lane loads its K and V fragment
+  elements straight from the cache at the selected token's address, the way
+  MLX's own dense tensor-unit attention loads its tiles.  V is read in its
+  natural ``[token, dim]`` layout, the query fragments are read once per
+  threadgroup instead of once per tile, and there is no threadgroup memory
+  and no barrier.  Kernel alone on an M5 Max, 4,096 rows at 65,536 tokens:
+  about 7 microseconds per row against 19.6 for the staged source.
+* ``_STAGED_SOURCE`` (``MTPLX_QSA_PREFILL_FLASH_KERNEL=staged``): the source
+  that shipped through 2.11.3.  Each selected tile is copied into one 16 KiB
+  threadgroup allocation, multiplied, then overwritten with V-transpose for
+  PV, with three simdgroup barriers a tile.  Kept as the rollback and as the
+  reference the parity test compares against.
 
 The entry point deliberately has no fallback.  It covers only B=1, Hq=24,
 Hkv=2, D=256, four-token blocks, K=512, fp16/bfloat16 inputs, a host-static
@@ -28,6 +44,7 @@ from __future__ import annotations
 
 import math
 import operator
+import os
 from functools import lru_cache
 
 import mlx.core as mx
@@ -72,7 +89,7 @@ inline short2 qsa_nax_coord(ushort lane) {
 """
 
 
-_SOURCE = r"""
+_STAGED_SOURCE = r"""
     constexpr int HEAD_DIM = 256;
     constexpr int KV_HEADS = 2;
     constexpr int GQA = 12;
@@ -133,8 +150,13 @@ _SOURCE = r"""
     mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> mm;
     auto ct_a = mm.get_left_input_cooperative_tensor<T, T, float>();
     auto ct_b = mm.get_right_input_cooperative_tensor<T, T, float>();
-    auto ct_c =
-        mm.get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), float>();
+    // macOS 27 MPP SDK gates get_destination_cooperative_tensor on
+    // __is_tensor_type_v / __is_cooperative_tensor_type_v, which an
+    // address-space-qualified decltype (thread ...) fails (issue #404).
+    // Strip the qualifier, matching mlx's own steel/gemm/nax.h pattern.
+    auto ct_c = mm.get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(ct_a)>,
+        metal::remove_addrspace_t<decltype(ct_b)>, float>();
 
     // Exactly 32 * 256 * sizeof(T) == 16 KiB. The allocation first holds K
     // row-major and is then overwritten with V-transpose for the PV multiply.
@@ -424,6 +446,311 @@ _SOURCE = r"""
 """
 
 
+_SOURCE = r"""
+    constexpr int HEAD_DIM = 256;
+    constexpr int KV_HEADS = 2;
+    constexpr int GQA = 12;
+    constexpr int BLOCK_TOKENS = 4;
+    constexpr int TOP_K_BLOCKS = 512;
+    constexpr int TILE_BLOCKS = 8;
+    constexpr int TOKENS_PER_TILE = TILE_BLOCKS * BLOCK_TOKENS;
+    constexpr int D_FRAGS = HEAD_DIM / 16;
+    constexpr int OUT_GROUPS = HEAD_DIM / 32;
+
+    const ushort lane = ushort(thread_index_in_simdgroup);
+    const int work = int(threadgroup_position_in_grid.x);
+    const int row = work / KV_HEADS;
+    const int kv_head = work - row * KV_HEADS;
+    const int pos_start = int(params[0]);
+    const int total_tokens = int(params[1]);
+    const int query_pos = pos_start + row;
+    const int complete_blocks = (query_pos + 1) / BLOCK_TOKENS;
+    const int tail_start = complete_blocks * BLOCK_TOKENS;
+    const int tail_count = query_pos + 1 - tail_start;
+
+    uint local_active_slots = 0u;
+    for (uint block_slot = uint(lane);
+         block_slot < uint(TOP_K_BLOCKS);
+         block_slot += 32u) {
+        const size_t id_at = size_t(row) * block_ids_strides[0] +
+            size_t(block_slot) * block_ids_strides[1];
+        const size_t valid_at = size_t(row) * block_valid_strides[0] +
+            size_t(block_slot) * block_valid_strides[1];
+        const int block_id = int(block_ids[id_at]);
+        if (bool(block_valid[valid_at]) &&
+            block_id >= 0 && block_id < complete_blocks) {
+            local_active_slots = metal::max(local_active_slots, block_slot + 1u);
+        }
+    }
+    const uint active_blocks = simd_max(local_active_slots);
+    const int active_selected_tiles =
+        (int(active_blocks) + TILE_BLOCKS - 1) / TILE_BLOCKS;
+    const int active_tiles = active_selected_tiles + (tail_count > 0 ? 1 : 0);
+    const short2 sc = qsa_nax_coord(lane);
+
+    constexpr auto desc_qk = mpp::tensor_ops::matmul2d_descriptor(
+        16, 32, 16, false, true, true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc_qk, metal::execution_simdgroup> mm_qk;
+    auto qk_a = mm_qk.get_left_input_cooperative_tensor<T, T, float>();
+    auto qk_b = mm_qk.get_right_input_cooperative_tensor<T, T, float>();
+    auto qk_c = mm_qk.get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(qk_a)>,
+        metal::remove_addrspace_t<decltype(qk_b)>, float>();
+
+    constexpr auto desc_pv = mpp::tensor_ops::matmul2d_descriptor(
+        16, 32, 16, false, false, true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc_pv, metal::execution_simdgroup> mm_pv;
+    auto pv_a = mm_pv.get_left_input_cooperative_tensor<T, T, float>();
+    auto pv_b = mm_pv.get_right_input_cooperative_tensor<T, T, float>();
+    auto pv_c = mm_pv.get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(pv_a)>,
+        metal::remove_addrspace_t<decltype(pv_b)>, float>();
+
+    // This lane's query fragments, read once: heads {sc.y, sc.y + 8} of the
+    // KV group (rows 12..15 of the padded M=16 matrix are zero), dims
+    // frag * 16 + sc.x .. + 3.
+    T q_frag[D_FRAGS][QSA_ELEMS_PER_FRAG];
+    for (int frag = 0; frag < D_FRAGS; ++frag) {
+        for (short row_part = 0; row_part < 2; ++row_part) {
+            const int m_row = int(sc.y) + int(row_part) * QSA_ELEM_ROWS_JUMP;
+            if (m_row < GQA) {
+                const int q_head = kv_head * GQA + m_row;
+                const size_t q_base = size_t(q_head) * q_strides[1] +
+                    size_t(row) * q_strides[2] +
+                    size_t(frag * 16 + int(sc.x)) * q_strides[3];
+                for (short col = 0; col < QSA_ELEM_COLS; ++col) {
+                    q_frag[frag][row_part * QSA_ELEM_COLS + col] =
+                        q[q_base + size_t(col) * q_strides[3]];
+                }
+            } else {
+                for (short col = 0; col < QSA_ELEM_COLS; ++col) {
+                    q_frag[frag][row_part * QSA_ELEM_COLS + col] = T(0);
+                }
+            }
+        }
+    }
+
+    float row_max[2] = {-1.0e38f, -1.0e38f};
+    float row_sum[2] = {0.0f, 0.0f};
+    float out_frag[OUT_GROUPS][2][QSA_ELEMS_PER_FRAG];
+    for (int group = 0; group < OUT_GROUPS; ++group) {
+        for (short part = 0; part < 2; ++part) {
+            for (short elem = 0; elem < QSA_ELEMS_PER_FRAG; ++elem) {
+                out_frag[group][part][elem] = 0.0f;
+            }
+        }
+    }
+
+    const bool unit_stride = q_strides[3] == 1 && k_strides[3] == 1 &&
+        v_strides[3] == 1;
+    const size_t k_head_base = size_t(kv_head) * k_strides[1];
+    const size_t v_head_base = size_t(kv_head) * v_strides[1];
+
+    for (int tile_index = 0; tile_index < active_tiles; ++tile_index) {
+        const bool tail_tile =
+            tail_count > 0 && tile_index == active_selected_tiles;
+        const int block_base = tile_index * TILE_BLOCKS;
+
+        // First token of each of the tile's eight blocks, or -1.
+        int block_token[TILE_BLOCKS];
+        for (int local_block = 0; local_block < TILE_BLOCKS; ++local_block) {
+            if (tail_tile) {
+                block_token[local_block] = -1;
+            } else {
+                const int block_slot = block_base + local_block;
+                const size_t id_at = size_t(row) * block_ids_strides[0] +
+                    size_t(block_slot) * block_ids_strides[1];
+                const size_t valid_at = size_t(row) * block_valid_strides[0] +
+                    size_t(block_slot) * block_valid_strides[1];
+                const int block_id = int(block_ids[id_at]);
+                const bool ok = bool(block_valid[valid_at]) &&
+                    block_id >= 0 && block_id < complete_blocks;
+                block_token[local_block] = ok ? block_id * BLOCK_TOKENS : -1;
+            }
+        }
+
+        // The four token rows this lane feeds to both multiplies:
+        // slots n_half * 16 + sc.y + row_half * 8.
+        int lane_token[4];
+        for (short n_half = 0; n_half < 2; ++n_half) {
+            for (short row_half = 0; row_half < 2; ++row_half) {
+                const int token_slot = int(n_half) * 16 + int(sc.y) +
+                    int(row_half) * QSA_ELEM_ROWS_JUMP;
+                int token = -1;
+                if (tail_tile) {
+                    const int t = tail_start + token_slot;
+                    token = (token_slot < tail_count && t < total_tokens) ? t : -1;
+                } else {
+                    const int first = block_token[token_slot / BLOCK_TOKENS];
+                    token = first >= 0 ? first + (token_slot % BLOCK_TOKENS) : -1;
+                }
+                lane_token[n_half * 2 + row_half] = token;
+            }
+        }
+
+        // QK: padded [16,256] x selected [32,256]^T -> [16,32], 16 dims a step.
+        for (short elem = 0; elem < 2 * QSA_ELEMS_PER_FRAG; ++elem) {
+            qk_c[elem] = 0.0f;
+        }
+        for (int frag = 0; frag < D_FRAGS; ++frag) {
+            for (short elem = 0; elem < QSA_ELEMS_PER_FRAG; ++elem) {
+                qk_a[elem] = q_frag[frag][elem];
+            }
+            const size_t dim_at = size_t(frag * 16 + int(sc.x));
+            for (short part = 0; part < 4; ++part) {
+                const int token = lane_token[part];
+                if (token >= 0) {
+                    const size_t k_at = k_head_base +
+                        size_t(token) * k_strides[2] + dim_at * k_strides[3];
+                    if (unit_stride) {
+                        for (short col = 0; col < QSA_ELEM_COLS; ++col) {
+                            qk_b[part * QSA_ELEM_COLS + col] = k[k_at + size_t(col)];
+                        }
+                    } else {
+                        for (short col = 0; col < QSA_ELEM_COLS; ++col) {
+                            qk_b[part * QSA_ELEM_COLS + col] =
+                                k[k_at + size_t(col) * k_strides[3]];
+                        }
+                    }
+                } else {
+                    for (short col = 0; col < QSA_ELEM_COLS; ++col) {
+                        qk_b[part * QSA_ELEM_COLS + col] = T(0);
+                    }
+                }
+            }
+            mm_qk.run(qk_a, qk_b, qk_c);
+        }
+
+        // Mask, scale and exponentiate this lane's score fragment.
+        float probabilities[2][QSA_ELEMS_PER_FRAG];
+        float correction[2];
+        bool column_valid[2];
+        for (short n_half = 0; n_half < 2; ++n_half) {
+            // Columns n_half * 16 + sc.x .. + 3 are exactly one block.
+            const int token_slot = int(n_half) * 16 + int(sc.x);
+            if (tail_tile) {
+                column_valid[n_half] = false;  // resolved per column below
+            } else {
+                column_valid[n_half] = block_token[token_slot / BLOCK_TOKENS] >= 0;
+            }
+        }
+        for (short row_part = 0; row_part < 2; ++row_part) {
+            const int m_row = int(sc.y) + int(row_part) * QSA_ELEM_ROWS_JUMP;
+            const bool live_row = m_row < GQA;
+            float tile_max = -1.0e38f;
+            for (short n_half = 0; n_half < 2; ++n_half) {
+                for (short col = 0; col < QSA_ELEM_COLS; ++col) {
+                    bool token_valid = column_valid[n_half];
+                    if (tail_tile) {
+                        const int token_slot = int(n_half) * 16 + int(sc.x) + int(col);
+                        token_valid = token_slot < tail_count &&
+                            tail_start + token_slot < total_tokens;
+                    }
+                    const short at = row_part * QSA_ELEM_COLS + col;
+                    const float score = live_row && token_valid
+                        ? qk_c[n_half * QSA_ELEMS_PER_FRAG + at] * scale[0]
+                        : -1.0e38f;
+                    probabilities[n_half][at] = score;
+                    tile_max = metal::max(tile_max, score);
+                }
+            }
+            tile_max = metal::max(tile_max, simd_shuffle_xor(tile_max, ushort(1)));
+            tile_max = metal::max(tile_max, simd_shuffle_xor(tile_max, ushort(8)));
+            const float new_max = metal::max(row_max[row_part], tile_max);
+            correction[row_part] = metal::exp(row_max[row_part] - new_max);
+            float tile_sum = 0.0f;
+            for (short n_half = 0; n_half < 2; ++n_half) {
+                for (short col = 0; col < QSA_ELEM_COLS; ++col) {
+                    const short at = row_part * QSA_ELEM_COLS + col;
+                    const float score = probabilities[n_half][at];
+                    const float probability = score > -1.0e37f
+                        ? metal::exp(score - new_max)
+                        : 0.0f;
+                    probabilities[n_half][at] = probability;
+                    tile_sum += probability;
+                }
+            }
+            tile_sum += simd_shuffle_xor(tile_sum, ushort(1));
+            tile_sum += simd_shuffle_xor(tile_sum, ushort(8));
+            row_max[row_part] = new_max;
+            row_sum[row_part] = row_sum[row_part] * correction[row_part] + tile_sum;
+        }
+
+        // PV: [16 heads,16 tokens] x [16 tokens,32 dims] -> [16 heads,32 dims],
+        // V in its natural layout. The rescale of the running output rides
+        // in the load of the destination.
+        for (int group = 0; group < OUT_GROUPS; ++group) {
+            for (short row_part = 0; row_part < 2; ++row_part) {
+                const float factor = correction[row_part];
+                for (short col = 0; col < QSA_ELEM_COLS; ++col) {
+                    const short at = row_part * QSA_ELEM_COLS + col;
+                    pv_c[at] = out_frag[group][0][at] * factor;
+                    pv_c[QSA_ELEMS_PER_FRAG + at] = out_frag[group][1][at] * factor;
+                }
+            }
+            for (short token_half = 0; token_half < 2; ++token_half) {
+                for (short elem = 0; elem < QSA_ELEMS_PER_FRAG; ++elem) {
+                    pv_a[elem] = T(probabilities[token_half][elem]);
+                }
+                for (short dim_half = 0; dim_half < 2; ++dim_half) {
+                    const size_t dim_at = size_t(
+                        group * 32 + int(dim_half) * 16 + int(sc.x));
+                    for (short row_half = 0; row_half < 2; ++row_half) {
+                        const int token = lane_token[token_half * 2 + row_half];
+                        const short at = dim_half * QSA_ELEMS_PER_FRAG +
+                            row_half * QSA_ELEM_COLS;
+                        if (token >= 0) {
+                            const size_t v_at = v_head_base +
+                                size_t(token) * v_strides[2] + dim_at * v_strides[3];
+                            if (unit_stride) {
+                                for (short col = 0; col < QSA_ELEM_COLS; ++col) {
+                                    pv_b[at + col] = v[v_at + size_t(col)];
+                                }
+                            } else {
+                                for (short col = 0; col < QSA_ELEM_COLS; ++col) {
+                                    pv_b[at + col] = v[v_at + size_t(col) * v_strides[3]];
+                                }
+                            }
+                        } else {
+                            for (short col = 0; col < QSA_ELEM_COLS; ++col) {
+                                pv_b[at + col] = T(0);
+                            }
+                        }
+                    }
+                }
+                mm_pv.run(pv_a, pv_b, pv_c);
+            }
+            for (short elem = 0; elem < QSA_ELEMS_PER_FRAG; ++elem) {
+                out_frag[group][0][elem] = pv_c[elem];
+                out_frag[group][1][elem] = pv_c[QSA_ELEMS_PER_FRAG + elem];
+            }
+        }
+    }
+
+    for (short row_part = 0; row_part < 2; ++row_part) {
+        const int m_row = int(sc.y) + int(row_part) * QSA_ELEM_ROWS_JUMP;
+        if (m_row >= GQA) continue;
+        const int q_head = kv_head * GQA + m_row;
+        const float inv_sum = row_sum[row_part] > 0.0f ? 1.0f / row_sum[row_part] : 0.0f;
+        const size_t out_base =
+            (size_t(q_head) * size_t(params[2]) + size_t(row)) * HEAD_DIM;
+        for (int group = 0; group < OUT_GROUPS; ++group) {
+            for (short dim_half = 0; dim_half < 2; ++dim_half) {
+                for (short col = 0; col < QSA_ELEM_COLS; ++col) {
+                    const int dim = group * 32 + int(dim_half) * 16 +
+                        int(sc.x) + int(col);
+                    out[out_base + size_t(dim)] = T(
+                        out_frag[group][dim_half][row_part * QSA_ELEM_COLS + col] *
+                        inv_sum);
+                }
+            }
+        }
+    }
+"""
+
+
 def _on_metal_device() -> bool:
     """Metal availability is insufficient when MLX currently targets CPU."""
 
@@ -541,10 +868,24 @@ def qsa_prefill_flash_supported(
     )
 
 
-@lru_cache(maxsize=1)
-def _kernel():
+_KERNEL_VARIANTS = ("direct", "staged")
+
+
+def _kernel_variant() -> str:
+    """Which of the two bit-identical sources serves (default: direct)."""
+
+    raw = (os.environ.get("MTPLX_QSA_PREFILL_FLASH_KERNEL") or "direct").strip().lower()
+    return raw if raw in _KERNEL_VARIANTS else "direct"
+
+
+@lru_cache(maxsize=2)
+def _kernel(variant: str = "direct"):
+    staged = variant == "staged"
     return mx.fast.metal_kernel(
-        name="mtplx_qsa_prefill_flash_nax_m16_n32_h24_kv2_d256_b4_k512",
+        name=(
+            "mtplx_qsa_prefill_flash_nax_m16_n32_h24_kv2_d256_b4_k512"
+            + ("" if staged else "_direct")
+        ),
         input_names=[
             "q",
             "k",
@@ -556,7 +897,7 @@ def _kernel():
         ],
         output_names=["out"],
         header=_HEADER,
-        source=_SOURCE,
+        source=_STAGED_SOURCE if staged else _SOURCE,
         # Every tensor is indexed with its injected stride array.  In
         # particular, the transposed Q view and full-capacity K/V backing must
         # not acquire hidden contiguous-copy dispatches.
@@ -602,7 +943,7 @@ def qsa_prefill_flash(
     rows = int(queries.shape[2])
     params = mx.array([int(pos_start), int(total_tokens), rows], dtype=mx.int32)
     scale_arg = mx.array([float(scale)], dtype=mx.float32)
-    kernel = _kernel()
+    kernel = _kernel(_kernel_variant())
     (out,) = kernel(
         inputs=[
             queries,

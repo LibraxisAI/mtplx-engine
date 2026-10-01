@@ -98,6 +98,7 @@ struct FanControlInstaller: Sendable {
     /// Check for a detected fan tool and install one when missing.
     /// Never throws — callers decide whether a failure blocks (tune)
     /// or degrades to a warning (runtime setup).
+    /// `status` receives localization keys; render only at the consuming view.
     func ensureReady(
         executable: URL,
         subprocess: SubprocessInterruptBox,
@@ -122,7 +123,7 @@ struct FanControlInstaller: Sendable {
         }
 
         status("Fan control ready")
-        return FanControlSetupResult(ok: true, exitCode: 0, message: "Fan control ready")
+        return FanControlSetupResult(ok: true, exitCode: 0, message: tr("Fan control ready"))
     }
 
     private func install(
@@ -138,7 +139,7 @@ struct FanControlInstaller: Sendable {
             return FanControlSetupResult(ok: false, exitCode: nil, message: result.message)
         }
         if result.exitCode == 0, helperPresent() {
-            return FanControlSetupResult(ok: true, exitCode: 0, message: "Fan control ready")
+            return FanControlSetupResult(ok: true, exitCode: 0, message: tr("Fan control ready"))
         }
         return FanControlSetupResult(
             ok: false,
@@ -200,7 +201,7 @@ struct FanControlInstaller: Sendable {
                 // installFailureMessage() surfaces it too.
                 stderr: stderrDrain.snapshot()
                     + "\n[\(commandLine) timed out after \(Int(timeout))s and was terminated]",
-                message: "\(commandLine) timed out after \(Int(timeout))s and was terminated"
+                message: tr("%@ timed out after %llds and was terminated", commandLine, Int(timeout))
             )
         }
         subprocess.clear(process)
@@ -251,7 +252,7 @@ struct FanControlInstaller: Sendable {
         let trimmedStderr = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedStderr.isEmpty { return trimmedStderr }
         if !trimmedStdout.isEmpty { return trimmedStdout }
-        return "Fan-control install failed."
+        return tr("Fan-control install failed.")
     }
 
     private static func commandMessage(

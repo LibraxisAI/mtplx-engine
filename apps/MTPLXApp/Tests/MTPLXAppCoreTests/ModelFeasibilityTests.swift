@@ -99,13 +99,33 @@ final class ModelFeasibilityTests: XCTestCase {
     // MARK: - Disk gate beats memory gate
 
     func testInsufficientDiskBlocksEvenWhenMemoryFits() {
-        // 128 GiB RAM is plenty for Quality, but 20 GiB free disk is
-        // not enough for 28 GB * 2.5 = 70 GiB required.
+        // 128 GiB RAM is plenty for Quality, but 20 GiB free disk is not
+        // enough for its 28 GiB download plus the 5 GiB pull headroom.
         let v = evaluator.evaluate(model: quality, chipTier: .modernApple, ramGiB: 128, diskFreeGiB: 20)
         if case .insufficientDisk(let needs) = v {
-            XCTAssertGreaterThan(needs, 60, "Quality 28 GB on disk × 2.5 should require > 60 GiB free")
+            XCTAssertEqual(needs, Double(quality.sizeBytes) / 1_073_741_824 + 5, accuracy: 1e-9)
             return
         }
         XCTFail("Expected insufficientDisk, got \(v)")
+    }
+
+    func testDiskGateIsTheMTPLXPullRule() throws {
+        let flashQuality = try XCTUnwrap(MTPLXModelOption.officialCatalog.first { $0.id == "flash-next-optimized-quality" })
+        // 163.3 GiB for the 170 GB pack; the old 2.5x rule asked 395.7.
+        let needs = Double(flashQuality.sizeBytes) / 1_073_741_824 + 5
+        XCTAssertEqual(evaluator.evaluate(model: flashQuality, chipTier: .modernApple, ramGiB: 256, diskFreeGiB: needs), .recommended)
+        XCTAssertEqual(
+            evaluator.evaluate(model: flashQuality, chipTier: .modernApple, ramGiB: 256, diskFreeGiB: needs - 0.01),
+            .insufficientDisk(needsGiB: needs)
+        )
+        // A paused download needs only its remaining bytes.
+        let half = flashQuality.sizeBytes / 2
+        let resumeFree = Double(flashQuality.sizeBytes - half) / 1_073_741_824 + 5
+        XCTAssertEqual(
+            evaluator.evaluate(model: flashQuality, chipTier: .modernApple, ramGiB: 256, diskFreeGiB: resumeFree, downloadedBytes: half),
+            .recommended
+        )
+        // Unknown size (a Forge probe stub): no disk gate, as before.
+        XCTAssertEqual(ModelFeasibility.requiredFreeDiskGiB(sizeBytes: 0), 0)
     }
 }

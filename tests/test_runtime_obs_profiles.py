@@ -186,7 +186,7 @@ def test_runtime_gated_env_combo_is_announced_loudly(capsys) -> None:
 
 
 def test_coding_agent_lane_bonus_verify_pin_is_announced(capsys) -> None:
-    # The app/CLI coding-agent lanes inject MTPLX_LAZY_BONUS_VERIFY=1 into
+    # Legacy app/CLI coding-agent lanes injected MTPLX_LAZY_BONUS_VERIFY=1 into
     # the daemon env while every product profile runs the lazy-distribution
     # strategy that disables it (generation.py records
     # disabled_by=lazy_target_distributions per event, which nobody reads).

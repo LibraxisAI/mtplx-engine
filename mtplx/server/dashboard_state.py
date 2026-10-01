@@ -21,6 +21,7 @@ worst one frame of stale visualization, which is acceptable.
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
 import time
 from collections import OrderedDict, deque
@@ -461,7 +462,27 @@ class PrefillHistory:
     def __init__(self, *, capacity: int = 100) -> None:
         self._capacity = int(capacity)
         self._rows: deque[dict[str, Any]] = deque(maxlen=self._capacity)
+        # Producer-side samples: polling/SSE consumers must not count the
+        # same chunk again. Keep actual compute separate from restore/setup.
+        self._chunks: deque[tuple[int, float]] = deque(maxlen=self._capacity)
         self._lock = threading.Lock()
+
+    def record_chunk(self, tokens: int, elapsed_s: float) -> None:
+        if tokens <= 0 or not math.isfinite(elapsed_s) or elapsed_s <= 0:
+            return
+        with self._lock:
+            self._chunks.append((tokens, elapsed_s))
+
+    def rates(self) -> dict[str, Any]:
+        with self._lock:
+            chunks = list(self._chunks)
+        return {
+            "tokens": sum(tokens for tokens, _ in chunks),
+            "compute_time_s": sum(seconds for _, seconds in chunks),
+            "peak_tok_s": max((tokens / seconds for tokens, seconds in chunks), default=None),
+            "samples": len(chunks),
+            "capacity": self._capacity,
+        }
 
     def append(self, row: dict[str, Any]) -> None:
         with self._lock:
@@ -621,9 +642,14 @@ class DashboardState:
     # 4 critical, 0 unknown. Written by the memory-pressure guard loop.
     last_memory_pressure_level: int = 0
     # Which signal produced the level above: "macos" (system-wide — often
-    # another process allocating) or "allocator" (this engine's Metal
-    # active+cache near its limit). Lets the app banner name the culprit
-    # instead of implying the engine is misbehaving under an external storm.
+    # another process allocating), "allocator" (this engine's Metal
+    # active+cache near its limit) or "system_available" (the kernel's
+    # available-memory figure fell under the desktop floor while the other two
+    # still read normal). Lets the app banner name the culprit instead of
+    # implying the engine is misbehaving under an external storm.
     last_memory_pressure_source: str = "macos"
     # (active+cache)/metal-limit at the same tick, for the banner detail.
     last_allocator_fraction: float = 0.0
+    # The kernel's available-memory figure at the same tick; None when it
+    # cannot be read or the system guard is off (mtplx/system_memory.py).
+    last_system_available_bytes: int | None = None

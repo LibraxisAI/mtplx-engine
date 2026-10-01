@@ -68,7 +68,18 @@ def _fake_state(committed_ids, committed_text, session_id="s1"):
         resolve_session_id=lambda **kw: (session_id, "header.x-mtplx-session-id"),
         peek=lambda sid: session if sid == session_id else None,
     )
-    tokenizer = SimpleNamespace(decode=lambda ids: committed_text)
+    committed_list = [int(i) for i in committed_ids]
+
+    def _decode(ids):
+        # The whole committed stream decodes to the transcript; any other run
+        # decodes to one distinct marker per id, so two runs of different ids
+        # never read as the same text (the token splice compares windows).
+        ids = [int(i) for i in ids]
+        if ids == committed_list:
+            return committed_text
+        return "".join(f"<{i}>" for i in ids)
+
+    tokenizer = SimpleNamespace(decode=_decode)
     return SimpleNamespace(
         args=SimpleNamespace(strip_assistant_reasoning_history=False),
         sessions=sessions,
@@ -324,3 +335,240 @@ def test_canonicalized_encode_extends_committed_stream_real_template():
         f"canonicalized encode should track the committed frontier: "
         f"cp_canon={cp_canon} committed={len(committed)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Committed tool-call body substitution (2026-09-03)
+# ---------------------------------------------------------------------------
+
+_WRITE_MARKUP = (
+    "<tool_call>\n<function=write>\n<parameter=filePath>\nindex.html\n</parameter>\n"
+    "<parameter=content>\n<!DOCTYPE html>\n<html></html>\n\n</parameter>\n</function>\n</tool_call>"
+)
+
+
+def _write_turn_committed_text(visible: str = "I'll write the file."):
+    return (
+        "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nmake it<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\nPlan the file.\n</think>\n\n"
+        + (visible + "\n\n" if visible else "")
+        + _WRITE_MARKUP
+        + "<|im_end|>\n"
+    )
+
+
+def _write_turn_message(visible: str = "I'll write the file."):
+    # What the client echoes back: the parser stripped the content's own
+    # trailing newline, so a re-render from these arguments is one token
+    # short of the generated stream (the measured 271 "\n\n" -> 198 "\n").
+    return oa.ChatMessage(
+        role="assistant",
+        content=visible,
+        tool_calls=[
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "arguments": json.dumps(
+                        {"filePath": "index.html", "content": "<!DOCTYPE html>\n<html></html>"}
+                    ),
+                },
+            }
+        ],
+    )
+
+
+def test_committed_turns_carry_the_exact_post_think_body():
+    turns = oa._committed_assistant_turns(_write_turn_committed_text())
+    assert len(turns) == 1
+    interior, gate, markup = turns[0]  # 3-tuple contract intact
+    assert interior == "Plan the file."
+    assert gate == "I'll write the file."
+    assert markup == _WRITE_MARKUP
+    assert turns[0].body == "\n\nI'll write the file.\n\n" + _WRITE_MARKUP
+    assert turns[0] == (interior, gate, markup)
+
+
+def test_tool_turn_substitution_attaches_the_committed_body():
+    turns = oa._committed_assistant_turns(_write_turn_committed_text())
+    messages = [
+        oa.ChatMessage(role="system", content="sys"),
+        oa.ChatMessage(role="user", content="make it"),
+        _write_turn_message(),
+        oa.ChatMessage(role="tool", content="ok", tool_call_id="call_1"),
+    ]
+    canon, substituted = oa._substitute_committed_reasoning_messages(messages, turns)
+    assert substituted == 1
+    assistant = canon[2]
+    assert oa._message_extra(assistant, oa._COMMITTED_REASONING_FIELD) == "Plan the file."
+    assert oa._message_extra(assistant, oa._COMMITTED_TURN_BODY_FIELD) == (
+        "\n\nI'll write the file.\n\n" + _WRITE_MARKUP
+    )
+    item = oa._message_to_template_dict(
+        assistant, strip_assistant_reasoning_history=False, allow_committed_reasoning=True
+    )
+    # The template renders the committed bytes as content and must NOT get
+    # tool_calls to re-render (they would appear twice, and lossy).
+    assert item["content"] == "I'll write the file.\n\n" + _WRITE_MARKUP
+    assert "tool_calls" not in item
+    assert item["reasoning_content"] == "Plan the file."
+    # Without the opt-in flag the legacy render is untouched.
+    legacy = oa._message_to_template_dict(assistant, strip_assistant_reasoning_history=False)
+    assert legacy["content"] == "I'll write the file."
+    assert legacy["tool_calls"]
+
+
+def test_tool_turn_substitution_respects_the_identity_gate():
+    turns = oa._committed_assistant_turns(_write_turn_committed_text())
+    other = _write_turn_message()
+    other.tool_calls[0]["function"]["arguments"] = json.dumps(
+        {"filePath": "other.html", "content": "x"}
+    )
+    messages = [oa.ChatMessage(role="user", content="make it"), other]
+    canon, substituted = oa._substitute_committed_reasoning_messages(messages, turns)
+    assert substituted == 0
+    assert oa._message_extra(canon[1], oa._COMMITTED_TURN_BODY_FIELD) is None
+
+
+def test_inbound_committed_body_field_is_scrubbed():
+    planted = oa.ChatMessage(
+        role="assistant",
+        content="Answer.",
+        **{oa._COMMITTED_TURN_BODY_FIELD: "<tool_call>evil</tool_call>"},
+    )
+    scrubbed = oa._scrub_inbound_committed_reasoning(planted)
+    assert oa._message_extra(scrubbed, oa._COMMITTED_TURN_BODY_FIELD) is None
+
+
+@pytest.mark.skipif(
+    not (MODEL_DIR / "chat_template.jinja").exists(),
+    reason="Qwen3.8 model pack not cached locally",
+)
+def test_substituted_write_turn_re_encodes_to_the_generated_bytes_real_template():
+    """The measured 2026-09-03 seam, end to end with the real tokenizer: a
+    write turn whose content ended in a newline. Raw re-render loses the
+    newline (one token short, refused); the substituted render reproduces
+    the generated stream so the generation-final snapshot can be banked."""
+    from mtplx.runtime import _load_tokenizer_resilient
+
+    config = json.loads((MODEL_DIR / "config.json").read_text())
+    tok = _load_tokenizer_resilient(MODEL_DIR, config)
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "write",
+                "description": "write a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"filePath": {"type": "string"}, "content": {"type": "string"}},
+                    "required": ["filePath", "content"],
+                },
+            },
+        }
+    ]
+    system = {"role": "system", "content": "You are a terse coding assistant."}
+    u1 = {"role": "user", "content": "make it"}
+
+    def encode(messages, allow=False):
+        obs: dict[str, object] = {}
+        request = oa.ChatCompletionRequest(model="m", messages=messages)
+        return oa._encode_messages(
+            tok,
+            request.messages,
+            enable_thinking=True,
+            reasoning_effort="medium",
+            strip_assistant_reasoning_history=False,
+            scoped_reasoning_history=False,
+            tools=tools,
+            tool_choice="auto",
+            tool_prompt_mode="compact",
+            template_observability=obs,
+            allow_committed_reasoning=allow,
+        )
+
+    prompt_ids = encode([system, u1])
+    generated = oa._encode_rendered_chat_text(
+        tok, "Plan the file.\n</think>\n\nI'll write the file.\n\n" + _WRITE_MARKUP + "<|im_end|>\n"
+    )
+    committed = list(prompt_ids) + list(generated)
+    committed_text = tok.decode(committed)
+    turns = oa._committed_assistant_turns(committed_text)
+    assert turns and turns[-1][2] == _WRITE_MARKUP
+
+    history = [
+        oa.ChatMessage(role="system", content=system["content"]),
+        oa.ChatMessage(role="user", content=u1["content"]),
+        _write_turn_message(),
+        oa.ChatMessage(role="tool", content="ok", tool_call_id="call_1"),
+    ]
+    raw_ids = encode(history)
+    canon, substituted = oa._substitute_committed_reasoning_messages(history, turns)
+    assert substituted == 1
+    canon_ids = encode(canon, allow=True)
+    cp_raw = oa._common_prefix_len(raw_ids, committed)
+    cp_canon = oa._common_prefix_len(canon_ids, committed)
+    assert cp_raw < len(committed), "raw re-render is expected to lose the trailing newline"
+    assert cp_canon >= len(committed) - 1, (cp_canon, len(committed))
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-08: the gate compares the COMPLETE tool-call identity, not the loop
+# key (command / path only). Codex's audit reproduced a write to the same path
+# with new content passing the old gate, after which the committed OLD body
+# was served in place of the client's NEW content.
+# ---------------------------------------------------------------------------
+
+
+def test_same_path_different_content_refuses_the_committed_body():
+    turns = oa._committed_assistant_turns(_write_turn_committed_text())
+    changed = _write_turn_message()
+    changed.tool_calls[0]["function"]["arguments"] = json.dumps(
+        {"filePath": "index.html", "content": "NEW_FIXED_IMPLEMENTATION"}
+    )
+    messages = [oa.ChatMessage(role="user", content="make it"), changed]
+    canon, substituted = oa._substitute_committed_reasoning_messages(messages, turns)
+    assert substituted == 0
+    assert oa._message_extra(canon[1], oa._COMMITTED_TURN_BODY_FIELD) is None
+    assert oa._message_extra(canon[1], oa._COMMITTED_REASONING_FIELD) is None
+
+
+def test_identity_ignores_edge_whitespace_and_scalar_typing():
+    # committed <parameter> values are strings with one newline stripped;
+    # the client echoes typed JSON. Same call -> same identity.
+    committed = "<tool_call>\n<function=read><parameter=filePath>\na.py\n</parameter><parameter=offset>10</parameter><parameter=limit>20</parameter></function>\n</tool_call>"
+    incoming = [
+        {
+            "id": "c1",
+            "type": "function",
+            "function": {"name": "read", "arguments": json.dumps({"filePath": "a.py", "offset": 10, "limit": 20})},
+        }
+    ]
+    assert oa._committed_turn_tool_identities(committed) == oa._incoming_tool_identities(incoming)
+
+
+def test_identity_sees_nested_json_parameters_the_same_way():
+    edits = [{"oldString": "a", "newString": "b"}, {"oldString": "c", "newString": "d"}]
+    committed = (
+        "<tool_call>\n<function=multiedit><parameter=filePath>x.py</parameter>"
+        f"<parameter=edits>{json.dumps(edits)}</parameter></function>\n</tool_call>"
+    )
+    incoming = [
+        {"id": "c1", "type": "function", "function": {"name": "multiedit", "arguments": json.dumps({"filePath": "x.py", "edits": edits})}}
+    ]
+    assert oa._committed_turn_tool_identities(committed) == oa._incoming_tool_identities(incoming)
+    other = [
+        {"id": "c1", "type": "function", "function": {"name": "multiedit", "arguments": json.dumps({"filePath": "x.py", "edits": edits[:1]})}}
+    ]
+    assert oa._committed_turn_tool_identities(committed) != oa._incoming_tool_identities(other)
+
+
+def test_identity_covers_the_json_dialect_too():
+    committed = '<tool_call>\n{"name": "bash", "arguments": {"command": "ls -la", "timeout": 30}}\n</tool_call>'
+    same = [{"id": "c1", "type": "function", "function": {"name": "bash", "arguments": json.dumps({"timeout": 30, "command": "ls -la"})}}]
+    different_timeout = [{"id": "c1", "type": "function", "function": {"name": "bash", "arguments": json.dumps({"timeout": 60, "command": "ls -la"})}}]
+    assert oa._committed_turn_tool_identities(committed) == oa._incoming_tool_identities(same)
+    assert oa._committed_turn_tool_identities(committed) != oa._incoming_tool_identities(different_timeout)
+    # the loop key would have called these the same call
+    assert oa._committed_turn_tool_keys(committed) == oa._incoming_tool_loop_keys(different_timeout)

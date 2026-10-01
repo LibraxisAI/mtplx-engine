@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import errno
 import io
 import json
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
+import os
+
 import pytest
 
 from mtplx.cli import build_parser, main
@@ -389,6 +393,23 @@ def test_probe_refuses_no_mtp_sources(tmp_path):
     assert payload["verdict"] == "no_mtp_heads"
     assert payload["forgeable"] is False
     assert payload["has_mtp_weights"] is False
+
+
+def test_probe_does_not_treat_runnable_qwen_trunk_as_mtp_evidence(tmp_path):
+    _write_json(tmp_path / "config.json", _mtp_config())
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"),
+        {"model.language_model.layers.0.mlp.down_proj.weight": mx.zeros((1, 1))},
+    )
+
+    payload = forge.probe_source(str(tmp_path))
+
+    assert payload["verdict"] == "no_mtp_heads"
+    assert payload["forgeable"] is False
+    assert payload["has_mtp_weights"] is False
+    assert payload["runtime_compatibility"] == "native-ar-only-missing-mtp"
+    assert payload["diagnostic"] == "native-ar-only-missing-mtp"
+    assert "AR-only Forge" in payload["message"]
 
 
 def test_probe_refuses_config_only_mtp_sources(tmp_path):
@@ -1015,7 +1036,11 @@ def test_build_zero_agreement_contract_still_measures_speed_rows(tmp_path, monke
     monkeypatch.setattr(
         forge,
         "_prepare_source",
-        lambda repo, run, probe: (source, "Qwen/Qwen3.5-9B", "abc123"),
+        lambda repo, run, probe, *, model_root=None: (
+            source,
+            "Qwen/Qwen3.5-9B",
+            "abc123",
+        ),
     )
 
     def fake_mirror(source_path, destination):
@@ -1207,6 +1232,93 @@ def test_forge_verify_only_requires_verified_ramp_when_requested(
         )
 
     assert ("--require-max-fans" in captured["command"]) is max_fans
+    assert ("--max" in captured["command"]) is max_fans
+
+
+@pytest.mark.parametrize("max_fans", [False, True])
+def test_forge_verify_tune_child_pins_fans_only_with_forge_max(
+    tmp_path, monkeypatch, capsys, max_fans
+):
+    # 2026-09-22: a MiMo `forge build` without --max pinned the fans at max
+    # from 15:02:45 to 15:03:45, because the tune child opened a MaxSession on
+    # every run. Run the exact child command forge builds through tune.
+    from mtplx.commands import public
+
+    model_dir = tmp_path / "Youssofal--Qwen3.5-9B-MTPLX-Optimized-Speed"
+    _write_json(
+        model_dir / "mtplx_runtime.json",
+        {
+            "arch_id": "qwen3-next-mtp",
+            "mtplx_version": "1.0.0",
+            "public_model_id": "mtplx-qwen35-9b-optimized-speed",
+            "hub": {"repo_id": "Youssofal/Qwen3.5-9B-MTPLX-Optimized-Speed"},
+        },
+    )
+    captured: dict[str, list[str]] = {}
+
+    class FinishedProcess:
+        returncode = 1
+
+        def poll(self):
+            return self.returncode
+
+    def fake_popen(command, **_kwargs):
+        captured["command"] = command
+        return FinishedProcess()
+
+    monkeypatch.setattr(forge.subprocess, "Popen", fake_popen)
+    with pytest.raises(forge.ForgeError, match="mtplx tune failed"):
+        forge._run_verify(model_dir, tmp_path / "run", max_fans=max_fans)
+    command = captured["command"]
+    assert command[1:4] == ["-P", "-m", "mtplx.cli"]
+
+    events: list[str] = []
+
+    class RecordingMaxSession:
+        def __init__(self, **_kwargs):
+            events.append("max-init")
+            self.thermal = {"enabled": True}
+
+        def start(self):
+            events.append("max-start")
+            return True
+
+        def stop(self):
+            events.append("max-stop")
+            return {"ok": True}
+
+    def fake_run_candidates(*_args, **_kwargs):
+        events.append("candidates")
+        return [
+            {"candidate": "ar", "mode": "AR", "depth": None, "tok_s": 10.0, "quality_passed": True},
+            {
+                "candidate": "1",
+                "mode": "D1",
+                "depth": 1,
+                "tok_s": 12.0,
+                "quality_passed": True,
+                "acceptance_by_depth": [0.8],
+            },
+        ]
+
+    monkeypatch.setattr("mtplx.thermal.MaxSession", RecordingMaxSession)
+    monkeypatch.setattr(public, "_run_tune_candidates", fake_run_candidates)
+    monkeypatch.setattr(public, "_apple_hardware_context", lambda: {"chip": "Apple M5 Max"})
+    monkeypatch.setattr(public, "_software_context", lambda: {"mtplx_version": "1.0.0"})
+    monkeypatch.setattr(public, "_mlx_backend_context", lambda: {"stock_mlx_likely": True})
+    monkeypatch.setenv("MTPLX_TUNE_STATE", str(tmp_path / "tune-state.json"))
+    args = build_parser().parse_args(command[4:])
+    args._cli_flags = {"model"}
+
+    assert public.cmd_tune_public(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    if max_fans:
+        assert events == ["max-init", "max-start", "candidates", "max-stop"]
+        assert args.require_max_fans is True
+    else:
+        assert events == ["candidates"]
+    assert payload["fans_requested"] is max_fans
 
 
 def test_contract_calibration_fails_closed_on_probe_failure(tmp_path, monkeypatch):
@@ -1259,8 +1371,11 @@ def test_contract_chain_probe_keeps_zero_agreement_as_diagnostic():
     )
 
     assert contract["hidden_variant"] == "post_norm"
-    assert contract["calibration"]["status"] == "no_agreement_signal"
-    assert "no agreement signal" in contract["calibration"]["diagnostic"]
+    # A variant with no counted draft rounds is no evidence either way.
+    assert contract["calibration"]["status"] == "inconclusive"
+    assert contract["calibration"]["reason"] == "insufficient_evidence"
+    assert contract["calibration"]["signal"] == "no_agreement_signal"
+    assert "inconclusive" in contract["calibration"]["diagnostic"]
 
 
 def test_contract_chain_probe_keeps_topk_only_signal_as_diagnostic():
@@ -1283,10 +1398,382 @@ def test_contract_chain_probe_keeps_topk_only_signal_as_diagnostic():
         },
     )
 
-    assert contract["hidden_variant"] == "fc"
+    # One top-k hint used to rewrite the contract to fc / hidden_embedding.
+    # It is recorded, and the declared contract stays.
+    assert contract["hidden_variant"] == "post_norm"
+    assert contract["concat_order"] == "embedding_hidden"
+    assert contract["calibration"]["status"] == "inconclusive"
+    assert contract["calibration"]["signal"] == "topk_only_no_exact_agreement"
+
+
+def _chain_probe_variant(
+    *,
+    base: str = "post_norm",
+    hidden: str = "post_norm",
+    concat: str = "embedding_hidden",
+    position: str = "local",
+    anchor: str = "prompt_boundary",
+    prompts: int = 8,
+    windows: int = 4,
+    depth: int = 3,
+    prefixes: tuple[int, ...] = (0,),
+) -> dict:
+    """One variant shaped like `mtplx mtp-chain-probe` output. ``prefixes``
+    cycles over the rounds: a round accepts that many draft tokens and then
+    misses."""
+    rows = []
+    accepted: list[int] = []
+    matches = [0] * depth
+    for prompt in range(prompts):
+        for window in range(windows):
+            prefix = prefixes[len(accepted) % len(prefixes)]
+            accepted.append(prefix)
+            for index in range(prefix):
+                matches[index] += 1
+            rows.append(
+                {
+                    "prompt_id": f"calib-{prompt:03d}",
+                    "window_index": window,
+                    "prefix": prefix,
+                    "drafts": [],
+                }
+            )
+    rounds = len(accepted)
+    return {
+        "base_hidden_variant": base,
+        "mtp_hidden_variant": hidden,
+        "concat_order": concat,
+        "mtp_position_mode": position,
+        "cache_policy": "persistent",
+        "history_mode": "recursive",
+        "anchor": anchor,
+        "matches_by_depth": matches,
+        "totals_by_depth": [rounds] * depth,
+        "agreement_by_depth": [value / rounds for value in matches],
+        "topk_hits_by_depth": {"8": list(matches)},
+        "topk_rates_by_depth": {"8": [value / rounds for value in matches]},
+        "mean_prefix": sum(accepted) / rounds,
+        "prefixes": accepted,
+        "rows": rows,
+        "error": None,
+    }
+
+
+def _chain_probe_payload(*contracts: dict) -> dict:
+    """Both anchors for every contract, as forge's calibration probe runs them."""
+    return {
+        "variants": [
+            _chain_probe_variant(anchor=anchor, **contract)
+            for contract in contracts
+            for anchor in ("prompt_boundary", "after_one_target")
+        ]
+    }
+
+
+def test_contract_calibration_keeps_family_default_on_an_all_zero_tie():
+    payload = _chain_probe_payload(
+        {},
+        {"hidden": "pre_norm"},
+        {"hidden": "fc"},
+        {"base": "pre_norm"},
+        {"concat": "hidden_embedding"},
+        {"position": "absolute"},
+    )
+
+    contract = forge._contract_from_chain_probe(
+        payload, fallback=forge._runtime_or_default_mtp_contract(None)
+    )
+
+    calibration = contract["calibration"]
+    assert contract["base_hidden_variant"] == "post_norm"
+    assert contract["hidden_variant"] == "post_norm"
+    assert contract["concat_order"] == "embedding_hidden"
+    assert contract["mtp_position_mode"] == "cache"
+    assert calibration["status"] == "inconclusive"
+    assert calibration["reason"] == "no_signal"
+    assert calibration["kept"] == "family_default"
+    assert calibration["signal"] == "no_agreement_signal"
+    assert calibration["reference"]["draft_rounds"] == 64
+    assert calibration["reference"]["prompts"] == 8
+    assert "no agreement signal" in calibration["diagnostic"]
+
+
+@pytest.mark.parametrize(
+    "prompts,windows",
+    [
+        (1, 1),  # the 09-22 MiMo probe: 2 rounds from one prompt
+        (2, 16),  # 64 rounds, but two prompts
+        (8, 2),  # eight prompts, but 32 rounds
+    ],
+)
+def test_contract_calibration_keeps_default_on_a_tiny_sample(prompts, windows):
+    payload = _chain_probe_payload(
+        {"prompts": prompts, "windows": windows},
+        {"hidden": "pre_norm", "prompts": prompts, "windows": windows, "prefixes": (3,)},
+    )
+
+    contract = forge._contract_from_chain_probe(
+        payload, fallback=forge._runtime_or_default_mtp_contract(None)
+    )
+
+    calibration = contract["calibration"]
+    assert contract["hidden_variant"] == "post_norm"
+    assert calibration["status"] == "inconclusive"
+    assert calibration["reason"] == "insufficient_evidence"
+    assert calibration["kept"] == "family_default"
+    assert calibration["chosen"] is None
+    assert calibration["best_alternative"]["hidden_variant"] == "pre_norm"
+    assert calibration["best_alternative"]["accepted_per_round"] == 3.0
+
+
+def test_contract_calibration_ignores_the_mimo_probe_that_picked_pre_norm():
+    # The shape of the real 09-22 MiMo contract probe: one prompt, one window,
+    # every candidate 0 at depth 1, and pre_norm "winning" on a depth-3 match
+    # after two misses plus top-k hints. The grafted Qwen3.5-9B head's
+    # contract is post_norm.
+    def variant(base, hidden, anchor, matches, topk8):
+        return {
+            "base_hidden_variant": base,
+            "mtp_hidden_variant": hidden,
+            "concat_order": "embedding_hidden",
+            "mtp_position_mode": "local",
+            "cache_policy": "persistent",
+            "history_mode": "recursive",
+            "anchor": anchor,
+            "matches_by_depth": matches,
+            "totals_by_depth": [1, 1, 1],
+            "agreement_by_depth": [float(value) for value in matches],
+            "topk_hits_by_depth": {"8": topk8},
+            "topk_rates_by_depth": {"8": [float(value) for value in topk8]},
+            "mean_prefix": 0.0,
+            "prefixes": [0],
+            "rows": [{"prompt_id": "calib_code_parser_001", "window_index": 0, "prefix": 0}],
+            "error": None,
+        }
+
+    payload = {
+        "variants": [
+            variant(base, "pre_norm", "after_one_target", [0, 0, 1], [0, 1, 1])
+            for base in ("post_norm", "pre_norm")
+        ]
+        + [
+            variant(base, "post_norm", "after_one_target", [0, 0, 0], [0, 1, 0])
+            for base in ("post_norm", "pre_norm")
+        ]
+        + [
+            variant(base, hidden, "prompt_boundary", [0, 0, 0], [0, 0, 0])
+            for base in ("post_norm", "pre_norm")
+            for hidden in ("post_norm", "pre_norm", "fc", "prev")
+        ]
+    }
+
+    contract = forge._contract_from_chain_probe(
+        payload, fallback=forge._runtime_or_default_mtp_contract(None)
+    )
+
+    assert contract["hidden_variant"] == "post_norm"
+    assert contract["base_hidden_variant"] == "post_norm"
+    assert contract["calibration"]["status"] == "inconclusive"
+    assert contract["calibration"]["reason"] == "insufficient_evidence"
+    assert contract["calibration"]["reference"]["draft_rounds"] == 2
+    assert contract["calibration"]["reference"]["prompts"] == 1
+
+
+def test_contract_calibration_switches_on_a_clear_winner():
+    payload = _chain_probe_payload(
+        {"prefixes": (0, 1)},  # the default contract: 0.5 accepted tokens a round
+        {"hidden": "pre_norm", "prefixes": (2, 2, 1, 3)},  # 2.0
+        {"hidden": "fc", "prefixes": (0,)},
+        {"concat": "hidden_embedding", "prefixes": (0,)},
+    )
+
+    contract = forge._contract_from_chain_probe(
+        payload, fallback=forge._runtime_or_default_mtp_contract(None)
+    )
+
+    calibration = contract["calibration"]
+    assert contract["hidden_variant"] == "pre_norm"
+    assert contract["base_hidden_variant"] == "post_norm"
+    assert contract["concat_order"] == "embedding_hidden"
+    assert contract["mtp_position_mode"] == "cache"
+    assert calibration["status"] == "switched"
+    assert calibration["kept"] is None
+    assert calibration["diagnostic"] is None
+    assert calibration["reference"]["accepted_per_round"] == 0.5
+    assert calibration["chosen"]["hidden_variant"] == "pre_norm"
+    assert calibration["chosen"]["accepted_per_round"] == 2.0
+    assert calibration["chosen"]["draft_rounds"] == 64
+
+
+def test_contract_calibration_prefers_the_smallest_change_among_tied_winners():
+    # pre_norm with the absolute position mode reads 0.125 higher, inside the
+    # margin, so the winner that changes one declared field is taken.
+    payload = _chain_probe_payload(
+        {"prefixes": (0,)},
+        {"hidden": "pre_norm", "prefixes": (2,)},
+        {"hidden": "pre_norm", "position": "absolute", "prefixes": (2, 2, 2, 2, 2, 2, 2, 3)},
+    )
+
+    contract = forge._contract_from_chain_probe(
+        payload, fallback=forge._runtime_or_default_mtp_contract(None)
+    )
+
+    assert contract["calibration"]["status"] == "switched"
+    assert contract["hidden_variant"] == "pre_norm"
+    assert contract["mtp_position_mode"] == "cache"
+    assert contract["calibration"]["best_alternative"]["mtp_position_mode"] == "absolute"
+
+
+def test_contract_calibration_keeps_declared_contract_when_the_margin_is_too_small():
+    declared = forge._runtime_or_default_mtp_contract(
+        {
+            "mtp_contract": {
+                "base_hidden_variant": "post_norm",
+                "hidden_variant": "post_norm",
+                "concat_order": "embedding_hidden",
+                "mtp_position_mode": "local",
+            }
+        }
+    )
+    payload = _chain_probe_payload(
+        {"prefixes": (2, 1, 2, 2)},  # 1.75
+        {"hidden": "pre_norm", "prefixes": (2, 2, 2, 1, 2, 2, 2, 2)},  # 1.875
+        {"hidden": "fc", "prefixes": (1,)},
+    )
+
+    contract = forge._contract_from_chain_probe(
+        payload, fallback=declared, fallback_source="declared"
+    )
+
+    calibration = contract["calibration"]
+    assert contract["hidden_variant"] == "post_norm"
+    assert contract["mtp_position_mode"] == "local"
+    assert calibration["status"] == "inconclusive"
+    assert calibration["reason"] == "tie"
+    assert calibration["kept"] == "declared"
+    assert calibration["best_alternative"]["hidden_variant"] == "pre_norm"
+    assert "0.25-token margin" in calibration["diagnostic"]
+
+
+def test_contract_calibration_confirms_a_declared_contract_that_wins_clearly():
+    payload = _chain_probe_payload(
+        {"prefixes": (2,)},
+        {"hidden": "pre_norm", "prefixes": (1, 2)},  # 1.5, 0.5 behind
+        {"concat": "hidden_embedding", "prefixes": (0,)},
+    )
+
+    contract = forge._contract_from_chain_probe(
+        payload,
+        fallback=forge._runtime_or_default_mtp_contract(None),
+        fallback_source="declared",
+    )
+
+    assert contract["hidden_variant"] == "post_norm"
+    assert contract["calibration"]["status"] == "confirmed"
+    assert contract["calibration"]["kept"] == "declared"
+    assert contract["calibration"]["diagnostic"] is None
+
+
+def test_contract_calibration_probe_samples_enough_and_measures_the_declared_contract(
+    tmp_path, monkeypatch
+):
+    from mtplx import thermal
+
+    class ForbiddenMaxSession:
+        def __init__(self, **_kwargs):
+            raise AssertionError("calibration without --max must not touch the fans")
+
+    monkeypatch.setattr(thermal, "MaxSession", ForbiddenMaxSession)
+    model = tmp_path / "model"
+    _write_json(model / "config.json", _mtp_config())
+    existing = {
+        "mtp_contract": {
+            "base_hidden_variant": "post_norm",
+            "hidden_variant": "embedding",
+            "concat_order": "hidden_embedding",
+            "mtp_position_mode": "cache",
+        }
+    }
+    captured: dict[str, list[str]] = {}
+
+    class FinishedRun:
+        returncode = 0
+
+    def fake_run(command, **_kwargs):
+        captured["command"] = command
+        output = Path(command[command.index("--output") + 1])
+        # A tiny probe in which a non-declared contract looks far better.
+        _write_json(
+            output,
+            _chain_probe_payload(
+                {
+                    "hidden": "embedding",
+                    "concat": "hidden_embedding",
+                    "prompts": 1,
+                    "windows": 1,
+                },
+                {"prompts": 1, "windows": 1, "prefixes": (3,)},
+            ),
+        )
+        return FinishedRun()
+
+    monkeypatch.setattr(forge.subprocess, "run", fake_run)
+
+    contract = forge._calibrate_mtp_contract(
+        model, tmp_path / "run", recipe={}, existing=existing, max_fans=False
+    )
+
+    command = captured["command"]
+
+    def flag(name: str) -> str:
+        return command[command.index(name) + 1]
+
+    assert flag("--limit") == "8"
+    assert flag("--windows") == "4"
+    assert flag("--depth") == "3"
+    assert flag("--stride") == "3"
+    assert "embedding" in flag("--mtp-hidden-variants").split(",")
+    assert "hidden_embedding" in flag("--concat-orders").split(",")
+    assert "local" in flag("--mtp-position-modes").split(",")
+    assert contract["hidden_variant"] == "embedding"
     assert contract["concat_order"] == "hidden_embedding"
-    assert contract["calibration"]["status"] == "topk_only_no_exact_agreement"
-    assert "top-k hints" in contract["calibration"]["diagnostic"]
+    assert contract["calibration"]["status"] == "inconclusive"
+    assert contract["calibration"]["kept"] == "declared"
+    progress = json.loads((tmp_path / "run" / "calibrate.json").read_text(encoding="utf-8"))
+    assert progress["label"] == "contract_calibration_inconclusive"
+    assert progress["calibration_status"] == "inconclusive"
+    assert progress["mtp_contract"]["calibration"]["reason"] == "insufficient_evidence"
+
+
+def test_runtime_stamp_records_contract_calibration_in_provenance(tmp_path):
+    _write_json(tmp_path / "config.json", _mtp_config())
+    contract = forge._contract_from_chain_probe(
+        _chain_probe_payload(
+            {"prompts": 1, "windows": 1},
+            {"hidden": "pre_norm", "prompts": 1, "windows": 1, "prefixes": (3,)},
+        ),
+        fallback=forge._runtime_or_default_mtp_contract(None),
+    )
+
+    runtime = forge._stamp_runtime_metadata(
+        tmp_path,
+        branded_name="Fixture-MTPLX",
+        source_repo="owner/source",
+        source_sha="abc123",
+        source_format=forge.SOURCE_BF16_NATIVE,
+        recipe={"mtp_policy": "keep_bf16"},
+        forge_inputs={"trunk_path": str(tmp_path)},
+        rows=_speed_win_rows(),
+        mtp_contract=contract,
+        existing=None,
+    )
+
+    assert "calibration" not in runtime["mtp_contract"]
+    assert runtime["mtp_contract"]["hidden_variant"] == "post_norm"
+    recorded = runtime["forge_provenance"]["mtp_contract_calibration"]
+    assert recorded["status"] == "inconclusive"
+    assert recorded["reason"] == "insufficient_evidence"
+    assert recorded["kept"] == "family_default"
 
 
 def test_discover_maps_hf_rows(monkeypatch):
@@ -1336,6 +1823,108 @@ def test_discover_network_failure_mentions_hf_unreachable(monkeypatch, capsys):
 
     assert code == 1
     assert "hf_unreachable" in capsys.readouterr().err
+
+
+def test_explicit_model_root_takes_precedence_for_forge_destinations(
+    tmp_path, monkeypatch
+):
+    primary_root = tmp_path / "primary"
+    forge_env_root = tmp_path / "forge-env"
+    legacy_env_root = tmp_path / "legacy-env"
+    monkeypatch.setenv("MTPLX_FORGE_MODEL_ROOT", str(forge_env_root))
+    monkeypatch.setenv("MTPLX_MODEL_DIR", str(legacy_env_root))
+
+    assert forge._default_model_root(primary_root) == primary_root
+    assert forge._unique_model_dir("Fixture", model_root=primary_root) == (
+        primary_root / "Fixture"
+    )
+    assert forge._default_model_root() == forge_env_root
+
+    monkeypatch.delenv("MTPLX_FORGE_MODEL_ROOT")
+    assert forge._default_model_root() == legacy_env_root
+
+
+def test_prepare_hf_source_uses_explicit_model_root_as_pull_cache(
+    tmp_path, monkeypatch
+):
+    primary_root = tmp_path / "primary"
+    monkeypatch.setenv("MTPLX_FORGE_MODEL_ROOT", str(tmp_path / "stale-forge-root"))
+    calls = []
+
+    def fake_pull(repo_id, **kwargs):
+        calls.append((repo_id, kwargs["cache_dir"]))
+        cached = Path(kwargs["cache_dir"]) / "owner--Fixture"
+        cached.mkdir(parents=True)
+        (cached / "config.json").write_text("{}", encoding="utf-8")
+        return {"path": str(cached), "size_bytes": 2}
+
+    monkeypatch.setattr(forge, "pull_model", fake_pull)
+
+    source, repo, revision = forge._prepare_source(
+        "owner/Fixture",
+        tmp_path / "run",
+        {"estimated_size_bytes": 2, "source_sha": "abc123"},
+        model_root=primary_root,
+    )
+
+    assert calls == [("owner/Fixture", primary_root)]
+    assert source == primary_root / "owner--Fixture"
+    assert repo == "owner/Fixture"
+    assert revision == "abc123"
+
+
+def test_mirrored_output_is_self_contained_after_source_removal(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    _write_json(source / "config.json", {"model_type": "fixture"})
+    blob = tmp_path / "cache-blob.safetensors"
+    blob.write_bytes(b"payload")
+    (source / "model.safetensors").symlink_to(blob)
+    nested = source / "tokenizer"
+    nested.mkdir()
+    (nested / "tokenizer.json").write_text('{"version":1}', encoding="utf-8")
+    destination = tmp_path / "destination"
+
+    forge._mirror_model_tree(source, destination)
+
+    payload = destination / "model.safetensors"
+    assert not payload.is_symlink()
+    assert payload.stat().st_ino == blob.stat().st_ino
+    assert not (destination / "config.json").is_symlink()
+    assert not (destination / "tokenizer" / "tokenizer.json").is_symlink()
+
+    shutil.rmtree(source)
+    blob.unlink()
+
+    assert payload.read_bytes() == b"payload"
+    assert (destination / "config.json").read_text(encoding="utf-8")
+    assert (destination / "tokenizer" / "tokenizer.json").read_text(
+        encoding="utf-8"
+    ) == '{"version":1}'
+
+
+def test_mirrored_output_copies_payload_when_hardlink_is_unavailable(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _write_json(source / "config.json", {"model_type": "fixture"})
+    source_payload = source / "model.safetensors"
+    source_payload.write_bytes(b"payload")
+
+    def cross_device_link(*_args, **_kwargs):
+        raise OSError(errno.EXDEV, "cross-device link")
+
+    monkeypatch.setattr(forge.os, "link", cross_device_link)
+    destination = tmp_path / "destination"
+
+    forge._mirror_model_tree(source, destination)
+
+    payload = destination / "model.safetensors"
+    assert not payload.is_symlink()
+    assert payload.read_bytes() == b"payload"
+    assert payload.stat().st_ino != source_payload.stat().st_ino
+    assert not list(destination.rglob(".*.tmp"))
 
 
 def test_build_local_already_mtplx_writes_phase_files_and_runtime(tmp_path, monkeypatch):
@@ -2093,6 +2682,72 @@ def test_embedded_bf16_mtp_extraction_does_not_require_torch(tmp_path):
     assert bool(mx.allclose(tensors["mtp.fc.weight"], mx.ones((2, 2), dtype=mx.bfloat16)).item())
 
 
+def test_embedded_mtp_extraction_from_a_single_file_checkpoint_without_an_index(tmp_path):
+    """Issue #492 (empero-ai/Qwen3.8-4B-Distill). A model small enough for one
+    ``model.safetensors`` ships no ``model.safetensors.index.json``. ``inspect``
+    reads the shard header in that case and reports the head as present, but
+    the extractor returned False without an index, so forge converted the
+    trunk, wrote no ``mtp.safetensors``, and the build died at calibration
+    with "return_hidden requires an MTP-patched runtime"."""
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    _write_json(source / "config.json", _mtp_config())
+    mx.save_safetensors(
+        str(source / "model.safetensors"),
+        {
+            "mtp.fc.weight": mx.ones((2, 2), dtype=mx.bfloat16),
+            "mtp.layers.0.self_attn.q_proj.weight": mx.full((2, 2), 3.0, dtype=mx.bfloat16),
+            "model.layers.0.self_attn.q_proj.weight": mx.zeros((2, 2), dtype=mx.bfloat16),
+        },
+    )
+    assert not (source / "model.safetensors.index.json").exists()
+
+    assert forge._ensure_mtp_sidecar(source, destination) is True
+
+    tensors = mx.load(str(destination / "mtp.safetensors"))
+    assert sorted(tensors) == ["mtp.fc.weight", "mtp.layers.0.self_attn.q_proj.weight"]
+    assert bool(
+        mx.allclose(
+            tensors["mtp.layers.0.self_attn.q_proj.weight"],
+            mx.full((2, 2), 3.0, dtype=mx.bfloat16),
+        ).item()
+    )
+
+
+def test_embedded_mtp_extraction_without_an_index_reads_every_shard(tmp_path):
+    # No index and two shards: the head may sit in either.
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    _write_json(source / "config.json", _mtp_config())
+    mx.save_safetensors(
+        str(source / "model-00001-of-00002.safetensors"),
+        {"model.layers.0.self_attn.q_proj.weight": mx.zeros((2, 2), dtype=mx.bfloat16)},
+    )
+    mx.save_safetensors(
+        str(source / "model-00002-of-00002.safetensors"),
+        {"mtp.fc.weight": mx.ones((2, 2), dtype=mx.bfloat16)},
+    )
+
+    assert forge._ensure_mtp_sidecar(source, destination) is True
+    assert sorted(mx.load(str(destination / "mtp.safetensors"))) == ["mtp.fc.weight"]
+
+
+def test_a_checkpoint_without_an_index_and_without_a_head_still_extracts_nothing(tmp_path):
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    _write_json(source / "config.json", _mtp_config())
+    mx.save_safetensors(
+        str(source / "model.safetensors"),
+        {"model.layers.0.self_attn.q_proj.weight": mx.zeros((2, 2), dtype=mx.bfloat16)},
+    )
+
+    assert forge._ensure_mtp_sidecar(source, destination) is False
+    assert not (destination / "mtp.safetensors").exists()
+
+
 def test_embedded_qwen_mtp_extraction_sanitizes_norm_weights(tmp_path):
     source = tmp_path / "source"
     destination = tmp_path / "destination"
@@ -2202,9 +2857,21 @@ def test_calibrate_sidecar_rejects_existing_zero_mtp_payload(tmp_path):
 
 def test_publish_reads_one_token_line_and_keeps_artifacts_secret_free(tmp_path, monkeypatch):
     local = tmp_path / "model"
-    _write_json(local / "mtplx_runtime.json", {"forge_provenance": {"forged_locally": True}})
+    trunk_path = "/Users/someone/.mtplx/models/Owner--Trunk"
+    _write_json(
+        local / "mtplx_runtime.json",
+        {
+            "base_trunk": trunk_path,
+            "forge_provenance": {
+                "forged_locally": True,
+                "source_repo": trunk_path,
+                "forge_inputs": {"trunk_path": trunk_path},
+            },
+        },
+    )
     (local / "config.json").write_text("{}", encoding="utf-8")
     calls: list[tuple[str, str | None]] = []
+    uploads: dict[str, object] = {}
 
     class FakeApi:
         def create_repo(self, **kwargs):
@@ -2212,10 +2879,12 @@ def test_publish_reads_one_token_line_and_keeps_artifacts_secret_free(tmp_path, 
 
         def upload_folder(self, **kwargs):
             calls.append(("folder", kwargs.get("token")))
+            uploads["ignore_patterns"] = kwargs.get("ignore_patterns")
             return SimpleNamespace(oid="rev-folder")
 
         def upload_file(self, **kwargs):
             calls.append(("file", kwargs.get("token")))
+            uploads[str(kwargs.get("path_in_repo"))] = kwargs.get("path_or_fileobj")
             return SimpleNamespace(oid="rev-file")
 
         def model_info(self, repo_id, *, token=None):
@@ -2256,6 +2925,36 @@ def test_publish_reads_one_token_line_and_keeps_artifacts_secret_free(tmp_path, 
     assert "hf_secret" not in publish_json
     assert "hf_secret" not in runtime_json
     assert json.loads(runtime_json)["forge_provenance"]["published_to_hf"]["repo"] == "owner/Fixture-MTPLX-Speed"
+    # The local contract keeps its paths; the published copy carries none.
+    assert trunk_path in runtime_json
+    assert uploads["ignore_patterns"] == ["mtplx_runtime.json"]
+    published = json.loads(uploads["mtplx_runtime.json"].decode("utf-8"))
+    assert "/Users/" not in json.dumps(published)
+    assert published["base_trunk"] == "<redacted>/Owner--Trunk"
+    assert published["forge_provenance"]["forge_inputs"]["trunk_path"] == "<redacted>/Owner--Trunk"
+
+
+def test_stamp_names_a_local_trunk_by_its_pull_marker(tmp_path):
+    trunk = tmp_path / "Owner--Trunk"
+    trunk.mkdir()
+    _write_json(
+        trunk / ".mtplx-source.json",
+        {"repo_id": "Owner/Trunk", "resolved_sha": "abc123", "revision": None},
+    )
+
+    assert forge._resolve_source_identity(str(trunk), "") == ("Owner/Trunk", "abc123")
+    assert forge._resolve_source_identity(str(trunk), "keep") == ("Owner/Trunk", "keep")
+
+
+def test_stamp_names_a_cache_layout_trunk_without_a_marker(tmp_path):
+    trunk = tmp_path / "Owner--Trunk"
+    trunk.mkdir()
+    plain = tmp_path / "just-a-folder"
+    plain.mkdir()
+
+    assert forge._resolve_source_identity(str(trunk), "") == ("Owner/Trunk", "")
+    assert forge._resolve_source_identity(str(plain), "") == (str(plain), "")
+    assert forge._resolve_source_identity("Owner/Trunk", "sha") == ("Owner/Trunk", "sha")
 
 
 def _tiny_vision_config() -> dict:
@@ -2464,3 +3163,74 @@ def test_runtime_stamp_carries_family_sampler_law(tmp_path):
     assert runtime["sampler"]["temperature"] == 1.0
     assert runtime["sampler"]["top_p"] == 0.95
     assert runtime["sampler"]["top_k"] == 20
+
+
+def test_forge_reuses_a_source_already_on_disk(tmp_path, monkeypatch):
+    """Issue #445: a repo the machine already holds must not be pulled again."""
+    from mtplx.commands import forge as forge_module
+
+    snapshot = tmp_path / "models--org--name" / "snapshots" / "deadbeef"
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "mtplx.hf_loader.resolve_model_path", lambda ref, cache_dir=None: snapshot
+    )
+
+    def never_pull(*args, **kwargs):
+        raise AssertionError("forge downloaded a source it already had")
+
+    monkeypatch.setattr(forge_module, "pull_model", never_pull)
+
+    run = tmp_path / "run"
+    run.mkdir()
+    path, repo_id, sha = forge_module._prepare_source("org/name", run, {})
+    assert path == snapshot
+    assert repo_id == "org/name"
+    # The sha describes the copy that was built from, not the remote tip.
+    assert sha == "deadbeef"
+
+
+def test_forge_still_pulls_a_source_that_is_not_on_disk(tmp_path, monkeypatch):
+    from mtplx.commands import forge as forge_module
+
+    def missing(ref, cache_dir=None):
+        raise FileNotFoundError(f"Model {ref} is not cached. Run: mtplx pull {ref}")
+
+    monkeypatch.setattr("mtplx.hf_loader.resolve_model_path", missing)
+    downloaded = tmp_path / "pulled"
+    downloaded.mkdir()
+    calls: list[str] = []
+
+    def fake_pull(repo_id, **kwargs):
+        calls.append(repo_id)
+        return {"path": str(downloaded), "size_bytes": 4}
+
+    monkeypatch.setattr(forge_module, "pull_model", fake_pull)
+
+    run = tmp_path / "run"
+    run.mkdir()
+    path, repo_id, _sha = forge_module._prepare_source(
+        "org/name", run, {"source_sha": "abc"}
+    )
+    assert calls == ["org/name"]
+    assert path == downloaded
+    assert repo_id == "org/name"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can create any directory")
+def test_unique_model_dir_explains_unavailable_model_root(tmp_path):
+    # The app passes --model-root for every build; when that root sits on a
+    # drive that is not connected, the build must stop with the directory
+    # named, not a bare permission error from whichever parent refused.
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+    root = locked / "ExternalSSD" / "models"
+    try:
+        with pytest.raises(forge.ForgeError, match="is not available") as excinfo:
+            forge._unique_model_dir("Built", model_root=root)
+    finally:
+        locked.chmod(0o700)
+
+    assert str(root) in str(excinfo.value)
+    assert excinfo.value.code == 2

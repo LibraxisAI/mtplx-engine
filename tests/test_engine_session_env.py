@@ -128,6 +128,42 @@ def test_system_prompt_mismatch_still_marks_background():
     )
 
 
+def test_short_answer_turn_with_history_stays_foreground_despite_mismatch():
+    """Issue #454: a second client's conversation with 30-token answers is
+    not a title job once it carries assistant history; it must keep its
+    session and bank entry instead of re-prefilling every turn."""
+    es = _engine_session()
+    main_hash = es.hash_text("main chat system")
+    messages = [
+        {"role": "system", "content": "Assistant S2. filler filler filler"},
+        {"role": "user", "content": "Turn 1: reply with just the number 1."},
+        {"role": "assistant", "content": "1"},
+        {"role": "user", "content": "Turn 2: reply with just the number 2."},
+    ]
+
+    assert (
+        es.is_background_request(
+            messages=messages,
+            max_tokens=30,
+            headers={},
+            metadata={},
+            main_system_hash=main_hash,
+        )
+        is False
+    )
+    # The explicit task markers still win regardless of shape.
+    assert (
+        es.is_background_request(
+            messages=messages,
+            max_tokens=30,
+            headers={},
+            metadata={"task": "title_generation"},
+            main_system_hash=main_hash,
+        )
+        is True
+    )
+
+
 # --- model-aware auto budget (v2, founder memory ruling 2026-07-05) ----------
 
 GIB = 1024**3
@@ -212,6 +248,70 @@ def test_per_session_auto_clamped_by_ram_tier_big_box(monkeypatch):
     assert es.resolve_session_bank_per_session_bytes(48 * GIB) == 24 * GIB
 
 
+def _plan(usable_gib: float, weights_gib: float):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        available=True,
+        usable_bytes=int(usable_gib * GIB),
+        model_weights_bytes=int(weights_gib * GIB),
+    )
+
+
+@pytest.mark.parametrize(
+    ("ram_gib", "usable_gib", "weights_gib", "budget_gib", "expected_gib", "seat"),
+    [
+        # PR #496 (Dizzler7) asked for a flat 32 GiB so a 12.2 GiB Q8-KV
+        # 100k-token 27B snapshot persists. The plan sizes that ask by the
+        # machine: (usable - weights - 3 GiB transients) / 2, under 2/3 of
+        # the bank budget.
+        (64, 48, 18.6, 26.4, 13.2, "64 GB + 27B: the 12.2 GiB snapshot fits"),
+        (128, 96, 18.6, 48, 32, "128 GB + 27B: play allows 37.2, budget rule holds 32"),
+        (128, 96, 72, 21, 10.5, "128 GB + Flash-Next: 10.5, below the old 24 flat"),
+        (48, 36, 18.6, 14.4, 7.2, "48 GB + 27B: 7.2, below the old 8 flat"),
+    ],
+)
+def test_per_session_auto_is_the_plan_play_ceiling(
+    monkeypatch, ram_gib, usable_gib, weights_gib, budget_gib, expected_gib, seat
+):
+    monkeypatch.delenv("MTPLX_SESSION_BANK_PER_SESSION_BYTES", raising=False)
+    es = _es_with_ram(monkeypatch, ram_gib * GIB)
+    plan = _plan(usable_gib, weights_gib)
+    resolved = es.resolve_session_bank_per_session_bytes(
+        int(budget_gib * GIB), memory_plan=plan
+    )
+    assert resolved == pytest.approx(expected_gib * GIB, abs=GIB // 1024), seat
+
+
+def test_per_session_play_ceiling_needs_a_usable_plan(monkeypatch):
+    from types import SimpleNamespace
+
+    es = _es_with_ram(monkeypatch, 64 * GIB)
+    assert es.per_session_play_ceiling_bytes(None) is None
+    assert es.per_session_play_ceiling_bytes(SimpleNamespace(available=False)) is None
+    assert (
+        es.per_session_play_ceiling_bytes(
+            SimpleNamespace(available=True, usable_bytes=0, model_weights_bytes=1)
+        )
+        is None
+    )
+    # A plan with no play left still floors at 1 GiB: the live-ref lease
+    # covers the rest, the gate never goes below the floor.
+    assert es.per_session_play_ceiling_bytes(_plan(20, 19)) == GIB
+
+
+def test_per_session_explicit_env_wins_over_the_plan_ceiling(monkeypatch):
+    monkeypatch.setenv("MTPLX_SESSION_BANK_PER_SESSION_BYTES", "20G")
+    es = _es_with_ram(monkeypatch, 64 * GIB)
+    # Explicit values keep their semantics, clamped to the auto budget.
+    assert (
+        es.resolve_session_bank_per_session_bytes(
+            int(26.4 * GIB), memory_plan=_plan(48, 18.6)
+        )
+        == 20 * GIB
+    )
+
+
 def test_memory_budget_env_tightens_auto_budget(monkeypatch):
     monkeypatch.delenv("MTPLX_SESSION_BANK_MAX_BYTES", raising=False)
     monkeypatch.setenv("MTPLX_MEMORY_BUDGET", "32G")
@@ -253,3 +353,43 @@ def test_manager_uses_auto_budget_for_bank(monkeypatch):
     assert manager.bank.max_bytes == expected
     # 2/3 of the 22.5G budget = 15G, clamped to the <96G tier ceiling (#150).
     assert manager.bank.per_session_max_bytes == 8 * GIB
+
+
+def test_idle_ttl_default_when_unset(monkeypatch):
+    monkeypatch.delenv("MTPLX_SESSION_BANK_IDLE_TTL_S", raising=False)
+    es = _engine_session()
+    assert es.session_bank_idle_ttl_s() == float(es.DEFAULT_IDLE_TTL_S)
+
+
+def test_idle_ttl_reads_seconds(monkeypatch):
+    monkeypatch.setenv("MTPLX_SESSION_BANK_IDLE_TTL_S", "7200")
+    es = _engine_session()
+    assert es.session_bank_idle_ttl_s() == 7200.0
+
+
+@pytest.mark.parametrize("raw", ["0", "-5", "0.0"])
+def test_idle_ttl_zero_means_never(monkeypatch, raw):
+    monkeypatch.setenv("MTPLX_SESSION_BANK_IDLE_TTL_S", raw)
+    es = _engine_session()
+    assert es.session_bank_idle_ttl_s() == float("inf")
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "soon", "nan"])
+def test_idle_ttl_garbage_falls_back_to_default(monkeypatch, raw):
+    monkeypatch.setenv("MTPLX_SESSION_BANK_IDLE_TTL_S", raw)
+    es = _engine_session()
+    assert es.session_bank_idle_ttl_s() == float(es.DEFAULT_IDLE_TTL_S)
+
+
+def test_manager_never_expires_sessions_when_ttl_is_off(monkeypatch):
+    """Issue #481: the only idle clock in the daemon is this one; with the
+    knob at 0 a day-old session is still warm."""
+    monkeypatch.setenv("MTPLX_SESSION_BANK_IDLE_TTL_S", "0")
+    es = _engine_session()
+    session = es.EngineSession("s-481", idle_ttl_s=es.session_bank_idle_ttl_s())
+    assert session.idle_ttl_s == float("inf")
+    assert not session.is_stale(now_s=session.last_access_s + 86_400.0)
+    monkeypatch.setenv("MTPLX_SESSION_BANK_IDLE_TTL_S", "60")
+    session = es.EngineSession("s-481b", idle_ttl_s=es.session_bank_idle_ttl_s())
+    assert session.is_stale(now_s=session.last_access_s + 61.0)
+    assert not session.is_stale(now_s=session.last_access_s + 59.0)

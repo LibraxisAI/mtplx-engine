@@ -93,20 +93,42 @@ def _drop_void_assistant_messages(messages: list[dict[str, Any]]) -> list[dict[s
 
 
 def _consolidate_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    system_parts: list[str] = []
-    non_system: list[dict[str, Any]] = []
+    """One leading system message; later system turns stay where they are.
+
+    The Qwen templates accept a system message only at the beginning, so the
+    leading run of system messages is joined into message 0. A system
+    message that arrives mid-conversation (Claude Code sends its per-turn
+    ``<system-reminder>`` notes as ``role: system``) used to be hoisted into
+    message 0 as well, which rewrote the first message on every turn: the
+    rendered prompt then diverged from the previous turn's prompt BEFORE the
+    unchanged conversation body, and prefix reuse advanced only by the new
+    reminder text instead of by each completed turn (issue #477, measured on
+    a 35B-A3B session: a cold re-prefill of the whole history per turn).
+    Such a message now becomes a ``user`` turn in place, which keeps the
+    template happy and keeps every earlier token byte-identical; the
+    consecutive-role merge below folds it into the user turn that follows.
+    """
+
+    leading: list[str] = []
+    rest: list[dict[str, Any]] = []
+    in_leading_run = True
     for msg in messages:
         if msg.get("role") == "system":
             content = msg.get("content", "")
             if isinstance(content, list):
                 content = _extract_text_from_content_list(content)
-            if content:
-                system_parts.append(str(content))
+            if not content:
+                continue
+            if in_leading_run:
+                leading.append(str(content))
+            else:
+                rest.append({**msg, "role": "user", "content": str(content)})
         else:
-            non_system.append(msg)
-    if not system_parts:
-        return messages
-    return [{"role": "system", "content": "\n\n".join(system_parts)}] + non_system
+            in_leading_run = False
+            rest.append(msg)
+    if not leading:
+        return rest if rest != messages else messages
+    return [{"role": "system", "content": "\n\n".join(leading)}] + rest
 
 
 def _merge_consecutive_roles(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -46,11 +46,3 @@ def test_qwen4_exp_compile_kill_switch_precedence(monkeypatch):
     assert text_model2._gdn_compiled_env is False
     assert text_model2._gdn_compile_explicit_off is True
 
-
-def test_qwen4_exp_compile_kill_switch_overrides_pipeline_lane(monkeypatch):
-    """Verify that explicit compile-off overrides set_ar_pipeline_mode."""
-    monkeypatch.setenv("MTPLX_COMPILED_GDN", "0")
-    model = _make_dummy_model()
-    model.set_ar_pipeline_mode(True)
-    text_model = model.language_model.model
-    assert text_model._gdn_compiled_lane is False

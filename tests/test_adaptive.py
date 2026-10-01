@@ -4,6 +4,92 @@ from mtplx.adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
 from mtplx.benchmarks.runners import mtp_adaptive
 
 
+def test_expected_value_uses_measured_shape_cost_in_both_directions():
+    for d3_verify, should_continue in [(0.025, True), (0.070, False)]:
+        policy = ExpectedValueDepthPolicy(max_depth=3, accepts_verify_cost=True,
+                                          warmup_full_depth_cycles=0, exploration_interval=0,
+                                          confidence_weight=0)
+        for _ in range(8):
+            policy.observe(attempted_depth=2, accepted_depths=1,
+                           verify_time_s=0.045, draft_time_s=0.008)
+            policy.observe(attempted_depth=3, accepted_depths=1,
+                           verify_time_s=d3_verify, draft_time_s=0.012)
+        decision = policy.should_continue_after_draft(drafted_depth=2, max_depth=3, draft_metrics={})
+        assert decision["cost_source"] == "observed_draft_and_verify"
+        assert decision["continue"] is should_continue
+
+
+def test_expected_value_rechecks_deeper_cost_after_expensive_initial_samples():
+    policy = ExpectedValueDepthPolicy(max_depth=3, accepts_verify_cost=True,
+                                      confidence_weight=0)
+    depths = []
+    # Allow the 0.12 EWMA to replace the four deliberately costly samples
+    # through repeated probes; the regression never makes another D3 probe.
+    for cycle in range(1024):
+        decision = policy.should_continue_after_draft(
+            drafted_depth=2, max_depth=3, draft_metrics={})
+        depth = 3 if decision["continue"] else 2
+        depths.append(depth)
+        policy.observe(
+            attempted_depth=depth, accepted_depths=1,
+            verify_time_s=(0.070 if cycle < 4 else 0.025) if depth == 3 else 0.045,
+            draft_time_s=0.012 if depth == 3 else 0.008,
+        )
+    assert depths[32] == 3
+    assert depths[64] == 2
+    assert depths[-128:].count(3) >= 120
+
+
+def test_expected_value_startup_spike_does_not_hide_faster_compiled_depth():
+    policy = ExpectedValueDepthPolicy(
+        max_depth=3, accepts_verify_cost=True, confidence_weight=0,
+        warmup_full_depth_cycles=0, exploration_interval=0,
+    )
+    # A reused compiled function reports no new trace, yet its first call
+    # still pays a one-off startup cost. Subsequent D3 calls are cheaper
+    # than eager D2; that must be learned before the first throughput choice.
+    for verify, draft in [(0.125, 0.027), (0.030, 0.007), (0.031, 0.007), (0.031, 0.007)]:
+        policy.observe(attempted_depth=3, accepted_depths=1,
+                       verify_time_s=verify, draft_time_s=draft)
+    for _ in range(4):
+        policy.observe(attempted_depth=2, accepted_depths=1,
+                       verify_time_s=0.038, draft_time_s=0.005)
+    decision = policy.should_continue_after_draft(
+        drafted_depth=2, max_depth=3, draft_metrics={})
+    assert decision["cost_source"] == "observed_draft_and_verify"
+    assert decision["extra_cost_s"] < 0
+    assert decision["continue"] is True
+
+    # Calibration is not a permanent minimum: sustained cost increases
+    # must still make the policy choose the cheaper shallow route.
+    for _ in range(40):
+        policy.observe(attempted_depth=3, accepted_depths=1,
+                       verify_time_s=0.070, draft_time_s=0.012)
+    assert policy.should_continue_after_draft(
+        drafted_depth=2, max_depth=3, draft_metrics={})["continue"] is False
+
+
+def test_expected_value_does_not_count_untested_positions_as_observed():
+    policy = ExpectedValueDepthPolicy(max_depth=3)
+    policy.observe(attempted_depth=3, accepted_depths=0)
+    assert policy._attempt_counts == [1, 1, 1]
+    assert policy._tested_counts == [1, 0, 0]
+
+
+def test_expected_value_does_not_charge_early_rejection_again_at_later_positions():
+    policy = ExpectedValueDepthPolicy(
+        max_depth=3, accept_priors=(1.0, 1.0, 1.0), ewma_alpha=0.5,
+        confidence_weight=0.0, warmup_full_depth_cycles=0, exploration_interval=0,
+    )
+    policy.observe(attempted_depth=3, accepted_depths=3)
+    policy.observe(attempted_depth=3, accepted_depths=0)
+    decision = policy.should_continue_after_draft(
+        drafted_depth=2, max_depth=3, draft_metrics={})
+    # Half the first-position estimate, with perfect later acceptance when
+    # reached, means p(accept third) = .5, not .5 * .5 * .5 = .125.
+    assert decision["expected_extra_accept"] == 0.5
+
+
 def test_adaptive_policy_increases_after_full_accept_streak():
     policy = AdaptiveDepthPolicy(max_depth=4, start_depth=2, increase_after=2)
 

@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+import logging
+import re
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from mtplx.profiles import DEFAULT_PROFILE_NAME, PROFILE_CHOICES, resolve_profile_name
+from mtplx.version import __version__
+
+_LOG = logging.getLogger(__name__)
 
 
 RUNTIME_CONTRACT_FILE = "mtplx_runtime.json"
@@ -38,6 +43,13 @@ EXIT_VERIFIED = 0
 EXIT_NO_MTP = 2
 EXIT_UNVERIFIED = 3
 EXIT_INCOMPATIBLE_ARCHITECTURE = 4
+
+# An official catalog pack whose exactness measurement has not run yet. It
+# runs as unverified; pending is not damage, so there is no Forge advice.
+SUPPORT_QUALIFICATION_PENDING = "official-pack-qualification-pending"
+# The pack's contract declares a min_engine_version newer than this build.
+ENGINE_UPDATE_REQUIRED = "engine-update-required"
+
 BLOCKING_RUNTIME_STATUSES = {
     "candidate",
     "candidate_build_only_benchmark_pending",
@@ -648,6 +660,9 @@ class RuntimeContract:
     mtp_contract: dict[str, Any] | None = None
     runtime_env_overrides: dict[str, str] | None = None
     raw: dict[str, Any] = field(default_factory=dict)
+    recommended_generation_mode: Literal["mtp", "ar"] | None = None
+    recommended_generation_mode_reason: str | None = None
+    recommended_generation_mode_evidence: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "RuntimeContract":
@@ -672,6 +687,15 @@ class RuntimeContract:
         depth = int(data["mtp_depth_max"])
         if depth <= 0:
             raise ValueError("runtime contract mtp_depth_max must be positive")
+        generation_mode = data.get("recommended_generation_mode")
+        if generation_mode is not None and generation_mode not in ("mtp", "ar"):
+            raise ValueError("runtime contract recommended_generation_mode must be 'mtp' or 'ar'")
+        generation_reason = data.get("recommended_generation_mode_reason")
+        if generation_reason is not None and not isinstance(generation_reason, str):
+            raise ValueError("runtime contract recommended_generation_mode_reason must be text")
+        generation_evidence = data.get("recommended_generation_mode_evidence")
+        if generation_evidence is not None and not isinstance(generation_evidence, dict):
+            raise ValueError("runtime contract recommended_generation_mode_evidence must be an object")
         recommended_draft_lm_head = None
         if data.get("recommended_draft_lm_head") is not None:
             from mtplx.draft_lm_head import normalize_draft_lm_head_spec
@@ -713,6 +737,11 @@ class RuntimeContract:
             mtp_contract=mtp_contract,
             runtime_env_overrides=runtime_env_overrides,
             raw=dict(data),
+            recommended_generation_mode=generation_mode,
+            recommended_generation_mode_reason=generation_reason,
+            recommended_generation_mode_evidence=(
+                dict(generation_evidence) if generation_evidence is not None else None
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -732,6 +761,12 @@ class RuntimeContract:
             out["mtp_contract"] = dict(self.mtp_contract)
         if self.runtime_env_overrides is not None:
             out["runtime_env_overrides"] = dict(self.runtime_env_overrides)
+        if self.recommended_generation_mode is not None:
+            out["recommended_generation_mode"] = self.recommended_generation_mode
+        if self.recommended_generation_mode_reason is not None:
+            out["recommended_generation_mode_reason"] = self.recommended_generation_mode_reason
+        if self.recommended_generation_mode_evidence is not None:
+            out["recommended_generation_mode_evidence"] = dict(self.recommended_generation_mode_evidence)
         return out
 
 
@@ -891,6 +926,55 @@ def _runtime_contract_blocker(contract: RuntimeContract) -> str | None:
         if verdict in BLOCKING_SPEED_VERDICTS:
             return f"speed_evidence verdict is {speed_evidence.get('verdict')}"
     return None
+
+
+def _official_qualification_pending(contract: RuntimeContract) -> bool:
+    """An official catalog pack whose only open item is its exactness measurement."""
+    from mtplx.model_catalog import catalog_model_matching
+
+    baseline = contract.exactness_baseline
+    status = _text(baseline.get("status"))
+    raw = contract.raw if isinstance(contract.raw, dict) else {}
+    return (
+        (status == "pending" or status.startswith("pending_"))
+        and baseline.get("public_release_blocker") is not True
+        # Nothing else in the contract blocks it.
+        and _runtime_contract_blocker(replace(contract, exactness_baseline={})) is None
+        and catalog_model_matching(
+            raw.get("public_model_id") or raw.get("served_model_id")
+        ) is not None
+    )
+
+
+def _version_key(text: str) -> tuple[int, ...] | None:
+    if not re.fullmatch(r"\d+(?:\.\d+)*", text):
+        return None
+    parts = [int(part) for part in text.split(".")]
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()  # 2.12 and 2.12.0 are the same release
+    return tuple(parts)
+
+
+def engine_version_blocker(contract_data: Any) -> str | None:
+    """The refusal line when a contract needs a newer MTPLX than this one."""
+    if not isinstance(contract_data, dict):
+        return None
+    floor = str(contract_data.get("min_engine_version") or "").strip()
+    if not floor:
+        return None
+    required = _version_key(floor)
+    if required is None:
+        _LOG.warning(
+            "ignoring malformed min_engine_version %r in %s", floor, RUNTIME_CONTRACT_FILE
+        )
+        return None
+    engine = _version_key(__version__)
+    if engine is None or engine >= required:
+        return None
+    return (
+        f"This model needs MTPLX {floor} or later (you have {__version__}). "
+        "Update MTPLX, then try again."
+    )
 
 
 def _runtime_evidence_blocker(value: Any, *, section_name: str) -> str | None:
@@ -1397,6 +1481,26 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
     contract_path = getattr(inspection, "runtime_contract_path", None)
     if not contract_path:
         contract_path = str(_contract_path(model_dir)) if _contract_path(model_dir).exists() else None
+    engine_blocker = engine_version_blocker(
+        contract_data if contract_data is not None else getattr(contract, "raw", None)
+    )
+    if engine_blocker:
+        # A capability gap of this build, not a verification label: no
+        # unsafe-force flag may start a pack that needs a newer engine.
+        engine_arch_id = contract.arch_id if contract is not None else detected_arch_id
+        return CompatibilityVerdict(
+            tier=TIER_INCOMPATIBLE_ARCHITECTURE,
+            arch_id=engine_arch_id,
+            supported=False,
+            recognized=architecture_support_for(engine_arch_id) is not None,
+            can_run=False,
+            exit_code=EXIT_INCOMPATIBLE_ARCHITECTURE,
+            message=engine_blocker,
+            runtime_contract=contract,
+            runtime_contract_path=contract_path,
+            runtime_compatibility=ENGINE_UPDATE_REQUIRED,
+            support_level=ENGINE_UPDATE_REQUIRED,
+        )
     # One question decides runnability throughout this function: can this
     # build construct the trunk from code it ships. MTP, contracts, and
     # verification tiers are labels and speed levers on top of that answer,
@@ -1528,6 +1632,35 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
         arch_id = contract.arch_id
         support = architecture_support_for(arch_id)
         blocker = _runtime_contract_blocker(contract)
+        if (
+            blocker
+            and arch_id in SUPPORTED_ARCH_IDS
+            and has_mtp
+            and _passes_verified_runtime_gate(arch_id, inspection, tensor_gate)
+            and _official_qualification_pending(contract)
+        ):
+            return CompatibilityVerdict(
+                tier=TIER_FAMILY_COMPATIBLE_UNVERIFIED,
+                arch_id=arch_id,
+                supported=True,
+                recognized=True,
+                can_run=True,
+                exit_code=EXIT_VERIFIED,
+                message=(
+                    f"Official MTPLX pack, qualification pending ({blocker}). "
+                    "It runs as unverified until its exactness measurement "
+                    "is published."
+                ),
+                recommended_backend=(support.backend if support else None),
+                recommended_profile=contract.recommended_profile,
+                runtime_contract=contract,
+                runtime_contract_path=contract_path,
+                unverified_model=True,
+                mtp_supported="yes",
+                runtime_compatibility=(support.runtime_compatibility if support else "native"),
+                support_level=SUPPORT_QUALIFICATION_PENDING,
+                support_notes=(support.notes if support else None),
+            )
         if blocker:
             # Contract evidence (exactness baseline, speed verdicts) is a
             # label, never a load gate: the model is architecturally
@@ -1766,14 +1899,7 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
             # A dir with no TRUNK weights at all is a different failure — no
             # model, not a missing head — and keeps a clean human refusal
             # instead of a FileNotFoundError deep in the loader.
-            try:
-                trunk_weights_exist = any(
-                    path.name != "mtp.safetensors"
-                    for path in Path(model_dir).glob("*.safetensors")
-                )
-            except OSError:
-                trunk_weights_exist = False
-            if not trunk_weights_exist:
+            if not _trunk_weights_present(inspection):
                 return CompatibilityVerdict(
                     tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,
                     arch_id=detected_arch_id,
@@ -1807,8 +1933,9 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
                     "tensors (mtp.safetensors or embedded mtp.* / "
                     "language_model.mtp.* weights). mtp_heads not found -> "
                     "mtp_off: MTPLX will serve this model autoregressive, "
-                    "without speculative decode acceleration. Build and verify "
-                    "an MTP artifact with Forge for full speed."
+                    "without speculative decode acceleration. Speculative "
+                    "acceleration requires a checkpoint with compatible "
+                    "trained MTP weights; Forge cannot create missing heads."
                 ),
                 recommended_backend="qwen3_next",
                 recommended_profile=DEFAULT_PROFILE_NAME,

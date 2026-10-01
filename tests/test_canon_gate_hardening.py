@@ -48,7 +48,18 @@ def _fake_state(committed_ids, committed_text, session_id="s1"):
         resolve_session_id=lambda **kw: (session_id, "header.x-mtplx-session-id"),
         peek=lambda sid: session if sid == session_id else None,
     )
-    tokenizer = SimpleNamespace(decode=lambda ids: committed_text)
+    committed_list = [int(i) for i in committed_ids]
+
+    def _decode(ids):
+        # The whole committed stream decodes to the transcript; any other run
+        # decodes to one distinct marker per id, so two runs of different ids
+        # never read as the same text (the token splice compares windows).
+        ids = [int(i) for i in ids]
+        if ids == committed_list:
+            return committed_text
+        return "".join(f"<{i}>" for i in ids)
+
+    tokenizer = SimpleNamespace(decode=_decode)
     return SimpleNamespace(
         args=SimpleNamespace(strip_assistant_reasoning_history=False),
         sessions=sessions,

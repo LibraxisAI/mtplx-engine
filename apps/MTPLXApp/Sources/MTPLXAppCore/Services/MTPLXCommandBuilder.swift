@@ -46,7 +46,7 @@ public struct MTPLXCommandBuilder: Sendable {
     }
 
     public static func missingRuntimeMessage() -> String {
-        "MTPLX command-line runtime was not found. Install it with Homebrew: \(homebrewInstallCommand). Then relaunch MTPLX."
+        tr("MTPLX command-line runtime was not found. Install it with Homebrew: %@. Then relaunch MTPLX.", homebrewInstallCommand)
     }
 
     public static func expandedPATH(environment: [String: String] = ProcessInfo.processInfo.environment) -> String {
@@ -307,8 +307,27 @@ public struct MTPLXCommandBuilder: Sendable {
         if let contextWindow = resolved.contextWindow, contextWindow > 0 {
             arguments.append(contentsOf: ["--context-window", String(contextWindow)])
         }
+        // Issue #448: the stall watchdog deadline is a setting, not a shell
+        // export the GUI-launched daemon can never see. Only a changed value
+        // rides on argv so the daemon's own default stays authoritative.
+        if configuration.streamStallDeadlineSeconds
+            != MTPLXAppConfiguration.defaultStreamStallDeadlineSeconds {
+            arguments.append(contentsOf: [
+                "--stream-stall-deadline-s",
+                Self.formatSeconds(configuration.streamStallDeadlineSeconds),
+            ])
+        }
+        // The key never rides on argv: every local process can read a
+        // process's arguments through `ps`, and the supervisor writes the
+        // launched command line into the Logs pane that users paste into
+        // bug reports. The daemon reads the key from a 0600 file instead.
+        // The file is (re)written on every build so the daemon always
+        // starts with the key the app currently holds; a missing file
+        // would make `mtplx serve` mint its own key and lock the app out.
         if let apiKey = configuration.apiKey, !apiKey.isEmpty {
-            arguments.append(contentsOf: ["--api-key", apiKey])
+            let apiKeyFileURL = Self.daemonAPIKeyFileURL(environment: environment)
+            try Self.writeDaemonAPIKeyFile(apiKey, to: apiKeyFileURL)
+            arguments.append(contentsOf: ["--api-key-file", apiKeyFileURL.path])
         }
         if configuration.enableThermalPolling {
             arguments.append("--enable-thermal-poll")
@@ -362,6 +381,11 @@ public struct MTPLXCommandBuilder: Sendable {
         if let reasoningEffort = resolved.reasoningEffort {
             arguments.append(contentsOf: ["--reasoning-effort", reasoningEffort])
         }
+        if configuration.adaptiveDepth == false {
+            // The daemon's own default is no policy. Off is still said
+            // explicitly so a launch preset cannot re-enable it.
+            arguments.append(contentsOf: ["--adaptive-policy", "none"])
+        }
         if let adaptivePolicy = resolved.adaptivePolicy, adaptivePolicy != "none" {
             arguments.append(contentsOf: ["--adaptive-policy", adaptivePolicy])
             if let adaptiveMinDepth = resolved.adaptiveMinDepth {
@@ -388,6 +412,7 @@ public struct MTPLXCommandBuilder: Sendable {
         environment.merge(resolved.ramSessionCacheEnvironment) { _, new in new }
         environment = Self.appSubprocessEnvironment(environment: environment)
         environment["MTPLX_APP_PARENT_PID"] = String(ProcessInfo.processInfo.processIdentifier)
+        environment["MTPLX_MANAGED_CLIENT_CONTROLS"] = configuration.controlClientSettings ? "app" : "client"
         if resolved.pagedKVQuantization != "off" {
             environment["MTPLX_VLLM_METAL_PAGED_KV_QUANT"] = resolved.pagedKVQuantization
         }
@@ -397,11 +422,33 @@ public struct MTPLXCommandBuilder: Sendable {
         if let mirror = MTPLXAppConfiguration.hfMirrorEnvironment(configuration.hfEndpoint) {
             environment.merge(mirror) { _, new in new }
         }
+        // Settings memory card (#431 asks for a higher cap on a 128 GB Mac,
+        // #427 for an "I know what I'm doing" swap opt-in). Both are engine
+        // env-only knobs, and the user's explicit number outranks whatever
+        // the surrounding app process happened to inherit.
+        environment.merge(
+            MTPLXAppConfiguration.memoryOverrideEnvironment(
+                memoryLimitGB: configuration.memoryLimitGB,
+                allowSwap: configuration.allowSwap
+            )
+        ) { _, new in new }
         return DaemonCommand(
             executableURL: executableURL,
             arguments: arguments,
             environment: environment
         )
+    }
+
+    /// Value that follows `flag` in a built argv, or nil when the flag was
+    /// not emitted. Reading the launch record back out of the arguments the
+    /// daemon actually received is what makes the launch diagnostic honest:
+    /// it reports what ran, not what the resolver intended to run (#398).
+    public static func flagValue(_ flag: String, in arguments: [String]) -> String? {
+        guard let index = arguments.firstIndex(of: flag) else { return nil }
+        let next = arguments.index(after: index)
+        guard arguments.indices.contains(next) else { return nil }
+        let value = arguments[next]
+        return value.hasPrefix("--") ? nil : value
     }
 
     private func resolveExecutable(_ explicitPath: String?) throws -> URL {
@@ -619,7 +666,12 @@ public struct MTPLXCommandBuilder: Sendable {
         isDevelopmentWrapperPath(candidatePath)
     }
 
-    public static func appRuntimeDirectory(
+    /// The app's own folder under the user's Application Support directory
+    /// (`~/Library/Application Support/MTPLX`), resolved from the same HOME
+    /// the rest of the builder uses so hermetic tests stay hermetic. The
+    /// settings file, the chat store, and the app-owned runtime venv all
+    /// live under this directory.
+    public static func appSupportDirectory(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> String {
         let home = environment["HOME"] ?? NSHomeDirectory()
@@ -627,8 +679,56 @@ public struct MTPLXCommandBuilder: Sendable {
             .appendingPathComponent("Library")
             .appendingPathComponent("Application Support")
             .appendingPathComponent("MTPLX")
+            .path
+    }
+
+    public static func appRuntimeDirectory(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> String {
+        URL(fileURLWithPath: appSupportDirectory(environment: environment))
             .appendingPathComponent("runtime-venv")
             .path
+    }
+
+    /// Where the daemon reads its API key from (`--api-key-file`). Kept
+    /// beside `settings.json`, which is the durable copy of the key; this
+    /// file is a 0600 hand-off to the daemon process only.
+    /// Render a seconds value for argv without a trailing ".0" (0 reads as
+    /// the documented off switch, 120 as 120).
+    static func formatSeconds(_ value: Double) -> String {
+        if value == value.rounded(), abs(value) < 1e15 {
+            return String(Int(value))
+        }
+        return String(value)
+    }
+
+    public static func daemonAPIKeyFileURL(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> URL {
+        URL(fileURLWithPath: appSupportDirectory(environment: environment), isDirectory: true)
+            .appendingPathComponent("daemon-api-key")
+    }
+
+    /// Write `key` to `url` readable by the current user only. The file is
+    /// created 0600 before any byte is written, and an existing file is
+    /// tightened to 0600 before it is truncated, so the key is never
+    /// readable by another local user even for an instant. The daemon
+    /// strips surrounding whitespace when it reads the file.
+    public static func writeDaemonAPIKeyFile(_ key: String, to url: URL) throws {
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let descriptor = open(url.path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0o600)
+        guard descriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        guard fchmod(descriptor, 0o600) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EPERM)
+        }
+        try handle.write(contentsOf: Data(key.utf8))
+        try handle.close()
     }
 
     public static func appRuntimeBinDirectory(
@@ -889,7 +989,26 @@ struct ResolvedDaemonArgs {
             : preset.draftTopK
         toolPromptMode = preset.toolPromptMode
         chatTemplateProfile = preset.chatTemplateProfile
-        adaptivePolicy = preset.adaptivePolicy
+        // The daemon starts with no depth policy unless told otherwise, so
+        // "on" has to name the policy at launch to survive a relaunch. Unset
+        // keeps the target's preset: Pi and Hermes name expected_value, the
+        // other targets pass nothing. Flash-Next is the exception: measured
+        // 2026-09-06 on the shipped 2.11.2 lane, the expected-value policy
+        // decodes 7 to 8 percent slower than a fixed depth 3 at both 2k and
+        // 19k tokens of context (ABBA pairs, the stopped third draft buys
+        // nothing on that family), while the 27B pair is a tie. So an unset
+        // switch launches Flash-Next at the chosen depth for every target,
+        // and the switch still turns the policy on explicitly.
+        let familyKeepsPresetPolicy =
+            MTPLXModelOption.modelFamily(for: configuration.model) != "qwen4_exp"
+        switch configuration.adaptiveDepth {
+        case .some(false):
+            adaptivePolicy = "none"
+        case .some(true):
+            adaptivePolicy = preset.adaptivePolicy ?? "expected_value"
+        case .none:
+            adaptivePolicy = familyKeepsPresetPolicy ? preset.adaptivePolicy : nil
+        }
         adaptiveMinDepth = preset.adaptiveMinDepth
         adaptiveEVBaseDepth = preset.adaptiveEVBaseDepth
         adaptiveEVWarmupFullDepthCycles = preset.adaptiveEVWarmupFullDepthCycles
@@ -1114,8 +1233,7 @@ private enum SchedulingOverridePreset: String {
                 batchingPreset: "throughput",
                 maxActiveRequests: 8,
                 decodeBatchMax: 8,
-                batchWaitMs: 20,
-                prefillChunkTokens: 2048
+                batchWaitMs: 20
             )
         case .agent:
             return TargetPreset(
@@ -1123,8 +1241,7 @@ private enum SchedulingOverridePreset: String {
                 batchingPreset: "agent",
                 maxActiveRequests: 4,
                 decodeBatchMax: 4,
-                batchWaitMs: 50,
-                prefillChunkTokens: 2048
+                batchWaitMs: 50
             )
         }
     }
@@ -1158,7 +1275,11 @@ private enum ModelLaunchFamily {
         }
         // 9B (6-bit) family, incl. the -FP16 sibling. Promoted to turbo
         // 2026-07-07 with the 6-bit hexpack split-K kernels (live ABBA:
-        // MTP D3 110/102 vs sustained 90/69 tok/s, AR flat).
+        // MTP D3 110/102 vs sustained 90/69 tok/s, AR flat). MiMo V2.6 Qwen
+        // 9B shares the 6-bit geometry but falls through to .qwenDefault:
+        // like the CLI's turbo allowlist, it waits for a turbo measurement
+        // on its own weights, and the engine's qwen3_5 contract already
+        // serves it the 0.6/0.95/20 sampler.
         if normalized.contains("qwen3.5-9b-mtplx-optimized-speed")
             || normalized.contains("qwen35-9b-optimized-speed")
         {
@@ -1173,6 +1294,12 @@ private enum ModelLaunchFamily {
             || MTPLXModelOption.modelFamily(for: model) == "qwen4_exp"
         {
             return .flashNext
+        }
+        // Bonsai shares qwen3_8 behavior, but its ternary pack has not earned
+        // the dense affine pack's hardcoded Turbo promotion. Like the CLI,
+        // leave profile and sampler selection to the artifact/engine.
+        if MTPLXModelOption.isBonsaiFamilyHint(normalized) {
+            return .qwenDefault
         }
         // Qwen3.8 27B MTPLX family (Bare Speed / Optimized Speed /
         // Optimized Quality). Trunk geometry is identical to the Qwen3.6
@@ -1247,6 +1374,10 @@ private struct TargetPreset {
     var maxActiveRequests: Int? = nil
     var decodeBatchMax: Int? = nil
     var batchWaitMs: Double? = nil
+    // Never set by a target or performance preset (PX.0): the prefill chunk
+    // is a model-tuned value the served family owns in the engine
+    // (mtplx/backends/family_settings.py), and a launch flag beats that
+    // block on every request. Only the user's own Settings value is passed.
     var prefillChunkTokens: Int? = nil
     var depth: Int? = nil
     var verifyStrategy: String? = nil
@@ -1276,6 +1407,10 @@ private struct TargetPreset {
     var reasoningEffort: String? = nil
     var acceptsSettingsReasoning: Bool = true
     var environment: [String: String] = [:]
+
+    /// Mirrors mtplx/launch_lane.py PI_SCHEDULER_MODE / PI_BATCHING_PRESET.
+    static let piSchedulerMode = "serial"
+    static let piBatchingPreset = "latency"
 
     private static let highMemoryThresholdBytes: UInt64 = 96 * 1024 * 1024 * 1024
     private static let defaultOpenCodeSessionBankMaxEntries = "6"
@@ -1311,10 +1446,9 @@ private struct TargetPreset {
                 : defaultOpenCodeSessionBankMaxEntries,
             "MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S": "30.0",
             "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "4096",
-            // Mirrors the CLI coding-agent lane (_opencode_memory_env_defaults);
-            // this key was CLI-only drift until the 2026-08-03 parity audit.
-            "MTPLX_LAZY_TARGET_DISTRIBUTIONS": "1",
-            "MTPLX_LAZY_BONUS_VERIFY": "1",
+            // Model/profile defaults own distribution evaluation and verify
+            // width, as in the CLI. Generic lazy pins mask Flash-Next's
+            // batched fixed-M4 lane; lazy bonus alone also removes its fourth row.
             "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER": "1",
             "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE": "1",
             // The read-inspection compactor and force-answer contract are no
@@ -1687,13 +1821,18 @@ private struct TargetPreset {
             let piEnv = codingAgentRuntimeEnvironment(
                 processEnvironment: processEnvironment
             )
+            // Scheduler lane (PX.1, 2026-09-18): Pi used to launch on the
+            // ar_batch agent lane here (2 slots, 50 ms batch wait) and on
+            // serial from `mtplx start pi`: same client, two engine paths.
+            // Both are serial now, the lane the OpenCode preset measured
+            // faster for single-stream coding turns (51.4 against 36.8
+            // decode tok/s at 8K). The owner is one constant in the engine,
+            // mtplx/launch_lane.py PI_SCHEDULER_MODE, and
+            // LaunchLaneParityTests fails if this preset parts from it. An
+            // explicit Settings Performance mode still overrides it (#325).
             return TargetPreset(
-                schedulerMode: "ar_batch",
-                batchingPreset: "agent",
-                maxActiveRequests: 2,
-                decodeBatchMax: 2,
-                batchWaitMs: 50,
-                prefillChunkTokens: 2048,
+                schedulerMode: TargetPreset.piSchedulerMode,
+                batchingPreset: TargetPreset.piBatchingPreset,
                 topP: 0.95,
                 topK: 20,
                 toolPromptMode: "hybrid",
@@ -1737,7 +1876,6 @@ private struct TargetPreset {
             return TargetPreset(
                 schedulerMode: "serial",
                 batchingPreset: "latency",
-                prefillChunkTokens: 2048,
                 depth: 3,
                 ssdSessionCache: "on",
                 temperature: 0.6,
@@ -1764,7 +1902,6 @@ private struct TargetPreset {
             return TargetPreset(
                 schedulerMode: "serial",
                 batchingPreset: "latency",
-                prefillChunkTokens: 2048,
                 ssdSessionCache: "on",
                 temperature: 0.6,
                 topP: 1.0,
@@ -1790,7 +1927,6 @@ private struct TargetPreset {
                 maxActiveRequests: 4,
                 decodeBatchMax: 4,
                 batchWaitMs: 50,
-                prefillChunkTokens: 2048,
                 ssdSessionCache: "on"
             )
         case .benchmark:
@@ -1803,7 +1939,6 @@ private struct TargetPreset {
             return TargetPreset(
                 schedulerMode: "serial",
                 batchingPreset: "latency",
-                prefillChunkTokens: 2048,
                 ssdSessionCache: "off",
                 topP: 0.95,
                 topK: 20,

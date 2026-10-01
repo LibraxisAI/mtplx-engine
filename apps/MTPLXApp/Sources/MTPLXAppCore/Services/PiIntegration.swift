@@ -121,7 +121,7 @@ public struct PiIntegration: Sendable {
             return PiLaunchResult(
                 action: .unavailable,
                 command: command,
-                detail: "could not prepare Pi terminal command: \(error)"
+                detail: tr("could not prepare Pi terminal command: %@", String(describing: error))
             )
         }
         guard isCurrent?() ?? true else {
@@ -155,7 +155,7 @@ public struct PiIntegration: Sendable {
                 return PiLaunchResult(
                     action: .unavailable,
                     command: command,
-                    detail: "could not open Pi automatically: open timed out after 30s and was terminated"
+                    detail: tr("could not open Pi automatically: open timed out after 30s and was terminated")
                 )
             }
             guard process.terminationStatus == 0 else {
@@ -166,8 +166,8 @@ public struct PiIntegration: Sendable {
                     action: .unavailable,
                     command: command,
                     detail: message.isEmpty
-                        ? "could not open Pi automatically: open exited \(process.terminationStatus)"
-                        : "could not open Pi automatically: \(message)"
+                        ? tr("could not open Pi automatically: open exited %@", String(process.terminationStatus))
+                        : tr("could not open Pi automatically: %@", message)
                 )
             }
             let receipt = await MTPLXTerminalHandoffLease.awaitReceipt(
@@ -194,7 +194,7 @@ public struct PiIntegration: Sendable {
                 return PiLaunchResult(
                     action: .unavailable,
                     command: command,
-                    detail: "Pi Terminal did not report its launch receipt."
+                    detail: tr("Pi Terminal did not report its launch receipt.")
                 )
             }
             guard isCurrent?() ?? true else {
@@ -202,7 +202,7 @@ public struct PiIntegration: Sendable {
                 return PiLaunchResult(
                     action: .unavailable,
                     command: command,
-                    detail: "Pi handoff cancelled because the daemon lifecycle changed.",
+                    detail: tr("Pi handoff cancelled because the daemon lifecycle changed."),
                     launchedProcessIDs: [lease.processID],
                     terminalHandoffLease: lease
                 )
@@ -210,7 +210,7 @@ public struct PiIntegration: Sendable {
             return PiLaunchResult(
                 action: .launched,
                 command: command,
-                detail: "opened Pi in Terminal",
+                detail: tr("opened Pi in Terminal"),
                 launchedProcessIDs: [lease.processID],
                 terminalHandoffLease: lease
             )
@@ -219,14 +219,14 @@ public struct PiIntegration: Sendable {
             return PiLaunchResult(
                 action: .unavailable,
                 command: command,
-                detail: "could not open Pi automatically: \(error)"
+                detail: tr("could not open Pi automatically: %@", String(describing: error))
             )
         }
         #else
         return PiLaunchResult(
             action: .unavailable,
             command: command,
-            detail: "automatic Pi launch currently requires macOS Terminal"
+            detail: tr("automatic Pi launch currently requires macOS Terminal")
         )
         #endif
     }
@@ -235,7 +235,7 @@ public struct PiIntegration: Sendable {
         PiLaunchResult(
             action: .unavailable,
             command: command,
-            detail: "Pi handoff cancelled because the daemon lifecycle changed."
+            detail: tr("Pi handoff cancelled because the daemon lifecycle changed.")
         )
     }
 
@@ -304,6 +304,7 @@ public struct PiIntegration: Sendable {
                     baseURL: baseURL,
                     apiKey: apiKey,
                     contextWindow: contextWindow,
+                    vision: MTPLXModelOption.supportsVision(model: configuration.model),
                     reasoningEnabled: OpenCodeIntegration.reasoningEnabled(forModelID: modelID)
                 )
             )
@@ -322,9 +323,13 @@ public struct PiIntegration: Sendable {
         let extensionURL = configURL.deletingLastPathComponent()
             .appendingPathComponent("extensions", isDirectory: true)
             .appendingPathComponent(Self.requestPolicyExtensionName)
-        let extensionDidChange = try Self.installRequestPolicyExtensionFile(
+        let extensionDidChange = try Self.installManagedExtensionFile(
             at: extensionURL,
-            modelID: modelID
+            source: Self.requestPolicyExtensionSource(modelID: modelID)
+        )
+        let mirrorDidChange = try Self.installManagedExtensionFile(
+            at: extensionURL.deletingLastPathComponent().appendingPathComponent("mtplx-settings-sync.ts"),
+            source: Self.settingsExtensionSource()
         )
 
         let existingData = try? Data(contentsOf: configURL)
@@ -335,7 +340,7 @@ public struct PiIntegration: Sendable {
                 baseURL: baseURL,
                 modelReference: modelReference,
                 launchCommand: Self.launchCommand(for: configuration.model),
-                didChange: extensionDidChange,
+                didChange: extensionDidChange || mirrorDidChange,
                 backupPath: nil
             )
         }
@@ -365,6 +370,84 @@ public struct PiIntegration: Sendable {
     /// Pi's generated 16,384 output ceiling for the configured model while
     /// leaving explicit user caps alone. Regenerated with the current model
     /// id on every sync — a stale model pin here silently disarms both hooks.
+    static func settingsExtensionSource() -> String {
+        """
+        // MTPLX-managed settings mirror. Remove this marker to take ownership.
+        export default function (pi: any) {
+          let timer: any;
+          let syncInFlight: any;
+          let clientThinking: any;
+          let sessionKey: any;
+
+          const readSettings = async (ctx: any) => {
+            const model = ctx.model;
+            if (model?.provider !== "mtplx") {
+              ctx.ui.setStatus("mtplx-controls", undefined);
+              return;
+            }
+            try {
+              const key = String(ctx.sessionManager.getSessionId()) + ":" + model.id;
+              if (sessionKey !== key) {
+                sessionKey = key;
+                clientThinking = undefined;
+              }
+              const registry = ctx.modelRegistry;
+              const auth = registry.getApiKeyAndHeaders
+                ? await registry.getApiKeyAndHeaders(model)
+                : { ok: true, apiKey: await registry.getApiKey(model) };
+              if (!auth.ok) throw new Error(auth.error);
+              const headers: any = {};
+              for (const [name, value] of Object.entries({ ...model.headers, ...auth.headers })) {
+                if (typeof value === "string") headers[name] = value;
+              }
+              if (auth.apiKey) headers.Authorization = "Bearer " + auth.apiKey;
+              // Pi installs a global HTTP dispatcher whose idle connection reuse can
+              // delay these small polls. Keep control-plane reads off pooled sockets.
+              headers.Connection = "close";
+              const base = String(auth.baseUrl || model.baseUrl).replace(/[/]+$/, "");
+              const response = await fetch(base + "/mtplx/settings", {
+                headers, signal: AbortSignal.timeout(5000),
+              });
+              if (!response.ok) throw new Error("settings HTTP " + response.status);
+              const settings = await response.json();
+              if (settings.managed_client_controls === "app") {
+                const effort = settings.enable_thinking === false ? "off" : settings.reasoning_effort;
+                if (!["off", "low", "medium", "high", "xhigh"].includes(effort)) {
+                  throw new Error("unsupported MTPLX reasoning effort: " + effort);
+                }
+                clientThinking ??= pi.getThinkingLevel();
+                if (pi.getThinkingLevel() !== effort) pi.setThinkingLevel(effort);
+                ctx.ui.setStatus("mtplx-controls", "MTPLX controls reasoning: " + effort);
+              } else {
+                if (clientThinking !== undefined) pi.setThinkingLevel(clientThinking);
+                clientThinking = undefined;
+                ctx.ui.setStatus("mtplx-controls", undefined);
+              }
+            } catch (error) {
+              ctx.ui.setStatus("mtplx-controls", "MTPLX settings sync failed: " + String(error));
+            }
+          };
+          const syncThinking = (ctx: any) => {
+            syncInFlight ??= readSettings(ctx).finally(() => { syncInFlight = undefined; });
+            return syncInFlight;
+          };
+          const startSync = async (_event: any, ctx: any) => {
+            if (timer) clearInterval(timer);
+            await syncThinking(ctx);
+            timer = setInterval(() => { if (ctx.isIdle()) void syncThinking(ctx); }, 3000);
+            timer.unref?.();
+          };
+          pi.on("session_start", startSync);
+          pi.on("session_switch", startSync);
+          pi.on("model_select", startSync);
+          pi.on("before_agent_start", async (_event: any, ctx: any) => { await syncThinking(ctx); });
+          pi.on("session_shutdown", () => { if (timer) clearInterval(timer); });
+
+        }
+
+        """
+    }
+
     static func requestPolicyExtensionSource(modelID: String) -> String {
         """
         // MTPLX-managed Pi extension. MTPLX keeps this file up to
@@ -416,11 +499,11 @@ public struct PiIntegration: Sendable {
     /// `models.json`. Content-compared before writing so repeat launches
     /// (and the Python `mtplx start pi` writer, which installs the identical
     /// bytes) never churn the file.
-    private static func installRequestPolicyExtensionFile(
+    private static func installManagedExtensionFile(
         at url: URL,
-        modelID: String
+        source: String
     ) throws -> Bool {
-        let data = Data(requestPolicyExtensionSource(modelID: modelID).utf8)
+        let data = Data(source.utf8)
         if let existing = try? Data(contentsOf: url) {
             if existing == data {
                 return false
@@ -518,9 +601,11 @@ public struct PiIntegration: Sendable {
                 $0.objectValue?["id"]?.stringValue == freshID
             }) {
                 let existingEntry = resultModels[index].objectValue ?? [:]
-                resultModels[index] = .object(
-                    fillMissingDeep(existing: existingEntry, defaults: freshObject)
-                )
+                var entry = fillMissingDeep(existing: existingEntry, defaults: freshObject)
+                if freshObject["input"]?.arrayValue?.contains(.string("image")) == true {
+                    entry["input"] = freshObject["input"]
+                }
+                resultModels[index] = .object(entry)
             } else {
                 resultModels.append(freshModel)
             }
@@ -534,6 +619,7 @@ public struct PiIntegration: Sendable {
         baseURL: String,
         apiKey: String,
         contextWindow: Int,
+        vision: Bool,
         reasoningEnabled: Bool
     ) -> [String: JSONValue] {
         // Mirrors the CLI provider block (mtplx/pi.py build_pi_provider_config):
@@ -569,7 +655,7 @@ public struct PiIntegration: Sendable {
                         "minimal": .null,
                         "xhigh": .string("xhigh"),
                     ]),
-                    "input": .array([.string("text")]),
+                    "input": .array(vision ? [.string("text"), .string("image")] : [.string("text")]),
                     "contextWindow": .number(Double(contextWindow)),
                     // Pi silently substitutes a 16,384 output ceiling for
                     // models whose metadata omits maxTokens. Advertise the

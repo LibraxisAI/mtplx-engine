@@ -8,16 +8,86 @@ steps until those offsets become tensor inputs/outputs.
 
 from __future__ import annotations
 
+import contextlib
+import math
 import os
 import time
 import weakref
 from dataclasses import asdict, dataclass, field
+from functools import partial
 from typing import Any
 
 import mlx.core as mx
 
 from .attention_context import attention_phase
+from .demotions import note as _note_demotion, note_bank_fallback as _note_bank_fallback
 from .gdn_capture import resolve_gdn_capture_backend
+from .rope_origin import RotaryOrigin, as_rope_delta, stamp_rope_delta
+
+
+# Process-wide state of the Flash-Next fixed-M4 compiled lane (PX.4):
+# "proven" flips after the first dispatch evaluated cleanly on this GPU;
+# "retired" holds the one-line reason after a dispatch failure, and the lane
+# stays on the eager verifier for the life of the process.
+_FIXED_M4_LANE: dict[str, Any] = {"proven": False, "retired": None}
+_MISSING = object()
+
+
+def fixed_m4_lane_retired_reason() -> str | None:
+    """Why the fixed-M4 compiled lane is retired for this process, or None."""
+
+    return _FIXED_M4_LANE["retired"]
+
+
+def retire_fixed_m4_lane(reason: str) -> None:
+    """Retire the lane for the process: one printed line, one ledger entry."""
+
+    first = _FIXED_M4_LANE["retired"] is None
+    text = " ".join(str(reason).split())[:400]
+    if first:
+        _FIXED_M4_LANE["retired"] = text
+    _note_demotion("fixed_m4_dispatch_retired", _FIXED_M4_LANE["retired"])
+    if not first:
+        return
+    try:
+        print(
+            "[mtplx] Flash-Next compiled verifier could not dispatch on this GPU "
+            f"({text}). Verify runs the eager path for the rest of this process; "
+            "output is unchanged. Please report this line with `mtplx doctor "
+            "--json`.",
+            flush=True,
+        )
+    except Exception:
+        pass
+
+
+# Demotion ledger reasons for the per-round sites: constants, so the verify
+# path formats nothing (mtplx/demotions.py cost contract).
+_FIXED_M4_OTHER_WIDTH_REASON = (
+    "verify width other than 4 has no compiled route: an adaptive stop, the "
+    "last round before max_tokens, or a draft depth of 4 or 5"
+)
+_FIXED_M4_RETIRED_ROUND_REASON = (
+    "the compiled verifier was retired for this process after a dispatch "
+    "failure, so this round ran the eager forward"
+)
+_FIXED_M4_NO_HOST_INPUTS_REASON = (
+    "a width-4 verify reached the bank without host-owned n-gram inputs (a "
+    "copy block of 3), so it ran the eager forward"
+)
+
+
+def _prepare_fixed_m4_materialized(
+    prepare_aux,
+    cache,
+    input_ids,
+    _host_input_ids,
+    _completion_tokens,
+    _committed_count,
+):
+    """Adapt the materialized PLE route to the fixed-M4 host-input contract."""
+
+    return prepare_aux(input_ids, cache)
 
 
 @dataclass
@@ -53,6 +123,7 @@ class SpecDecodeGraphBank:
         allow_python_cache_capture: bool = False,
         promote_tensor_offsets: bool = True,
         capture_backend: str | None = None,
+        rope_delta: mx.array | int | None = None,
     ) -> None:
         self.runtime = runtime
         self.max_verify_len = max_verify_len
@@ -60,6 +131,10 @@ class SpecDecodeGraphBank:
         self.promote_tensor_offsets = promote_tensor_offsets
         self.capture_backend = resolve_gdn_capture_backend(capture_backend)
         self._capture_accepts_backend = _accepts_capture_backend(runtime)
+        # An image request's rotary delta (None for text): stamped on every
+        # cache this bank promotes. The closures below capture each cache's
+        # ``compile_state``, which carries the delta as an implicit input.
+        self._rope_delta = as_rope_delta(rope_delta)
         self.stats = GraphBankStats()
         self._compiled: dict[tuple[str, int, tuple[int, ...]], Any] = {}
 
@@ -184,6 +259,9 @@ class SpecDecodeGraphBank:
             for kind, length in sorted({(kind, length) for kind, length, _, _ in self._compiled})
         ]
         data["compiled_entry_count"] = len(self._compiled)
+        data["rope_delta"] = (
+            None if self._rope_delta is None else int(self._rope_delta.item())
+        )
         return data
 
     def reset(self) -> None:
@@ -206,6 +284,7 @@ class SpecDecodeGraphBank:
                 self.stats.promotion_failures[reason] = (
                     self.stats.promotion_failures.get(reason, 0) + count
                 )
+            stamp_rope_delta(cache, self._rope_delta)
         if cache_has_python_offsets(cache):
             return "python_cache_offsets"
         return None
@@ -351,6 +430,16 @@ def _accepts_capture_backend(runtime: Any) -> bool:
     return "capture_backend" in signature.parameters
 
 
+def _accepts_runtime_keyword(runtime: Any, name: str) -> bool:
+    import inspect
+
+    try:
+        signature = inspect.signature(runtime.forward_ar_capture)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return name in signature.parameters
+
+
 def cache_has_python_offsets(cache: Any) -> bool:
     for entry in cache or []:
         if entry is None:
@@ -364,7 +453,7 @@ def cache_has_python_offsets(cache: Any) -> bool:
     return False
 
 
-class TensorOffsetKVCache:
+class TensorOffsetKVCache(RotaryOrigin):
     """Full-attention KV cache adapter with array-backed mutable offset.
 
     Stock `KVCache.offset` is a Python integer.  In a compiled verify graph that
@@ -372,6 +461,12 @@ class TensorOffsetKVCache:
     stale.  This adapter keeps the existing key/value buffers, stores the offset
     in `cache[2]`, and mutates the three-array state through operations visible
     to `mx.compile(inputs=..., outputs=...)`.
+
+    The adapter also owns its ROTARY ORIGIN (``RotaryOrigin``): ``rope_delta``
+    is None for a text request and the image request's delta otherwise, and
+    ``rope_offset`` is where the attention routes rotate the next row. The
+    delta shifts rotary positions only; ``offset`` keeps driving the mask,
+    the rollback window and every slice write.
     """
 
     def __init__(
@@ -381,6 +476,7 @@ class TensorOffsetKVCache:
         offset: int | mx.array,
         *,
         step: int = 256,
+        rope_delta: mx.array | int | None = None,
     ) -> None:
         offset_array = (
             offset
@@ -390,6 +486,7 @@ class TensorOffsetKVCache:
         self.cache = [keys, values, offset_array]
         self.rollback_state = [None, None, None]
         self.step = step
+        self._init_rotary_origin(rope_delta)
         # Growth-budget tracking (2026-07-03): the first promotion grants
         # headroom (`initial_reserve_tokens`); any capacity expansion AFTER
         # that grant means the compiled verify graph would retrace, so the
@@ -447,7 +544,10 @@ class TensorOffsetKVCache:
 
     @property
     def compile_state(self):
-        return [self.cache, self.rollback_state]
+        # The rotary origin rides next to the leaves so a closure that
+        # captures this tree (the graph bank, the device draft cores) reads
+        # the delta at call time, never as a constant of the trace.
+        return [self.cache, self.rollback_state, self.rope_state]
 
     def ensure_capacity(self, needed: int) -> None:
         if self.keys is None or self.values is None:
@@ -472,8 +572,57 @@ class TensorOffsetKVCache:
         )
         self._granted = True
 
+    def _concrete_offset(self):
+        """The host-int offset when it is a materialized value, else None.
+
+        During an ``mx.compile`` trace ``cache[2]`` is a tracer and ``.item()``
+        raises; on the eager (demoted) verify path it is a concrete scalar.
+        """
+        try:
+            return int(self.cache[2].item())
+        except Exception:
+            return None
+
     def update_and_fetch(self, keys, values):
         steps = int(keys.shape[2])
+        off_i = self._concrete_offset()
+        if off_i is not None:
+            # Eager (demoted) verify: write the S new rows in place. The
+            # functional ``mx.slice_update`` below reallocates the WHOLE
+            # [1, 2, capacity, 256] buffer per key and value tensor when the
+            # compiled graph cannot donate it (267 MB each at 262K, 6.4 GB
+            # across the 12 full-attention layers) -- the transient that OOMs a
+            # 261,120-token verify while an S=1 AR decode on the stock KVCache,
+            # which writes in place, fits. Mirror the stock in-place write on
+            # this path. The rollback snapshot is a materialized independent
+            # copy of the pre-write rows, so the in-place write cannot corrupt
+            # it and a later ``trim`` restores exactly the same bytes.
+            end = off_i + steps
+            if end > int(self.cache[0].shape[2]):
+                # A write past the granted capacity. The functional path
+                # below clamps silently (MLX drops the rows that do not fit
+                # while the offset still advances past them), which is how
+                # a copy block straddling the growth edge lost its KV rows
+                # on the eager copy-block route; an in-place assignment
+                # refuses the shape instead. Grow first, as the stock
+                # KVCache does. ``ensure_capacity`` flips
+                # ``growth_after_grant`` on a granted leaf, so the bank
+                # demotes the request rather than replaying a compiled graph
+                # over the old buffers.
+                self.ensure_capacity(end)
+            snap_k = mx.contiguous(self.cache[0][:, :, off_i:end, :])
+            snap_v = mx.contiguous(self.cache[1][:, :, off_i:end, :])
+            mx.eval(snap_k, snap_v)
+            self.rollback_state[0] = self.cache[2]
+            self.rollback_state[1] = snap_k
+            self.rollback_state[2] = snap_v
+            self.cache[0][:, :, off_i:end, :] = keys
+            self.cache[1][:, :, off_i:end, :] = values
+            self.cache[2] = self.cache[2] + steps
+            return self.cache[0], self.cache[1]
+        # Compiled trace: keep the compile-visible functional path so
+        # mx.compile(inputs=..., outputs=...) can donate the buffers in the
+        # replayed graph.
         self.rollback_state[0] = self.cache[2]
         self.rollback_state[1] = mx.slice(
             self.cache[0],
@@ -530,19 +679,31 @@ class TensorOffsetKVCache:
             and self.rollback_state[2] is not None
             and int(self.rollback_state[1].shape[2]) == n
         ):
-            self.cache[0] = mx.slice_update(
-                self.cache[0],
-                self.rollback_state[1],
-                self.rollback_state[0],
-                axes=(2,),
-            )
-            self.cache[1] = mx.slice_update(
-                self.cache[1],
-                self.rollback_state[2],
-                self.rollback_state[0],
-                axes=(2,),
-            )
-            self.cache[2] = self.rollback_state[0]
+            try:
+                back_i = int(self.rollback_state[0].item())
+            except Exception:
+                back_i = None
+            if back_i is not None:
+                # Eager restore: put the saved rows back in place instead of
+                # reallocating the full buffer (same 6.4 GB avoidance as
+                # update_and_fetch's eager write).
+                self.cache[0][:, :, back_i:back_i + n, :] = self.rollback_state[1]
+                self.cache[1][:, :, back_i:back_i + n, :] = self.rollback_state[2]
+                self.cache[2] = self.rollback_state[0]
+            else:
+                self.cache[0] = mx.slice_update(
+                    self.cache[0],
+                    self.rollback_state[1],
+                    self.rollback_state[0],
+                    axes=(2,),
+                )
+                self.cache[1] = mx.slice_update(
+                    self.cache[1],
+                    self.rollback_state[2],
+                    self.rollback_state[0],
+                    axes=(2,),
+                )
+                self.cache[2] = self.rollback_state[0]
         else:
             self.cache[2] = mx.maximum(
                 self.cache[2] - n,
@@ -577,6 +738,354 @@ class TensorOffsetKVCache:
         return entry
 
 
+class TensorOffsetQSACache:
+    """Fixed-capacity Qwen4 QSA state for compiled target verification.
+
+    QSA owns five graph leaves: attention keys, attention values, the logical
+    token offset, raw index keys, and pooled index keys.  The logical pooled
+    length is always ``offset // ratio`` and therefore does not need a second
+    mutable offset.  All buffers are granted once when the verifier bank is
+    constructed; the enabled path only performs fixed-shape slice updates.
+
+    The bank also owns its ROTARY ORIGIN, next to the logical offset. A text
+    request rotates row ``i`` of a forward at ``offset + i``. An image request
+    rotates it at ``offset + rope_delta + i``: past the last image every
+    position of the request's table is the sequence index plus one constant
+    (``mtplx/vision/mrope.py``), so the whole table collapses to that delta
+    for every row a decode forward can write. ``rope_delta`` shifts rotary
+    positions ONLY. ``offset`` keeps driving the masks, the block selection,
+    the tail start and every slice write, which are KV indices.
+
+    Because the origin rides the cache, the fixed lane never reads the
+    request context (``attention_context.vision_rope_state``): a table or a
+    delta read inside a verify trace would be baked into a graph that every
+    request of the process replays.
+    """
+
+    fixed_capacity = True
+    step = 256
+
+    def __init__(
+        self,
+        kv: TensorOffsetKVCache,
+        raw_keys: mx.array,
+        pooled: mx.array,
+        *,
+        compress_ratio: int,
+        rows_gather: bool = False,
+        rows_gather_kv_m4: Any,
+        rows_gather_enabled: bool = False,
+        rows_gather_min_context: int = 0,
+        fused_rows_gather_kv_m4: bool = False,
+        rope_delta: mx.array | int | None = None,
+    ) -> None:
+        self.kv = kv
+        self.raw_keys = raw_keys
+        self.pooled = pooled
+        self.ratio = max(1, int(compress_ratio))
+        self.step = int(getattr(kv, "step", 256))
+        self.fixed_rows_gather = bool(rows_gather)
+        self.rows_gather_kv_m4 = rows_gather_kv_m4
+        self.rows_gather_enabled = bool(rows_gather_enabled)
+        self.rows_gather_min_context = max(0, int(rows_gather_min_context))
+        self.fused_rows_gather_kv_m4 = bool(fused_rows_gather_kv_m4)
+        self.rope_delta = rope_delta
+
+    @property
+    def rope_delta(self) -> mx.array | None:
+        """One int32 value for an image request, None for a text request."""
+
+        return self._rope_delta
+
+    @rope_delta.setter
+    def rope_delta(self, value: mx.array | int | None) -> None:
+        self._rope_delta = as_rope_delta(value)
+
+    @property
+    def rope_offset(self):
+        """Rotary position of the next row this bank writes.
+
+        For a text request this IS ``offset``, the same array object, so the
+        text verify trace holds exactly the nodes it held before image
+        requests could reach this lane.
+        """
+
+        if self._rope_delta is None:
+            return self.kv.offset
+        return self.kv.offset + self._rope_delta
+
+    @staticmethod
+    def _bank_capacity(
+        needed: int, ratio: int, kv_step: int, *, rows_gather: bool
+    ) -> int:
+        """Rows of a fixed bank that holds ``needed`` tokens.
+
+        Always a multiple of the QSA ratio. On the rows-gather lane also a
+        multiple of the K/V cache's growth step, so the K and V banks ARE the
+        step-rounded buffers and are never cut from them. MLX lets
+        ``slice_update`` write in place only when the array's buffer is at
+        most 16,384 bytes larger than the array, while its buffer cache hands
+        back a recycled buffer up to two pages (32,768 bytes) larger than
+        asked for. A bank cut to a multiple of 4 rows from a 256-row buffer
+        landed, after its first copy, in exactly such a buffer whenever the
+        cut was 17 to 47 rows short of the step: never donatable again, so
+        every K and V bank was copied on every verify round (24 x 135 MB at
+        128K: 7.8 ms against 0.6 ms for the 24 writes in isolation, 48
+        against 65 tok/s served, 2026-09-20). A capacity on the step is a
+        whole number of pages, where the worst recycled buffer is one page
+        larger and still donates.
+
+        Rows-gather only, on purpose: there each verify row attends over its
+        own selected rows and the index scores are per block, so the padded
+        tail never enters a value and the result is bit-identical. The dense
+        lane reduces over every row of the bank, and its last float32 bit
+        already depends on the padded length (capacity 28 and capacity 64
+        differ from the stock cache by 2e-8 on the tiny test geometry), so
+        its capacity is left exactly as it was.
+        """
+
+        quantum = max(1, int(ratio))
+        if rows_gather:
+            quantum = math.lcm(quantum, max(1, int(kv_step)))
+        return ((max(1, int(needed)) + quantum - 1) // quantum) * quantum
+
+    @staticmethod
+    def _fixed_bank(value: mx.array, capacity: int, axis: int) -> mx.array:
+        current = int(value.shape[axis])
+        if current == capacity:
+            return value
+        if current > capacity:
+            slices = [slice(None)] * value.ndim
+            slices[axis] = slice(0, capacity)
+            return value[tuple(slices)]
+        shape = list(value.shape)
+        shape[axis] = capacity - current
+        return mx.concatenate(
+            [value, mx.zeros(tuple(shape), dtype=value.dtype)], axis=axis
+        )
+
+    @classmethod
+    def from_qsa_cache(
+        cls, entry: Any, *, reserve_tokens: int
+    ) -> "TensorOffsetQSACache":
+        reserve_tokens = max(1, int(reserve_tokens))
+        offset = int(entry.offset)
+        ratio = max(1, int(entry.ratio))
+        if entry.raw_keys is None or entry.pooled is None:
+            raise ValueError("QSA index state is empty")
+        if entry.kv.keys is None or entry.kv.values is None:
+            raise ValueError("QSA attention state is empty")
+
+        from .models.qwen4_exp import (
+            _qsa_gather_enabled,
+            _qsa_gather_min_context,
+        )
+
+        rows_gather_enabled = _qsa_gather_enabled()
+        rows_gather_min_context = _qsa_gather_min_context()
+        rows_gather = rows_gather_enabled and offset >= rows_gather_min_context
+
+        logical_capacity = offset + reserve_tokens
+        raw_capacity = cls._bank_capacity(
+            logical_capacity,
+            ratio,
+            getattr(entry.kv, "step", 256),
+            rows_gather=rows_gather,
+        )
+        pooled_capacity = raw_capacity // ratio
+
+        kv = TensorOffsetKVCache.from_kv_cache(
+            entry.kv, reserve_tokens=reserve_tokens
+        )
+        kv.keys = cls._fixed_bank(kv.keys, raw_capacity, 2)
+        kv.values = cls._fixed_bank(kv.values, raw_capacity, 2)
+        raw = cls._fixed_bank(entry.raw_keys, raw_capacity, 1)
+        pooled = cls._fixed_bank(entry.pooled, pooled_capacity, 1)
+        rows_gather_kv_m4 = entry.rows_gather_kv_m4
+        fused_rows_gather_kv_m4 = _env_enabled("MTPLX_QSA_M4_FUSED_KV_GATHER")
+        if fused_rows_gather_kv_m4:
+            expected_shape = (1, 2, raw_capacity, 256)
+            if not _env_enabled("MTPLX_QWEN4_FIXED_M4_VERIFY"):
+                raise RuntimeError(
+                    "QSA fused K/V gather requires the fixed-M4 verifier"
+                )
+            if not rows_gather_enabled or ratio != 4:
+                raise RuntimeError(
+                    "QSA fused K/V gather requires the fixed rows-gather ratio-4 lane"
+                )
+            if (
+                tuple(kv.keys.shape) != expected_shape
+                or tuple(kv.values.shape) != expected_shape
+                or kv.keys.dtype != mx.bfloat16
+                or kv.values.dtype != mx.bfloat16
+            ):
+                raise RuntimeError(
+                    "QSA fused K/V gather requires BF16 "
+                    "[1,2,capacity,256] cache ownership"
+                )
+            if rows_gather:
+                from .kernels.qwen4_qsa_m4_fused_kv_gather import (
+                    bind_qwen4_qsa_m4_fused_kv_gather,
+                )
+
+                rows_gather_kv_m4 = bind_qwen4_qsa_m4_fused_kv_gather(
+                    capacity=raw_capacity
+                )
+
+        return cls(
+            kv,
+            raw,
+            pooled,
+            compress_ratio=ratio,
+            rows_gather=rows_gather,
+            rows_gather_kv_m4=rows_gather_kv_m4,
+            rows_gather_enabled=rows_gather_enabled,
+            rows_gather_min_context=rows_gather_min_context,
+            fused_rows_gather_kv_m4=fused_rows_gather_kv_m4,
+        )
+
+    @property
+    def capacity(self) -> int:
+        return int(self.raw_keys.shape[1])
+
+    def ensure_capacity(self, needed: int) -> bool:
+        """Grow this installed QSA generation without changing its offset."""
+
+        if int(needed) <= self.capacity:
+            return False
+        raw_capacity = self._bank_capacity(
+            needed,
+            self.ratio,
+            getattr(self.kv, "step", 256),
+            rows_gather=self.fixed_rows_gather,
+        )
+        pooled_capacity = raw_capacity // self.ratio
+        self.kv.keys = self._fixed_bank(self.kv.keys, raw_capacity, 2)
+        self.kv.values = self._fixed_bank(self.kv.values, raw_capacity, 2)
+        self.raw_keys = self._fixed_bank(self.raw_keys, raw_capacity, 1)
+        self.pooled = self._fixed_bank(self.pooled, pooled_capacity, 1)
+        self.kv._granted = True
+        self.kv.growth_after_grant = False
+        if self.fixed_rows_gather and self.fused_rows_gather_kv_m4:
+            from .kernels.qwen4_qsa_m4_fused_kv_gather import (
+                bind_qwen4_qsa_m4_fused_kv_gather,
+            )
+
+            self.rows_gather_kv_m4 = bind_qwen4_qsa_m4_fused_kv_gather(
+                capacity=raw_capacity
+            )
+        return True
+
+    def activate_rows_gather(self, logical_end: int) -> bool:
+        """Install the construction-validated sparse route at its threshold."""
+
+        if (
+            self.fixed_rows_gather
+            or not self.rows_gather_enabled
+            or int(logical_end) < self.rows_gather_min_context
+        ):
+            return False
+        self.fixed_rows_gather = True
+        if self.fused_rows_gather_kv_m4:
+            from .kernels.qwen4_qsa_m4_fused_kv_gather import (
+                bind_qwen4_qsa_m4_fused_kv_gather,
+            )
+
+            self.rows_gather_kv_m4 = bind_qwen4_qsa_m4_fused_kv_gather(
+                capacity=self.capacity
+            )
+        return True
+
+    @property
+    def offset(self):
+        return self.kv.offset
+
+    @property
+    def pooled_len(self):
+        return self.kv.offset // self.ratio
+
+    @property
+    def state_leaves(self) -> list[mx.array]:
+        return [*self.kv.cache, self.raw_keys, self.pooled]
+
+    def pooled_f32_view(self, nb: int) -> mx.array:
+        """fp32-transposed [1, 1, D, nb] view of the fixed pooled bank.
+
+        The stock QSACache keeps a lockstep mirror for allocation hygiene;
+        the fixed bank has static capacity and lives inside one compiled
+        trace, so the cast is a single graph node and needs no mirror.
+        """
+        return mx.swapaxes(self.pooled.astype(mx.float32), 1, 2)[:, None][..., :nb]
+
+    def write_raw(self, keys: mx.array) -> None:
+        self.raw_keys = mx.slice_update(
+            self.raw_keys, keys, self.kv.offset, axes=(1,)
+        )
+
+    def write_pooled(self, blocks: mx.array, nb_start, nb_total) -> None:
+        del nb_total
+        self.pooled = mx.slice_update(
+            self.pooled, blocks, nb_start, axes=(1,)
+        )
+
+    def size(self) -> int:
+        return self.kv.size()
+
+    def is_trimmable(self) -> bool:
+        return True
+
+    def trim(self, n: int) -> int:
+        return self.kv.trim(n)
+
+    @property
+    def nbytes(self) -> int:
+        return int(self.kv.nbytes + self.raw_keys.nbytes + self.pooled.nbytes)
+
+    def demote(self):
+        """Hand the state back as a stock ``QSACache``.
+
+        The rotary delta does not travel: keys and pooled keys are stored
+        already rotated, and the delta is a function of the request's own
+        ids and image grids, recomputed by the next request. Nothing of it
+        reaches the session bank, RAM or SSD.
+        """
+
+        from .models.qwen4_exp import QSACache
+
+        offset = self.kv.size()
+        entry = QSACache(self.ratio)
+        entry.kv = self.kv.demote()
+        entry.raw_keys = self.raw_keys
+        entry.pooled = self.pooled
+        entry.pooled_len = min(int(self.pooled.shape[1]), offset // self.ratio)
+        return entry
+
+
+def ensure_eager_window_capacity(cache: Any, window_tokens: int) -> int:
+    """Grow every ``TensorOffsetKVCache`` entry so one eager forward of
+    ``window_tokens`` rows fits; returns how many entries grew.
+
+    The eager copy-block route writes ``1 + block`` rows into these fixed
+    buffers outside the bank's own reservation. The growth has to happen
+    before the forward: the attention mask is built once per forward from
+    the first full-attention layer's capacity, so a buffer that grows inside
+    a layer's update no longer matches the mask. Every full-attention layer
+    holds the same token count, so the offset is read once.
+    """
+
+    grown = 0
+    size = None
+    for entry in cache or []:
+        if not isinstance(entry, TensorOffsetKVCache) or entry.keys is None:
+            continue
+        if size is None:
+            size = entry.size()
+        needed = size + max(1, int(window_tokens))
+        if needed > int(entry.keys.shape[2]):
+            entry.ensure_capacity(needed)
+            grown += 1
+    return grown
+
 def promote_kv_cache_offsets(
     cache: Any,
     *,
@@ -605,8 +1114,31 @@ def promote_kv_cache_offsets(
     for idx, entry in enumerate(cache):
         if entry is None:
             continue
+        if isinstance(entry, TensorOffsetQSACache):
+            continue
         if isinstance(entry, TensorOffsetKVCache):
             entry.ensure_capacity(entry.size() + reserve_tokens)
+            continue
+        try:
+            from .models.qwen4_exp import QSACache
+        except Exception:  # pragma: no cover - optional model import
+            QSACache = None
+        if QSACache is not None and isinstance(entry, QSACache):
+            try:
+                cache[idx] = TensorOffsetQSACache.from_qsa_cache(
+                    entry,
+                    reserve_tokens=(
+                        initial_reserve_tokens
+                        if initial_reserve_tokens is not None
+                        else reserve_tokens
+                    ),
+                )
+            except (TypeError, ValueError):
+                failures["auxiliary_qsa_state"] = (
+                    failures.get("auxiliary_qsa_state", 0) + 1
+                )
+                continue
+            promoted += 1
             continue
         if preserve_paged:
             try:
@@ -745,6 +1277,12 @@ def cache_array_tree(cache: Any) -> list[Any]:
 
 VERIFY_SPEC_KIND_FULL_ATTN = "fa"
 VERIFY_SPEC_KIND_GDN = "gdn"
+VERIFY_SPEC_KIND_QSA = "qsa"
+
+# Fixed-M4 replay install receipts printed so far in this process (the first
+# few installs announce their auxiliary route; the request report carries it
+# for every request).
+_FIXED_M4_INSTALL_RECEIPTS = 0
 
 TAPE_CAPTURE_KEYS = ("conv_states", "conv_out", "g", "state_in", "tape")
 STANDARD_CAPTURE_KEYS = ("conv_states", "states")
@@ -837,11 +1375,11 @@ def _record_permanent_eager(reason: str, *, once: bool = False) -> None:
 # Process-global compiled verify callables, keyed by
 # (runtime id, capture backend, state spec, verify length, hidden variant,
 # bucket). The bank is per-generation; without sharing, every request pays a
-# fresh trace. Values are (compiled_fn, trace_host) where trace_host["bank"]
-# is re-pointed to the live bank before each dispatch so internal retraces
+# fresh trace. Values are (compiled_fn, trace_host, runtime_ref), where the
+# host's WEAK bank reference is re-pointed before each dispatch so retraces
 # (mx.compile re-traces on leaf-shape changes) always use live scratch
 # containers. See CompiledVerifyBank._shared_or_new_verify_step.
-_SHARED_VERIFY_STEPS: dict[tuple, tuple[Any, dict[str, Any]]] = {}
+_SHARED_VERIFY_STEPS: dict[tuple, tuple[Any, dict[str, Any], Any]] = {}
 
 
 def _prewarm_enabled() -> bool:
@@ -904,6 +1442,9 @@ def build_verify_state_spec(cache: Any) -> tuple[list[tuple[int, str, int]] | No
     for idx, entry in enumerate(cache or []):
         if entry is None:
             continue
+        if isinstance(entry, TensorOffsetQSACache):
+            spec.append((idx, VERIFY_SPEC_KIND_QSA, 5))
+            continue
         if isinstance(entry, TensorOffsetKVCache) or (
             TensorOffsetVllmMetalPagedKVCache is not None
             and isinstance(entry, TensorOffsetVllmMetalPagedKVCache)
@@ -911,9 +1452,12 @@ def build_verify_state_spec(cache: Any) -> tuple[list[tuple[int, str, int]] | No
             spec.append((idx, VERIFY_SPEC_KIND_FULL_ATTN, len(entry.cache)))
             continue
         if ArraysCache is not None and isinstance(entry, ArraysCache):
-            if len(entry.cache) != 2:
+            if len(entry.cache) not in (2, 4):
                 return None, f"unsupported_container:ArraysCache[{len(entry.cache)}]"
-            spec.append((idx, VERIFY_SPEC_KIND_GDN, 2))
+            n_leaves = len(entry.cache)
+            if n_leaves == 4 and any(leaf is None for leaf in entry.cache):
+                return None, "unsupported_container:ArraysCache[partial_ple]"
+            spec.append((idx, VERIFY_SPEC_KIND_GDN, n_leaves))
             continue
         return None, f"unsupported_container:{type(entry).__name__}"
     return spec, None
@@ -1060,6 +1604,15 @@ def _compiled_verify_max_context() -> int:
     return max(0, value)
 
 
+_FIXED_M4_DONATION_PROBE_RAW = str(
+    __import__("os").environ.get("MTPLX_FIXED_M4_DONATION_PROBE", "")
+).strip().lower()
+_FIXED_M4_DONATION_PROBE = _FIXED_M4_DONATION_PROBE_RAW in (
+    "1", "true", "yes", "on", "all"
+)
+_FIXED_M4_DONATION_PROBE_ALL = _FIXED_M4_DONATION_PROBE_RAW == "all"
+
+
 def _compiled_verify_boundary() -> str:
     import os
 
@@ -1166,6 +1719,48 @@ def _compiled_verify_growth_reserve() -> int:
         return 512
 
 
+def _fixed_m4_initial_growth_reserve() -> int:
+    """Construction-time reserve for the strict Qwen4 fixed-M4 lane."""
+
+    if "MTPLX_COMPILED_VERIFY_GROWTH_RESERVE" in os.environ:
+        return _compiled_verify_growth_reserve()
+    return 1024
+
+
+_FIXED_M4_MAX_GROWTH_TOKENS = 16384
+
+
+def _next_fixed_m4_growth_tokens(current: int) -> int:
+    """Next construction-owned grant for an overrun fixed-M4 generation."""
+
+    current = max(1, int(current))
+    return min(
+        current * 2,
+        max(current, _FIXED_M4_MAX_GROWTH_TOKENS),
+    )
+
+
+def _fixed_m4_capacity_growth(
+    *,
+    capacity: int,
+    required_end: int,
+    growth_tokens: int,
+    capacity_limit: int | None,
+) -> tuple[int, int]:
+    """Resolve one host-boundary capacity transition and its next grant."""
+
+    next_capacity = max(
+        int(required_end),
+        int(capacity) + max(1, int(growth_tokens)),
+    )
+    if capacity_limit is not None:
+        next_capacity = max(
+            int(required_end),
+            min(next_capacity, int(capacity_limit)),
+        )
+    return next_capacity, _next_fixed_m4_growth_tokens(growth_tokens)
+
+
 def _post_restore_eager_rounds() -> int:
     """Verify rounds routed eager after a large session-bank restore (opt-in).
 
@@ -1250,13 +1845,47 @@ def _runtime_trunk_quant_bits(runtime: Any) -> int | None:
         return None
 
 
+def _prism_ternary_fp16_loaded(runtime: Any) -> bool:
+    """True for a Ternary Bonsai (Prism) pack that finished its float16 load checks.
+
+    Its 2-bit trunk is the Prism ternary layout behind in-module Hadamard
+    rotations, not a generic 2-bit affine trunk: the verify graph is the dense
+    Qwen3.5 one with each projection's rotation inside its call. Admission
+    needs the loader's own post-load report (rotation metadata, packed module
+    count, float16 activations with float32 rotation signs).
+    """
+
+    model = getattr(runtime, "model", None)
+    try:
+        from .models.prism_hadamard_qwen35 import Model as _PrismModel
+    except Exception:
+        return False
+    # isinstance, not the exact class: MTP injection swaps the loaded model's
+    # class for a subclass (mtp_patch._MTPLXOuterModel) at load time.
+    if not isinstance(model, _PrismModel):
+        return False
+    report = getattr(model, "_prism_post_load_report", None)
+    records = getattr(model, "_prism_records", ()) or ()
+    return (
+        isinstance(report, dict)
+        and report.get("model_type") == "prism_hadamard_qwen35"
+        and bool(records)
+        and report.get("packed_modules") == len(records)
+        and report.get("float_dtypes") == ["float16", "float32"]
+    )
+
+
 def _compiled_verify_bits_gate_ok(runtime: Any) -> bool:
     if _env_enabled("MTPLX_COMPILED_VERIFY_FORCE"):
         return True
     bits = _runtime_trunk_quant_bits(runtime)
     # Measured-win allowlist: 4-bit and 8-bit affine trunks engage;
     # unquantized (None) passes for test rigs and bf16 research models.
-    # Unmeasured quantizations (e.g. the 6-bit 9B) stay eager.
+    # Unmeasured quantizations (e.g. the 6-bit 9B) stay eager. The Prism
+    # ternary 2-bit trunk (Ternary Bonsai 2) engages after its loader's
+    # float16 checks: parity2 and speed receipts in the Bonsai night report.
+    if bits == 2 and _prism_ternary_fp16_loaded(runtime):
+        return True
     return bits is None or bits in (4, 8)
 
 
@@ -1352,8 +1981,19 @@ class CompiledVerifyBank:
         parity: bool = False,
         parity2: bool = False,
         restored_tokens: int = 0,
+        rope_delta: mx.array | int | None = None,
     ) -> None:
         self.runtime = runtime
+        # The request's rotary delta (an image request on the QSA family) or
+        # None (every text request). The bank is built per request, so this is
+        # request state: every fixed QSA bank it promotes carries the delta
+        # (``TensorOffsetQSACache.rope_delta``) and every verify step it
+        # compiles for this request takes it as a graph INPUT, never as a
+        # captured constant: two image requests with different deltas replay
+        # one trace.
+        self._rope_delta: mx.array | None = None
+        self._rope_delta_value: int | None = None
+        self._adopt_rope_delta(rope_delta)
         if max_verify_len is None:
             raw = os.environ.get("MTPLX_COMPILED_VERIFY_MAX_LEN", "").strip()
             max_verify_len = int(raw) if raw else 6
@@ -1364,8 +2004,11 @@ class CompiledVerifyBank:
         self.speculative_headroom = (
             self.max_verify_len if self.request_max_tokens is not None else 0
         )
-        # The request budget can only TIGHTEN the reserve, never raise it
-        # past the env ceiling. Server requests default max_tokens to the
+        self.strict_no_fallback = bool(
+            getattr(runtime, "qwen4_fixed_m4_compiled_verify", False)
+        )
+        # Generic banks let the request budget only TIGHTEN the reserve; it
+        # never raises it past the env ceiling. Server requests default max_tokens to the
         # whole remaining context window (~262k on a 256k model), and
         # granting that verbatim made every request materialize a
         # multi-gigabyte KV reserve across all promoted leaves at first
@@ -1377,17 +2020,25 @@ class CompiledVerifyBank:
         # the request remainder (measured flat vs eager-only). Explicit
         # small budgets still reserve exactly budget + one speculative
         # window; raise MTPLX_COMPILED_VERIFY_GROWTH_RESERVE to widen the
-        # ceiling for known-budget batch runs.
+        # stable-capacity generation. The construction-owned Qwen4 fixed-M4
+        # lane has its own 1K default, then grows and reinstalls its graph at
+        # capacity boundaries instead of demoting to eager. An explicit env
+        # reserve remains authoritative for both lanes.
+        reserve_ceiling = (
+            _fixed_m4_initial_growth_reserve()
+            if self.strict_no_fallback
+            else _compiled_verify_growth_reserve()
+        )
         self.growth_reserve_tokens = (
             min(
                 self.request_max_tokens + self.speculative_headroom,
                 max(
-                    _compiled_verify_growth_reserve(),
+                    reserve_ceiling,
                     self.max_verify_len,
                 ),
             )
             if self.request_max_tokens is not None
-            else _compiled_verify_growth_reserve()
+            else reserve_ceiling
         )
         self.capture_backend = resolve_gdn_capture_backend(capture_backend)
         self.parity = bool(parity)
@@ -1414,20 +2065,60 @@ class CompiledVerifyBank:
             )
             _record_permanent_eager(self.permanent_eager_reason, once=True)
         self._capture_accepts_backend = _accepts_capture_backend(runtime)
-        self._compiled: dict[tuple[int, str, int], Any] = {}
+        capture_layout = getattr(runtime, "_mtplx_capture_layout", None)
+        self._capture_layout_override = (
+            None
+            if capture_layout is None
+            else tuple(str(name) for name in capture_layout)
+        )
+        self._extra_capture_layout = tuple(
+            (int(layer_index), tuple(str(name) for name in names))
+            for layer_index, names in tuple(
+                getattr(runtime, "_mtplx_capture_extra_layout", ()) or ()
+            )
+        )
+        prepare_aux = getattr(runtime, "prepare_compiled_verify_aux", None)
+        self._prepare_compiled_aux = prepare_aux if callable(prepare_aux) else None
+        build_fixed_aux = getattr(runtime, "build_fixed_m4_compiled_verify_aux", None)
+        self._build_fixed_m4_aux = (
+            build_fixed_aux if callable(build_fixed_aux) else None
+        )
+        commit_captures = getattr(runtime, "commit_compiled_verify_captures", None)
+        self._commit_compiled_captures = (
+            commit_captures if callable(commit_captures) else None
+        )
+        self._runtime_accepts_compiled_aux = _accepts_runtime_keyword(
+            runtime, "compiled_aux"
+        )
+        if self._prepare_compiled_aux is not None and not self._runtime_accepts_compiled_aux:
+            raise TypeError(
+                "compiled verify auxiliary preparation requires a compiled_aux input"
+            )
+        self._compiled: dict[tuple[int, str, int, int], Any] = {}
         self._spec: list[tuple[int, str, int]] | None = None
         self._shadow: list[Any] | None = None
         self._shadow_signature: tuple[Any, ...] | None = None
         self._gdn_meta_cache: dict[int, dict[str, int] | None] = {}
         self._exception_failures = 0
         self._held_state_refs: list = []
-        # Dense leaves that outgrow the capacity granted at first promotion
-        # would retrace the compiled graph on every cache-growth step. A
-        # generation request supplies its known output budget plus one maximum
-        # speculative window; TensorOffsetKVCache.ensure_capacity rounds the
-        # final offset + reserve to each entry's own step geometry. Standalone
-        # callers without a request budget retain the legacy env reserve.
+        # The Qwen4 fixed-M4 lane installs one construction-owned replay plan
+        # after prompt prefill.  Production calls then bypass the generic
+        # eligibility, promotion, bucket, shadow, and fallback machinery.
+        # Parity modes intentionally stay on the generic dispatcher because
+        # they need its eager comparison paths.
+        self._fixed_m4_dispatch: dict[str, Any] | None = None
+        # Generic lanes demote when dense leaves outgrow the initial grant.
+        # The fixed-M4 lane instead performs explicit capacity-generation
+        # transitions while keeping its installed direct route.
         self._growth_demoted = False
+        # Per-call dispatch receipt.  Aggregate counters answer "how often";
+        # these fields answer the more important Route Tape question: which
+        # path served the most recent call.  Keep this on the bank so callers
+        # never have to infer execution from counter deltas.
+        self.last_dispatch_kind = "not_run"
+        self.last_fallback_reason: str | None = None
+        self.last_fallback_transition = False
+        self._growth_budget_fallback_reported = False
         self._dense_capacity_grant: dict[int, int] | None = None
         # Post-restore warmup: a session-bank restore hands this generation
         # exact-size KV buffers, so the first promotion concatenate-copies the
@@ -1439,6 +2130,7 @@ class CompiledVerifyBank:
                 int(restored_tokens or 0) >= _post_restore_min_tokens()
                 and not parity
                 and not parity2
+                and not self.strict_no_fallback
             )
             else 0
         )
@@ -1461,9 +2153,1157 @@ class CompiledVerifyBank:
             "growth_handoff_materializations": 0,
             "growth_handoff_state_leaves": 0,
             "growth_handoff_materialize_time_s": 0.0,
+            "fixed_m4_capacity_transitions": 0,
+            "fixed_m4_route_transitions": 0,
         }
 
     # -- public API ---------------------------------------------------------
+
+    def last_dispatch_route(self, compiled_route: str = "compiled_bank") -> str:
+        """Return the actual route taken by the most recent public call."""
+        if self.last_dispatch_kind == "eager":
+            return f"bank_eager:{self.last_fallback_reason or 'unknown'}"
+        if self.last_dispatch_kind == "compiled":
+            return compiled_route
+        return "not_run"
+
+    def _adopt_rope_delta(self, value: mx.array | int | None) -> None:
+        """Bind this request's rotary delta once; a second value must agree."""
+
+        delta = as_rope_delta(value)
+        if delta is None:
+            return
+        number = int(value) if isinstance(value, int) else int(delta.item())
+        if self._rope_delta is not None:
+            if number != self._rope_delta_value:
+                raise ValueError(
+                    "this verify bank already carries rope_delta="
+                    f"{self._rope_delta_value}; a request has one delta, got {number}"
+                )
+            return
+        mx.eval(delta)
+        self._rope_delta = delta
+        self._rope_delta_value = number
+
+    def _stamp_rope_delta(self, cache: Any) -> None:
+        """Every promoted container of this request owns its rotary origin.
+
+        Fixed QSA banks (Flash-Next) and the full-attention tensor-offset
+        adapters (the dense families, plain and paged) alike.
+        """
+
+        stamp_rope_delta(cache, self._rope_delta)
+
+    def _verify_key(
+        self, length: int, hidden_variant: str | None, bucket: int
+    ) -> tuple[int, str, int, int]:
+        """Per-bank key of one compiled verify step.
+
+        The last element says whether the step takes the rotary delta as an
+        input. A text request and an image request never share a trace: the
+        text trace has no such input and stays the graph it always was.
+        """
+
+        return (
+            int(length),
+            str(hidden_variant or ""),
+            int(bucket),
+            int(self._rope_delta is not None),
+        )
+
+    def _rope_args(self) -> tuple[mx.array, ...]:
+        """The delta as a positional graph input, or nothing for text."""
+
+        return () if self._rope_delta is None else (self._rope_delta,)
+
+    def install_fixed_m4(
+        self,
+        cache: Any,
+        *,
+        prompt_ids,
+        hidden_variant: str | None,
+        rope_delta: mx.array | int | None = None,
+    ) -> None:
+        """Install the exact Qwen4 physical-M4 replay once after prefill.
+
+        ``rope_delta`` admits an image request: every QSA bank of the cache
+        rotates at ``offset + rope_delta`` and the replayed graph takes the
+        delta as an input. None is a text request and installs the text
+        trace.
+        """
+
+        if not self.strict_no_fallback:
+            raise ValueError("fixed-M4 installation requires the Qwen4 runtime route")
+        if self.parity:
+            raise ValueError(
+                "fixed-M4 direct replay has no eager-authoritative parity mode; "
+                "MTPLX_COMPILED_VERIFY=parity2 compares every round against the "
+                "eager verifier"
+            )
+        self._adopt_rope_delta(rope_delta)
+
+        class _M4Shape:
+            shape = (1, 4)
+
+        reason = self._fallback_reason(_M4Shape(), cache, True)
+        if reason is not None:
+            raise RuntimeError(f"qwen4 fixed-M4 installation refused: {reason}")
+        bucket = self._resolve_bucket(cache, 4)
+        if bucket != 0:
+            raise RuntimeError(
+                f"qwen4 fixed-M4 installation requires dense state; bucket={bucket}"
+            )
+        self._ensure_shadow(cache)
+        state_plan = tuple(
+            (kind, cache[idx], n_leaves)
+            for idx, kind, n_leaves in self._spec or ()
+        )
+        if not state_plan or any(
+            kind not in (VERIFY_SPEC_KIND_QSA, VERIFY_SPEC_KIND_GDN)
+            for kind, _entry, _n in state_plan
+        ):
+            raise RuntimeError("qwen4 fixed-M4 installation found unsupported state")
+        qsa_entries = tuple(
+            entry for kind, entry, _n in state_plan if kind == VERIFY_SPEC_KIND_QSA
+        )
+        if not qsa_entries:
+            raise RuntimeError("qwen4 fixed-M4 installation found no QSA state")
+        route_key = int(all(entry.fixed_rows_gather for entry in qsa_entries))
+        key = self._verify_key(4, hidden_variant, route_key)
+        fn = self._compiled.get(key)
+        if fn is None:
+            fn = self._shared_or_new_verify_step(key, 4, hidden_variant)
+            self._compiled[key] = fn
+        pending_route_thresholds = tuple(
+            entry.rows_gather_min_context
+            for entry in qsa_entries
+            if entry.rows_gather_enabled and not entry.fixed_rows_gather
+        )
+
+        capture_plan = []
+        capture_pos = 0
+        for idx, names in self._extra_capture_layout:
+            capture_plan.append((cache[idx], capture_pos, len(names)))
+            capture_pos += len(names)
+
+        boundary = _compiled_verify_boundary()
+        if self._build_fixed_m4_aux is not None and boundary in ("both", "pre"):
+            prepare_aux = self._build_fixed_m4_aux(cache, prompt_ids)
+            aux_route = "staged_sidecar"
+            aux_inputs = "host_ledger"
+        else:
+            prepare_aux = partial(
+                _prepare_fixed_m4_materialized,
+                self._prepare_compiled_aux,
+                cache,
+            )
+            aux_route = "materialized"
+            aux_inputs = "device_history"
+        from .models.qwen4_exp import _qsa_stock_rows_gather_kv
+
+        kv_gather = (
+            "fused_m4"
+            if any(
+                kind == VERIFY_SPEC_KIND_QSA
+                and entry.rows_gather_kv_m4 is not _qsa_stock_rows_gather_kv
+                for kind, entry, _n in state_plan
+            )
+            else "stock"
+        )
+        initial_growth_tokens = max(
+            self.max_verify_len,
+            self.growth_reserve_tokens,
+        )
+        capacity_limit = (
+            None
+            if self.request_max_tokens is None
+            else (
+                len(prompt_ids)
+                + self.request_max_tokens
+                + self.speculative_headroom
+            )
+        )
+        self._fixed_m4_dispatch = {
+            "fn": fn,
+            "prepare_aux": prepare_aux,
+            "aux_route": aux_route,
+            "aux_inputs": aux_inputs,
+            "kv_gather": kv_gather,
+            "state_plan": state_plan,
+            "state_leaves": sum(n for _kind, _entry, n in state_plan),
+            "capture_plan": tuple(capture_plan),
+            "capture_leaves": capture_pos,
+            "boundary": boundary,
+            "base_offset": len(prompt_ids),
+            "capacity": min(entry.capacity for entry in qsa_entries),
+            "growth_tokens": _next_fixed_m4_growth_tokens(
+                initial_growth_tokens
+            ),
+            "capacity_limit": capacity_limit,
+            "hidden_variant": hidden_variant,
+            "qsa_entries": qsa_entries,
+            "route_transition_at": (
+                min(pending_route_thresholds)
+                if pending_route_thresholds
+                else None
+            ),
+            # parity2 reads the pre-round leaves after the replay, so nothing
+            # may be donated into it.
+            "donate": (
+                _compiled_verify_donation_enabled()
+                and boundary in ("both", "post")
+                and not self.parity2
+            ),
+            # The replay's positional inputs after the auxiliary: the delta
+            # of an image request, nothing for text. Built once here so the
+            # round itself assembles no tuple and the text call is the call
+            # it always was.
+            "rope_args": self._rope_args(),
+            "rope_delta": self._rope_delta_value,
+            "parity2": bool(self.parity2),
+        }
+        # Engagement receipt (counters law): the request report carries the
+        # bound auxiliary route (to_dict -> compiled_verify.fixed_m4) and the
+        # first installs per process announce it in the serve log, so an A/B
+        # can prove the staged sidecar lane ran rather than the materialized
+        # PLE embedding.
+        global _FIXED_M4_INSTALL_RECEIPTS
+        if _FIXED_M4_INSTALL_RECEIPTS < 3:
+            _FIXED_M4_INSTALL_RECEIPTS += 1
+            print(
+                "[qwen4-fixed-M4-verify] replay installed: "
+                f"aux={aux_route} inputs={aux_inputs} boundary={boundary} "
+                f"donate={self._fixed_m4_dispatch['donate']} kv_gather={kv_gather} "
+                "positions="
+                + ("text" if self._rope_delta is None else "vision_delta"),
+                flush=True,
+            )
+
+    def prefetch_fixed_m4_aux(
+        self,
+        host_input_prefix,
+        *,
+        completion_tokens,
+        committed_count: int,
+    ) -> int:
+        """Warm the n-gram rows of the next verify window's first tokens.
+
+        The verify replay opens with a host row gather that needs the draft
+        tokens, so the GPU sits idle for it every round.  The draft loop calls
+        this as each token becomes known, while the GPU is still drafting; the
+        replay's own gather then reads hot rows.  An instrument of timing
+        only: it returns a count, produces no array, and a failure here is
+        recorded and ignored because the gather does not depend on it.
+        """
+
+        dispatch = self._fixed_m4_dispatch
+        if dispatch is None:
+            return 0
+        prefetch = getattr(dispatch.get("prepare_aux"), "prefetch", None)
+        if prefetch is None:
+            return 0
+        try:
+            fetched = int(
+                prefetch(host_input_prefix, completion_tokens, committed_count)
+            )
+        except Exception as error:  # noqa: BLE001 - never on the decode path
+            self.stats["fixed_m4_aux_prefetch_error"] = repr(error)[:200]
+            return 0
+        self.stats["fixed_m4_aux_prefetch_calls"] = (
+            int(self.stats.get("fixed_m4_aux_prefetch_calls", 0)) + 1
+        )
+        self.stats["fixed_m4_aux_prefetch_rows"] = (
+            int(self.stats.get("fixed_m4_aux_prefetch_rows", 0)) + fetched
+        )
+        return fetched
+
+    def reserve_fixed_m4_window(
+        self,
+        cache: Any,
+        *,
+        committed_count: int | None = None,
+        window_tokens: int = 4,
+    ) -> None:
+        """Reserve every target write into an installed fixed-capacity bank.
+
+        D1/D2 and copy windows use these same buffers even when their forward
+        runs eager. They must renew capacity before writing, too. Generation
+        supplies its host ledger to avoid a device sync; standalone callers
+        without that ledger use the live cache offset. Generic banks are
+        unchanged. Keep four rows reserved for a possible lazy bonus write.
+        """
+
+        dispatch = self._fixed_m4_dispatch
+        if dispatch is None:
+            return
+        logical_start = (
+            int(dispatch["base_offset"]) + max(0, int(committed_count))
+            if committed_count is not None
+            else dispatch["qsa_entries"][0].size()
+        )
+        required_end = logical_start + max(4, int(window_tokens))
+        capacity_needed = required_end > int(dispatch["capacity"])
+        route_transition_at = dispatch["route_transition_at"]
+        route_needed = (
+            route_transition_at is not None
+            and required_end >= int(route_transition_at)
+        )
+        if not capacity_needed and not route_needed:
+            return
+
+        qsa_entries = dispatch["qsa_entries"]
+        capacity_changed = False
+        next_growth_tokens = int(dispatch["growth_tokens"])
+        if capacity_needed:
+            next_capacity, next_growth_tokens = _fixed_m4_capacity_growth(
+                capacity=int(dispatch["capacity"]),
+                required_end=required_end,
+                growth_tokens=int(dispatch["growth_tokens"]),
+                capacity_limit=dispatch["capacity_limit"],
+            )
+            for entry in qsa_entries:
+                capacity_changed = (
+                    entry.ensure_capacity(next_capacity) or capacity_changed
+                )
+        route_changed = False
+        if route_needed:
+            for entry in qsa_entries:
+                route_changed = (
+                    entry.activate_rows_gather(required_end) or route_changed
+                )
+            pending_route_thresholds = tuple(
+                entry.rows_gather_min_context
+                for entry in qsa_entries
+                if entry.rows_gather_enabled and not entry.fixed_rows_gather
+            )
+            dispatch["route_transition_at"] = (
+                min(pending_route_thresholds)
+                if pending_route_thresholds
+                else None
+            )
+        if not capacity_changed and not route_changed:
+            return
+
+        self._clear_shadow_leaf_refs()
+        self._held_state_refs.clear()
+        self._shadow = None
+        self._shadow_signature = None
+        self._ensure_shadow(cache)
+        route_key = int(all(entry.fixed_rows_gather for entry in qsa_entries))
+        key = self._verify_key(4, dispatch["hidden_variant"], route_key)
+        fn = self._compiled.get(key)
+        if fn is None:
+            fn = self._shared_or_new_verify_step(
+                key,
+                4,
+                dispatch["hidden_variant"],
+            )
+            self._compiled[key] = fn
+        dispatch["fn"] = fn
+        dispatch["capacity"] = min(entry.capacity for entry in qsa_entries)
+        if capacity_changed:
+            dispatch["growth_tokens"] = next_growth_tokens
+            self.stats["fixed_m4_capacity_transitions"] += 1
+        if route_changed:
+            # Receipt refresh: the rows-gather activation may have bound the
+            # fused kernel, so the request report must not keep carrying the
+            # install-time gather label.
+            from .models.qwen4_exp import _qsa_stock_rows_gather_kv
+
+            dispatch["kv_gather"] = (
+                "fused_m4"
+                if any(
+                    entry.rows_gather_kv_m4 is not _qsa_stock_rows_gather_kv
+                    for entry in qsa_entries
+                )
+                else "stock"
+            )
+            self.stats["fixed_m4_route_transitions"] += 1
+
+    def _forward_installed_fixed_m4(
+        self,
+        input_ids,
+        host_input_ids,
+        completion_tokens,
+        committed_count: int,
+        cache: Any,
+    ):
+        dispatch = self._fixed_m4_dispatch
+        assert dispatch is not None
+        self.reserve_fixed_m4_window(
+            cache,
+            committed_count=committed_count,
+        )
+        boundary = dispatch["boundary"]
+        donate = dispatch["donate"]
+        if donate:
+            self._clear_shadow_leaf_refs()
+
+        state_in: list[Any] = []
+        for kind, entry, n_leaves in dispatch["state_plan"]:
+            if kind == VERIFY_SPEC_KIND_QSA:
+                state_in.extend(
+                    (
+                        entry.kv.cache[0],
+                        entry.kv.cache[1],
+                        entry.kv.cache[2],
+                        entry.raw_keys,
+                        entry.pooled,
+                    )
+                )
+            else:
+                state_in.extend(entry.cache[:n_leaves])
+
+        # Host split of the replay (four clock reads per round): the n-gram row
+        # gather, the input eval, the graph replay and the encode. The verify
+        # forward is most of a decode round and it is one opaque host call
+        # otherwise; the request log carries these as compiled_verify
+        # fixed_m4_host_s so a slow round can be read, not guessed.
+        host_split = self.stats.setdefault(
+            "fixed_m4_host_s",
+            {"aux": 0.0, "input_eval": 0.0, "replay": 0.0, "encode": 0.0},
+        )
+        clock = time.perf_counter
+        t0 = clock()
+        compiled_aux = dispatch["prepare_aux"](
+            input_ids,
+            host_input_ids,
+            completion_tokens,
+            committed_count,
+        )
+        t1 = clock()
+        if boundary in ("both", "pre"):
+            mx.async_eval(compiled_aux, *state_in)
+        t2 = clock()
+        # Argument order is the trace's contract (``_make_verify_step``):
+        # ids, the auxiliary, the rotary delta of an image request, the state.
+        outputs = dispatch["fn"](
+            input_ids, compiled_aux, *dispatch["rope_args"], *state_in
+        )
+        t3 = clock()
+        host_split["aux"] += t1 - t0
+        host_split["input_eval"] += t2 - t1
+        host_split["replay"] += t3 - t2
+
+        capture_end = 2 + dispatch["capture_leaves"]
+        logits, hidden = outputs[:2]
+        captures_flat = outputs[2:capture_end]
+        state_out = outputs[capture_end:]
+
+        if dispatch.get("parity2"):
+            # The real entries still hold the pre-round leaves here: parity2
+            # installs without donation and the commit below has not run.
+            self._fixed_m4_parity2_round(
+                dispatch,
+                cache,
+                input_ids,
+                compiled_aux=compiled_aux,
+                candidate_logits=logits,
+                candidate_hidden=hidden,
+                candidate_captures=self._named_fixed_m4_captures(captures_flat),
+                candidate_state=list(state_out),
+                committed_count=committed_count,
+                dispatch_kind="compiled",
+            )
+
+        if not donate and boundary in ("both", "post"):
+            mx.async_eval(*outputs)
+            self._held_state_refs.clear()
+        elif not donate:
+            self._held_state_refs.append(state_in)
+            if len(self._held_state_refs) > 3:
+                self._held_state_refs.pop(0)
+
+        state_pos = 0
+        for kind, entry, n_leaves in dispatch["state_plan"]:
+            if kind == VERIFY_SPEC_KIND_QSA:
+                entry.kv.cache[0] = state_out[state_pos]
+                entry.kv.cache[1] = state_out[state_pos + 1]
+                entry.kv.cache[2] = state_out[state_pos + 2]
+                entry.raw_keys = state_out[state_pos + 3]
+                entry.pooled = state_out[state_pos + 4]
+                for slot in range(len(entry.kv.rollback_state)):
+                    entry.kv.rollback_state[slot] = None
+            else:
+                for slot in range(n_leaves):
+                    entry.cache[slot] = state_out[state_pos + slot]
+            state_pos += n_leaves
+
+        for entry, start, count in dispatch["capture_plan"]:
+            entry._mtplx_verify_rows = tuple(captures_flat[start : start + 6])
+            if count > 6:
+                entry._mtplx_verify_ple = tuple(
+                    captures_flat[start + 6 : start + count]
+                )
+
+        if donate:
+            state_in = None
+            self._held_state_refs.clear()
+            mx.async_eval(*outputs)
+        host_split["encode"] += clock() - t3
+
+        if _FIXED_M4_DONATION_PROBE:
+            self._probe_fixed_m4_donation(dispatch)
+
+        # Route Tape receipt (main contract): the installed replay is a
+        # compiled dispatch, so last_dispatch_route() reports it as such.
+        self.last_dispatch_kind = "compiled"
+        self.last_fallback_reason = None
+        self.last_fallback_transition = False
+        self.stats["compiled_calls"] += 1
+        self.stats["buckets"]["0"] = self.stats["buckets"].get("0", 0) + 1
+        return logits, hidden, {}
+
+    def _probe_fixed_m4_donation(self, dispatch) -> None:
+        """MTPLX_FIXED_M4_DONATION_PROBE=1: did the verify write land in place?
+
+        A measuring instrument (it forces a sync, so it is never on in a
+        product lane).  After each installed replay it reads the device
+        address of the first QSA layer's key bank.  A donated buffer keeps its
+        address from one round to the next; a bank that was copied into a
+        fresh allocation moves.  ``fixed_m4_kv_bank_moves`` over
+        ``fixed_m4_kv_bank_probes`` is the share of rounds that paid a whole
+        -bank copy.
+        """
+
+        import numpy as np
+
+        entry = dispatch["qsa_entries"][0]
+        keys = entry.kv.cache[0]
+        mx.eval(keys)
+        address = int(
+            np.asarray(keys.view(mx.uint16), copy=False).__array_interface__["data"][0]
+        )
+        previous = dispatch.get("_probe_key_address")
+        dispatch["_probe_key_address"] = address
+        self.stats["fixed_m4_kv_bank_probes"] = (
+            int(self.stats.get("fixed_m4_kv_bank_probes", 0)) + 1
+        )
+        if previous is not None and previous != address:
+            self.stats["fixed_m4_kv_bank_moves"] = (
+                int(self.stats.get("fixed_m4_kv_bank_moves", 0)) + 1
+            )
+        if _FIXED_M4_DONATION_PROBE_ALL:
+            self._probe_fixed_m4_donation_all_leaves(dispatch)
+
+    def _probe_fixed_m4_donation_all_leaves(self, dispatch) -> None:
+        """MTPLX_FIXED_M4_DONATION_PROBE=all: which state leaves move per round?
+
+        The first-key-bank probe above cleared one leaf of one layer.  Every
+        other leaf the replay owns (values, the third KV leaf, raw keys, the
+        pooled bank, the GDN state) can still lose donation on its own, and a
+        context-sized leaf that is copied every round is a cost that grows
+        with the prompt.  Per leaf class this records how many rounds saw a
+        new device address and how many bytes those rounds re-wrote.
+        """
+
+        import numpy as np
+
+        names = ("kv0", "kv1", "kv2", "raw_keys", "pooled")
+        leaves: list[tuple[str, Any]] = []
+        for kind, entry, n_leaves in dispatch["state_plan"]:
+            if kind == VERIFY_SPEC_KIND_QSA:
+                leaves.extend(
+                    zip(
+                        names,
+                        (
+                            entry.kv.cache[0],
+                            entry.kv.cache[1],
+                            entry.kv.cache[2],
+                            entry.raw_keys,
+                            entry.pooled,
+                        ),
+                    )
+                )
+            else:
+                leaves.extend(("gdn", entry.cache[slot]) for slot in range(n_leaves))
+        mx.eval([leaf for _name, leaf in leaves if leaf is not None])
+        previous = dispatch.get("_probe_leaf_addresses")
+        current: list[int | None] = []
+        moves = self.stats.setdefault("fixed_m4_leaf_moves", {})
+        moved_bytes = self.stats.setdefault("fixed_m4_leaf_moved_bytes", {})
+        for index, (name, leaf) in enumerate(leaves):
+            # Scalars (the logical offset) are rebuilt every round by design
+            # and cannot be viewed as bytes; only buffers are of interest.
+            if leaf is None or leaf.ndim == 0 or leaf.nbytes < 4096:
+                current.append(None)
+                continue
+            try:
+                flat = leaf.view(mx.uint8) if leaf.dtype != mx.uint8 else leaf
+                address = int(
+                    np.asarray(flat, copy=False).__array_interface__["data"][0]
+                )
+            except Exception as exc:  # noqa: BLE001 - an instrument never fails a round
+                self.stats["fixed_m4_leaf_probe_error"] = f"{name}: {exc}"
+                current.append(None)
+                continue
+            current.append(address)
+            if (
+                previous is not None
+                and index < len(previous)
+                and previous[index] is not None
+                and previous[index] != address
+            ):
+                moves[name] = int(moves.get(name, 0)) + 1
+                moved_bytes[name] = int(moved_bytes.get(name, 0)) + int(leaf.nbytes)
+        dispatch["_probe_leaf_addresses"] = current
+        self.stats["fixed_m4_leaf_probe_rounds"] = (
+            int(self.stats.get("fixed_m4_leaf_probe_rounds", 0)) + 1
+        )
+        self.stats["fixed_m4_leaf_count"] = len(leaves)
+
+    def forward_fixed_m4(
+        self,
+        input_ids,
+        *,
+        host_input_ids,
+        completion_tokens,
+        committed_count: int,
+        cache,
+        return_hidden: bool = True,
+        hidden_variant: str | None = None,
+    ):
+        """Run the installed physical-M4 route with host-owned n-gram inputs.
+
+        The first dispatch of the process runs under a guard
+        (``_prove_fixed_m4_dispatch``): a kernel an older GPU refuses retires
+        the lane to the eager verifier for the life of the process instead
+        of failing the request. Once proven, this is the unguarded replay.
+        """
+
+        del return_hidden
+        self.stats["calls"] += 1
+        if _FIXED_M4_LANE["retired"] is not None:
+            return self._fixed_m4_retired_forward(
+                input_ids,
+                cache=cache,
+                committed_count=committed_count,
+                hidden_variant=hidden_variant,
+            )
+        if _FIXED_M4_LANE["proven"]:
+            return self._forward_installed_fixed_m4(
+                input_ids,
+                host_input_ids,
+                completion_tokens,
+                committed_count,
+                cache,
+            )
+        return self._prove_fixed_m4_dispatch(
+            input_ids,
+            host_input_ids,
+            completion_tokens,
+            committed_count,
+            cache,
+            hidden_variant=hidden_variant,
+        )
+
+    def _fixed_m4_state_refs(self) -> list[tuple[Any, str, tuple, tuple, tuple]]:
+        """References (never copies) to every leaf the replay rebinds.
+
+        Holding them keeps MLX from donating the input buffers for this one
+        dispatch, so a failed dispatch leaves the pre-round state intact and
+        restoring it is a rebind.
+        """
+
+        dispatch = self._fixed_m4_dispatch
+        saved: list[tuple[Any, str, tuple, tuple, tuple]] = []
+        for kind, entry, n_leaves in dispatch["state_plan"]:
+            if kind == VERIFY_SPEC_KIND_QSA:
+                leaves = (
+                    entry.kv.cache[0],
+                    entry.kv.cache[1],
+                    entry.kv.cache[2],
+                    entry.raw_keys,
+                    entry.pooled,
+                )
+                rollback = tuple(entry.kv.rollback_state)
+            else:
+                leaves = tuple(entry.cache[:n_leaves])
+                rollback = ()
+            captured = (
+                getattr(entry, "_mtplx_verify_rows", _MISSING),
+                getattr(entry, "_mtplx_verify_ple", _MISSING),
+            )
+            saved.append((entry, kind, leaves, rollback, captured))
+        return saved
+
+    @staticmethod
+    def _restore_fixed_m4_state(saved: list[tuple[Any, str, tuple, tuple, tuple]]) -> None:
+        for entry, kind, leaves, rollback, captured in saved:
+            if kind == VERIFY_SPEC_KIND_QSA:
+                entry.kv.cache[0], entry.kv.cache[1], entry.kv.cache[2] = leaves[:3]
+                entry.raw_keys = leaves[3]
+                entry.pooled = leaves[4]
+                for slot, value in enumerate(rollback):
+                    entry.kv.rollback_state[slot] = value
+            else:
+                for slot, value in enumerate(leaves):
+                    entry.cache[slot] = value
+            for name, value in zip(("_mtplx_verify_rows", "_mtplx_verify_ple"), captured):
+                if value is _MISSING:
+                    if hasattr(entry, name):
+                        try:
+                            delattr(entry, name)
+                        except AttributeError:
+                            pass
+                else:
+                    setattr(entry, name, value)
+
+    def _prove_fixed_m4_dispatch(
+        self,
+        input_ids,
+        host_input_ids,
+        completion_tokens,
+        committed_count: int,
+        cache: Any,
+        *,
+        hidden_variant: str | None,
+    ):
+        """First dispatch of the process: prove the lane or retire it.
+
+        Every receipt behind the fixed-M4 kernels is an M5 Max, the lane is
+        armed by model geometry alone, and its dispatch had no try/except: a
+        kernel that an older GPU refuses to build or dispatch (the 896-thread
+        pipeline cap of issue #400 is the known shape of that failure) was a
+        failed request. The generic bank already falls back after an
+        exception streak; this lane now does the same on its first dispatch.
+
+        The round is evaluated inside the guard (the generation loop blocks
+        on these logits next anyway), with the input leaves held so nothing
+        is donated: on a failure the pre-round state is restored by rebinding
+        and the same verify window runs the eager forward, the route every
+        width other than 4 already takes through this bank.
+        """
+
+        self.reserve_fixed_m4_window(cache, committed_count=committed_count)
+        saved = self._fixed_m4_state_refs()
+        compiled_before = int(self.stats.get("compiled_calls", 0))
+        bucket_before = int(self.stats["buckets"].get("0", 0))
+        try:
+            result = self._forward_installed_fixed_m4(
+                input_ids,
+                host_input_ids,
+                completion_tokens,
+                committed_count,
+                cache,
+            )
+            mx.eval(result[0], result[1])
+        except Exception as exc:  # noqa: BLE001 - any dispatch failure retires the lane
+            self._restore_fixed_m4_state(saved)
+            self._held_state_refs.clear()
+            # The replay counts itself before the guard's blocking eval; a
+            # round that failed there was not a compiled round.
+            self.stats["compiled_calls"] = compiled_before
+            self.stats["buckets"]["0"] = bucket_before
+            retire_fixed_m4_lane(f"{type(exc).__name__}: {exc}")
+            return self._fixed_m4_retired_forward(
+                input_ids,
+                cache=cache,
+                committed_count=committed_count,
+                hidden_variant=hidden_variant,
+            )
+        _FIXED_M4_LANE["proven"] = True
+        return result
+
+    def _fixed_m4_retired_forward(
+        self,
+        input_ids,
+        *,
+        cache: Any,
+        committed_count: int | None,
+        hidden_variant: str | None,
+    ):
+        """The eager verify forward through an installed bank (lane retired)."""
+
+        self.reserve_fixed_m4_window(
+            cache,
+            committed_count=committed_count,
+            window_tokens=_decode_length(input_ids),
+        )
+        self.last_dispatch_kind = "eager"
+        self.last_fallback_reason = "fixed_m4_dispatch_retired"
+        self.last_fallback_transition = False
+        self.stats["fallback_calls"] = int(self.stats.get("fallback_calls", 0)) + 1
+        _note_demotion("fixed_m4_uncompiled_round", _FIXED_M4_RETIRED_ROUND_REASON)
+        return self._runtime_forward(
+            input_ids,
+            cache=cache,
+            return_hidden=True,
+            hidden_variant=hidden_variant,
+        )
+
+    # -- parity2 on the installed fixed-M4 lane ---------------------------------
+    #
+    # MTPLX_COMPILED_VERIFY=parity2 on this lane: the installed bank stays
+    # authoritative (the stream advances on its state) and every forward that
+    # runs over it, the compiled width-4 replay and the eager short windows
+    # alike, is replayed once more the way the EAGER VERIFIER would have run
+    # it: on a stock-cache copy of the pre-round state, in the request context
+    # the caller has open. Logits, hidden rows, captured rows and every state
+    # leaf are compared on the device; only scalars cross to the host unless
+    # a round diverges. A measuring instrument: it copies the whole QSA state
+    # every round and blocks on it, so it never runs in a product lane.
+    #
+    # The reference takes its positions from the CALLER'S scope (the
+    # generation loop opens it from the request's own splice), never from the
+    # delta this bank was handed. The two are independent on purpose: a wrong
+    # delta at the admission, or one baked into a trace, shows up as a
+    # divergence instead of being mirrored by its own reference.
+
+    def _named_fixed_m4_captures(self, captures_flat) -> dict[str, Any]:
+        named: dict[str, Any] = {}
+        pos = 0
+        for idx, names in self._extra_capture_layout:
+            for key_name in names:
+                named[f"capture[{idx}].{key_name}"] = captures_flat[pos]
+                pos += 1
+        return named
+
+    def _named_eager_captures(self, captures: Any) -> dict[str, Any]:
+        named: dict[str, Any] = {}
+        if not isinstance(captures, dict):
+            return named
+        for idx, names in self._extra_capture_layout:
+            layer_capture = captures.get(idx) or {}
+            for key_name in names:
+                named[f"capture[{idx}].{key_name}"] = layer_capture.get(key_name)
+        return named
+
+    def _fixed_m4_state_leaves(self) -> list[Any]:
+        """The installed plan's live leaves, in replay output order."""
+
+        leaves: list[Any] = []
+        for kind, entry, n_leaves in self._fixed_m4_dispatch["state_plan"]:
+            if kind == VERIFY_SPEC_KIND_QSA:
+                leaves.extend(
+                    (
+                        entry.kv.cache[0],
+                        entry.kv.cache[1],
+                        entry.kv.cache[2],
+                        entry.raw_keys,
+                        entry.pooled,
+                    )
+                )
+            else:
+                leaves.extend(entry.cache[:n_leaves])
+        return leaves
+
+    def _fixed_m4_parity2_clone(self, cache: Any) -> list[Any]:
+        """The pre-round state as the eager verifier would hold it.
+
+        Leaf copies of every entry (``_parity2_clone_cache``), with each fixed
+        QSA bank demoted to the stock ``QSACache``: a host offset, no rotary
+        delta, the stock gather. Materialized at once, because the forward
+        that follows may write the source buffers in place.
+        """
+
+        clone = self._parity2_clone_cache(cache, 0)
+        for idx, entry in enumerate(clone):
+            if isinstance(entry, TensorOffsetQSACache):
+                clone[idx] = entry.demote()
+        leaves: list[mx.array] = []
+        for entry in clone:
+            if entry is None:
+                continue
+            kv = getattr(entry, "kv", None)
+            if kv is not None:
+                leaves.extend(
+                    leaf
+                    for leaf in (kv.keys, kv.values, entry.raw_keys, entry.pooled)
+                    if isinstance(leaf, mx.array)
+                )
+            else:
+                leaves.extend(
+                    leaf for leaf in entry.cache if isinstance(leaf, mx.array)
+                )
+        if leaves:
+            mx.eval(*leaves)
+        return clone
+
+    def _fixed_m4_parity2_record(self, dispatch) -> dict[str, Any]:
+        """This request's parity receipt (``compiled_verify.fixed_m4_parity2``)."""
+
+        rope_delta = dispatch["rope_delta"]
+        return self.stats.setdefault(
+            "fixed_m4_parity2",
+            {
+                "positions": "text" if rope_delta is None else "vision_delta",
+                "rope_delta": rope_delta,
+                # Rounds compared, and how many of them differed anywhere.
+                "rounds": 0,
+                "rounds_by_width": {},
+                # A width-4 call can still run eager without host inputs.
+                # Count the dispatch that actually produced the candidate.
+                "compiled_rounds": 0,
+                "eager_rounds": 0,
+                "compiled_exact_rounds": 0,
+                "eager_exact_rounds": 0,
+                "divergent_rounds": 0,
+                "divergent_rounds_by_width": {},
+                # Rounds of an image request NOT compared, because their
+                # caller had no request scope open (see
+                # ``_fixed_m4_parity2_reference_ready``).
+                "reference_scope_missing_rounds": 0,
+                "reference_scope_missing_by_width": {},
+                "compared_leaves_per_round": 0,
+                "logits_max_abs_diff": 0.0,
+                "logits_max_kl": 0.0,
+                "hidden_max_abs_diff": 0.0,
+                "state_max_abs_diff": 0.0,
+                "capture_max_abs_diff": 0.0,
+                "kl_scope": "logits_only",
+                "state_metrics": ["max_abs_diff", "differing_elements"],
+                "round_diagnostics": [],
+                "first_divergence": None,
+            },
+        )
+
+    def _fixed_m4_parity2_reference_ready(self, dispatch, input_ids) -> bool:
+        """Whether this round has a reference it can be compared with.
+
+        The reference of an image round is the stock cache roped from the
+        REQUEST's scope, the one the generation loop opens from the splice.
+        It is read from the caller's context, here on the host in the
+        instrument (the fixed lane itself never reads it), so it cannot
+        depend on the delta under test: a wrong delta at the admission would
+        otherwise be compared with itself and pass. A caller with no scope
+        open leaves nothing independent to compare with. Its reference would
+        rotate at text positions and the round would read as divergent
+        whatever the lane did, so it is counted and not compared, and the
+        maxima below stay the maxima of real comparisons.
+        """
+
+        if dispatch["rope_delta"] is None:
+            return True
+        from .attention_context import vision_rope_state
+
+        if vision_rope_state() is not None:
+            return True
+        record = self._fixed_m4_parity2_record(dispatch)
+        width = str(_decode_length(input_ids))
+        record["reference_scope_missing_rounds"] += 1
+        record["reference_scope_missing_by_width"][width] = (
+            record["reference_scope_missing_by_width"].get(width, 0) + 1
+        )
+        return False
+
+    def _fixed_m4_parity2_round(self, dispatch, cache, input_ids, **candidate) -> None:
+        if not self._fixed_m4_parity2_reference_ready(dispatch, input_ids):
+            return
+        self._fixed_m4_parity2_compare(
+            dispatch, self._fixed_m4_parity2_clone(cache), input_ids, **candidate
+        )
+
+    def _fixed_m4_parity2_compare(
+        self,
+        dispatch,
+        clone: list[Any],
+        input_ids,
+        *,
+        compiled_aux,
+        candidate_logits,
+        candidate_hidden,
+        candidate_captures: dict[str, Any],
+        candidate_state: list[Any],
+        committed_count: int | None,
+        dispatch_kind: str,
+    ) -> None:
+        # The reference leg: the stock cache in the caller's ambient scope
+        # (``_fixed_m4_parity2_reference_ready`` checked that an image round
+        # has one).
+        with attention_phase("decode_verify"):
+            eager_logits, eager_hidden, eager_captures = self._runtime_forward(
+                input_ids,
+                cache=clone,
+                return_hidden=True,
+                hidden_variant=dispatch["hidden_variant"],
+                compiled_aux=compiled_aux,
+            )
+
+        # (name, reference leaf, candidate leaf); the two lanes may hold
+        # different capacities, but both must store and compare ALL live rows.
+        pairs: list[tuple[str, Any, Any]] = [
+            ("logits", eager_logits, candidate_logits),
+            ("hidden", eager_hidden, candidate_hidden),
+        ]
+        reference_captures = self._named_eager_captures(eager_captures)
+        for name in sorted(set(reference_captures) | set(candidate_captures)):
+            pairs.append(
+                (name, reference_captures.get(name), candidate_captures.get(name))
+            )
+        offsets: list[tuple[str, int, int]] = []
+        storage_shortfalls: dict[str, dict[str, Any]] = {}
+        pos = 0
+        for idx, kind, n_leaves in self._spec or []:
+            entry = clone[idx]
+            prefix = f"state[{idx}:{kind}]"
+            if kind == VERIFY_SPEC_KIND_QSA:
+                reference = (
+                    entry.kv.keys, entry.kv.values, None, entry.raw_keys, entry.pooled
+                )
+                reference_offset = int(entry.kv.offset)
+                candidate_offset = int(candidate_state[pos + 2].item())
+                offsets.append((f"{prefix}.2", reference_offset, candidate_offset))
+                for leaf_idx, axis in ((0, 2), (1, 2), (3, 1), (4, 1)):
+                    ref = reference[leaf_idx]
+                    cand = candidate_state[pos + leaf_idx]
+                    name = f"{prefix}.{leaf_idx}"
+                    divisor = int(entry.ratio) if leaf_idx == 4 else 1
+                    ref_rows = reference_offset // divisor
+                    cand_rows = candidate_offset // divisor
+                    if ref.shape[axis] < ref_rows or cand.shape[axis] < cand_rows:
+                        storage_shortfalls[name] = {
+                            "reason": "live_storage_shortfall",
+                            "reference_storage_rows": int(ref.shape[axis]),
+                            "reference_live_rows": ref_rows,
+                            "candidate_storage_rows": int(cand.shape[axis]),
+                            "candidate_live_rows": cand_rows,
+                        }
+                    ref_index = [slice(None)] * ref.ndim
+                    cand_index = [slice(None)] * cand.ndim
+                    ref_index[axis] = slice(0, ref_rows)
+                    cand_index[axis] = slice(0, cand_rows)
+                    pairs.append(
+                        (name, ref[tuple(ref_index)], cand[tuple(cand_index)])
+                    )
+            else:
+                for leaf_idx in range(n_leaves):
+                    pairs.append(
+                        (
+                            f"{prefix}.{leaf_idx}",
+                            entry.cache[leaf_idx],
+                            candidate_state[pos + leaf_idx],
+                        )
+                    )
+            pos += n_leaves
+
+        comparable = [
+            (name, ref, cand)
+            for name, ref, cand in pairs
+            if name not in storage_shortfalls
+            and isinstance(ref, mx.array)
+            and isinstance(cand, mx.array)
+            and ref.shape == cand.shape
+            and ref.dtype == cand.dtype
+        ]
+        # Retain scalar diagnostics for every leaf of every compared round.
+        # No cache arrays cross to the host, even when many leaves diverge.
+        measurements = {}
+        for name, ref, cand in comparable:
+            # Integer leaves must not lose differences above float32's exact
+            # integer range. The logical QSA offset is measured as a host int.
+            dtype = mx.int64 if mx.issubdtype(ref.dtype, mx.integer) else mx.float32
+            measurements[name] = (
+                mx.max(mx.abs(ref.astype(dtype) - cand.astype(dtype)))
+                if ref.size else mx.array(0.0),
+                mx.sum(ref != cand),
+            )
+        ref32 = eager_logits.astype(mx.float32)
+        cand32 = candidate_logits.astype(mx.float32)
+        log_p = ref32 - mx.logsumexp(ref32, axis=-1, keepdims=True)
+        log_q = cand32 - mx.logsumexp(cand32, axis=-1, keepdims=True)
+        max_kl = mx.max(mx.sum(mx.exp(log_p) * (log_p - log_q), axis=-1))
+        mx.eval(list(measurements.values()), max_kl)
+        leaves: dict[str, dict[str, Any]] = {}
+        for name, ref, cand in pairs:
+            if name in storage_shortfalls:
+                metric = {
+                    "max_abs_diff": None, "differing_elements": None,
+                    **storage_shortfalls[name],
+                }
+            elif name in measurements:
+                diff, count = measurements[name]
+                differing = int(count.item())
+                metric = {
+                    "max_abs_diff": float(diff.item()),
+                    "differing_elements": differing,
+                    "reason": "value_mismatch" if differing else None,
+                }
+            elif ref is None and cand is None:
+                metric = {"max_abs_diff": 0.0, "differing_elements": 0, "reason": None}
+            else:
+                if ref is None or cand is None:
+                    reason = "missing_leaf"
+                elif ref.shape != cand.shape:
+                    reason = "shape_mismatch"
+                else:
+                    reason = "dtype_mismatch"
+                metric = {
+                    "max_abs_diff": None, "differing_elements": None, "reason": reason,
+                }
+            leaves[name] = metric
+        for name, ref, cand in offsets:
+            leaves[name] = {
+                "max_abs_diff": abs(ref - cand),
+                "differing_elements": int(ref != cand),
+                "reason": "offset_mismatch" if ref != cand else None,
+            }
+        leaves["logits"]["max_kl"] = float(max_kl.item())
+        mismatched = [name for name, metric in leaves.items() if metric["reason"]]
+
+        width = str(_decode_length(input_ids))
+        record = self._fixed_m4_parity2_record(dispatch)
+        record["rounds"] += 1
+        record["rounds_by_width"][width] = record["rounds_by_width"].get(width, 0) + 1
+        record[f"{dispatch_kind}_rounds"] += 1
+        record["compared_leaves_per_round"] = len(pairs) + len(offsets)
+        context = (
+            int(dispatch["base_offset"]) + int(committed_count)
+            if committed_count is not None else None
+        )
+        record["round_diagnostics"].append({
+            "round": int(record["rounds"]), "width": int(width),
+            "dispatch_kind": dispatch_kind, "context": context, "leaves": leaves,
+        })
+        for name, metric in leaves.items():
+            family = _artifact_kind(name)
+            if family in ("logits", "hidden", "state", "capture"):
+                diff = metric["max_abs_diff"]
+                if diff is not None:
+                    key = f"{family}_max_abs_diff"
+                    record[key] = max(record[key], diff)
+        record["logits_max_kl"] = max(record["logits_max_kl"], float(max_kl.item()))
+        self.stats["parity2_calls"] += 1
+        if not mismatched:
+            record[f"{dispatch_kind}_exact_rounds"] += 1
+            return
+
+        record["divergent_rounds"] += 1
+        record["divergent_rounds_by_width"][width] = (
+            record["divergent_rounds_by_width"].get(width, 0) + 1
+        )
+        self.stats["parity2_divergent_calls"] += 1
+        if record["first_divergence"] is None:
+            report = [f"{name}: {leaves[name]}" for name in mismatched]
+            first_name = mismatched[0]
+            record["first_divergence"] = {
+                "round": int(record["rounds"]),
+                "width": int(width),
+                "context": context,
+                "leaf": first_name,
+                "reason": leaves[first_name]["reason"],
+                "artifact": _artifact_kind(first_name),
+                "mismatched_leaves": len(mismatched),
+                "report": report,
+            }
+            self.stats["parity2_first_divergence"] = {
+                "call": int(self.stats["calls"]),
+                "context": record["first_divergence"]["context"],
+                "artifact": _artifact_kind(first_name),
+                "leaf": first_name,
+                "reason": leaves[first_name]["reason"],
+                "max_abs_diff": leaves[first_name]["max_abs_diff"],
+                "mismatched_leaves": len(mismatched),
+            }
+        if record["divergent_rounds"] <= 10:
+            print(
+                f"[parity2] fixed-M4 divergence round={record['rounds']} "
+                f"width={width} positions={record['positions']} "
+                f"leaf={mismatched[0]} mismatched_leaves={len(mismatched)} "
+                f"logits_max_abs_diff={leaves['logits']['max_abs_diff']} "
+                f"kl={float(max_kl.item()):.3e}",
+                flush=True,
+            )
 
     def forward_ar_capture(
         self,
@@ -1473,6 +3313,7 @@ class CompiledVerifyBank:
         return_hidden: bool = True,
         hidden_variant: str | None = None,
         extended_window: bool = False,
+        committed_count: int | None = None,
     ):
         """Compiled verify dispatch.
 
@@ -1491,6 +3332,64 @@ class CompiledVerifyBank:
         exactness is unaffected either way.
         """
         global _PREWARM_DONE
+        if self._fixed_m4_dispatch is not None:
+            self.stats["calls"] += 1
+            self.reserve_fixed_m4_window(
+                cache,
+                committed_count=committed_count,
+                window_tokens=_decode_length(input_ids),
+            )
+            if _decode_length(input_ids) == 4:
+                # Without host-owned n-gram inputs (any caller other than the
+                # generation loop's forward_fixed_m4 entrypoint, for example a
+                # bank-routed copy block of the same width) the installed
+                # replay cannot run. Main's bank contract is to refuse
+                # internally and take the identical runtime forward, so route
+                # the call eager and let the Route Tape show it.
+                self.last_dispatch_kind = "eager"
+                self.last_fallback_reason = "fixed_m4_host_inputs_missing"
+                self.last_fallback_transition = False
+                _note_demotion("fixed_m4_uncompiled_round", _FIXED_M4_NO_HOST_INPUTS_REASON)
+            else:
+                # Shorter adaptive windows take the normal family capture
+                # route. Not a fallback (no counter), but the Route Tape must
+                # still see that this call ran eager through the bank.
+                self.last_dispatch_kind = "eager"
+                self.last_fallback_reason = "fixed_m4_short_window"
+                self.last_fallback_transition = False
+                _note_demotion("fixed_m4_uncompiled_round", _FIXED_M4_OTHER_WIDTH_REASON)
+            # Either way the forward runs eager ON the promoted bank, where an
+            # image request rotates at the bank's own origin. parity2 checks
+            # that forward too, against the stock cache in the request scope.
+            parity2_clone = (
+                self._fixed_m4_parity2_clone(cache)
+                if self._fixed_m4_dispatch.get("parity2")
+                and return_hidden
+                and self._fixed_m4_parity2_reference_ready(
+                    self._fixed_m4_dispatch, input_ids
+                )
+                else None
+            )
+            result = self._runtime_forward(
+                input_ids,
+                cache=cache,
+                return_hidden=return_hidden,
+                hidden_variant=hidden_variant,
+            )
+            if parity2_clone is not None:
+                self._fixed_m4_parity2_compare(
+                    self._fixed_m4_dispatch,
+                    parity2_clone,
+                    input_ids,
+                    compiled_aux=None,
+                    candidate_logits=result[0],
+                    candidate_hidden=result[1],
+                    candidate_captures=self._named_eager_captures(result[2]),
+                    candidate_state=self._fixed_m4_state_leaves(),
+                    committed_count=committed_count,
+                    dispatch_kind="eager",
+                )
+            return result
         if (
             not _PREWARM_DONE
             and not self.parity
@@ -1550,6 +3449,9 @@ class CompiledVerifyBank:
                     )
                 except Exception:
                     pass
+        self.last_dispatch_kind = "compiled"
+        self.last_fallback_reason = None
+        self.last_fallback_transition = False
         self.stats["calls"] += 1
         reason = self._fallback_reason(
             input_ids, cache, return_hidden, extended_window=extended_window
@@ -1628,7 +3530,7 @@ class CompiledVerifyBank:
                 # donation. The traced body re-seeds every slot from the
                 # explicit inputs before any read, so the held refs are dead.
                 self._clear_shadow_leaf_refs()
-            key = (length, str(hidden_variant or ""), int(bucket))
+            key = self._verify_key(length, hidden_variant, bucket)
             fn = self._compiled.get(key)
             if fn is None:
                 fn = self._shared_or_new_verify_step(key, length, hidden_variant)
@@ -1642,9 +3544,24 @@ class CompiledVerifyBank:
                     hidden_variant=hidden_variant,
                     reason="empty_state_leaf",
                 )
+            compiled_aux = (
+                self._prepare_compiled_aux(input_ids, cache)
+                if self._prepare_compiled_aux is not None
+                else None
+            )
             if boundary in ("both", "pre"):
-                mx.async_eval(*state_in)
-            outputs = fn(input_ids, *state_in)
+                mx.async_eval(
+                    *((compiled_aux,) if compiled_aux is not None else ()),
+                    *state_in,
+                )
+            # Same positional contract as the installed replay: ids, the
+            # auxiliary when the runtime prepares one, the rotary delta of an
+            # image request, the state leaves.
+            outputs = (
+                fn(input_ids, compiled_aux, *self._rope_args(), *state_in)
+                if compiled_aux is not None
+                else fn(input_ids, *self._rope_args(), *state_in)
+            )
             logits, hidden, captures_flat, state_out = self._unpack_outputs(outputs)
             if donate:
                 # A2.1 commit-first ownership handoff — commit + schedule
@@ -1695,6 +3612,7 @@ class CompiledVerifyBank:
                 input_ids,
                 cache=cache,
                 hidden_variant=hidden_variant,
+                compiled_aux=compiled_aux,
                 state_in=state_in,
                 compiled_logits=logits,
                 compiled_hidden=hidden,
@@ -1706,6 +3624,7 @@ class CompiledVerifyBank:
                 input_ids,
                 cache=cache,
                 hidden_variant=hidden_variant,
+                compiled_aux=compiled_aux,
                 bucket=int(bucket),
                 compiled_logits=logits,
                 compiled_hidden=hidden,
@@ -1713,6 +3632,8 @@ class CompiledVerifyBank:
                 compiled_state_out=state_out,
             )
         self._mirror_commit(cache, state_out)
+        if self._commit_compiled_captures is not None:
+            self._commit_compiled_captures(cache, captures)
         if donate:
             # A2.1 commit-first ownership handoff: the real cache is already
             # rebound to the output leaves, so dropping the dispatcher's
@@ -1867,7 +3788,7 @@ class CompiledVerifyBank:
                 continue
             try:
                 self._apply_bucket(cache, bucket)
-                key = (length, variant_key, int(bucket))
+                key = self._verify_key(length, hidden_variant, bucket)
                 fn = self._compiled.get(key)
                 if fn is None:
                     # Shared-registry compile (F6): a bare per-bank
@@ -1879,7 +3800,7 @@ class CompiledVerifyBank:
                     fn = self._shared_or_new_verify_step(key, length, hidden_variant)
                     self._compiled[key] = fn
                 bucket_started = time.perf_counter()
-                outputs = fn(input_ids, *state_in)
+                outputs = fn(input_ids, *self._rope_args(), *state_in)
                 # Synchronous eval: the compile cost is paid HERE, and no
                 # graph is left pending, so no held-reference bookkeeping
                 # is needed. Outputs are dropped, never committed.
@@ -1974,13 +3895,13 @@ class CompiledVerifyBank:
                 if state_in is None:
                     report["skipped"].append(f"m{length}:empty_state_leaf")
                     continue
-                key = (length, variant_key, int(bucket))
+                key = self._verify_key(length, hidden_variant, bucket)
                 fn = self._compiled.get(key)
                 if fn is None:
                     fn = self._shared_or_new_verify_step(key, length, hidden_variant)
                     self._compiled[key] = fn
                 length_started = time.perf_counter()
-                outputs = fn(probe, *state_in)
+                outputs = fn(probe, *self._rope_args(), *state_in)
                 mx.eval(*outputs)
                 report["lengths"].append(
                     {
@@ -2060,7 +3981,10 @@ class CompiledVerifyBank:
             TensorOffsetVllmMetalPagedKVCache = None
         count = 0
         for idx, entry in enumerate(cache or []):
-            if isinstance(entry, TensorOffsetKVCache):
+            if isinstance(entry, TensorOffsetQSACache):
+                cache[idx] = entry.demote()
+                count += 1
+            elif isinstance(entry, TensorOffsetKVCache):
                 cache[idx] = entry.demote()
                 count += 1
             elif TensorOffsetVllmMetalPagedKVCache is not None and isinstance(
@@ -2104,8 +4028,43 @@ class CompiledVerifyBank:
         data["compiled_entry_count"] = len(self._compiled)
         data["compiled_keys"] = [
             f"m{length}:{variant or 'default'}:b{bucket}"
-            for length, variant, bucket in sorted(self._compiled)
+            + (":rope_delta" if rope_delta_input else "")
+            for length, variant, bucket, rope_delta_input in sorted(self._compiled)
         ]
+        # The generic lane's own receipt: an image request replays the trace
+        # that takes the rotary delta as an input; a text request the text
+        # trace. (The fixed-M4 lane repeats it under ``fixed_m4`` below.)
+        data["rope_delta_input"] = self._rope_delta is not None
+        data["rope_delta"] = self._rope_delta_value
+        parity2 = self.stats.get("parity2")
+        if isinstance(parity2, dict):
+            data["parity2"] = {
+                key: (dict(value) if isinstance(value, dict) else value)
+                for key, value in parity2.items()
+            }
+        dispatch = self._fixed_m4_dispatch
+        if dispatch is not None:
+            data["fixed_m4"] = {
+                "installed": True,
+                "aux_route": dispatch["aux_route"],
+                "aux_inputs": dispatch["aux_inputs"],
+                "kv_gather": dispatch["kv_gather"],
+                "boundary": dispatch["boundary"],
+                "donate": bool(dispatch["donate"]),
+                "state_leaves": int(dispatch["state_leaves"]),
+                "capture_leaves": int(dispatch["capture_leaves"]),
+                # Growth receipts: the installed bank's prompt offset, its
+                # current QSA capacity and the next grant. Read together with
+                # the fixed_m4_capacity_transitions counter they prove that a
+                # request outgrew its first grant and stayed on the lane.
+                "base_offset": int(dispatch["base_offset"]),
+                "capacity": int(dispatch["capacity"]),
+                "growth_tokens": int(dispatch["growth_tokens"]),
+                # Image requests replay the trace that takes the rotary delta
+                # as an input; text requests replay the text trace.
+                "rope_delta_input": bool(dispatch["rope_args"]),
+                "rope_delta": dispatch["rope_delta"],
+            }
         return data
 
     # -- dispatch preconditions ----------------------------------------------
@@ -2191,6 +4150,7 @@ class CompiledVerifyBank:
             initial_reserve_tokens=max(length, self.growth_reserve_tokens),
         )
         self.stats["promoted"] += promoted
+        self._stamp_rope_delta(cache)
         for entry in cache:
             if isinstance(entry, TensorOffsetKVCache) and entry.growth_after_grant:
                 # A dense leaf outgrew its first-promotion grant: every
@@ -2326,13 +4286,35 @@ class CompiledVerifyBank:
         shadow: list[Any] = [None] * len(cache)
         for idx, kind, _n in self._spec or []:
             entry = cache[idx]
-            if kind == VERIFY_SPEC_KIND_FULL_ATTN:
+            if kind == VERIFY_SPEC_KIND_QSA:
+                kv = TensorOffsetKVCache(
+                    entry.kv.cache[0],
+                    entry.kv.cache[1],
+                    entry.kv.cache[2],
+                    step=entry.kv.step,
+                )
+                twin = TensorOffsetQSACache(
+                    kv,
+                    entry.raw_keys,
+                    entry.pooled,
+                    compress_ratio=entry.ratio,
+                    rows_gather=entry.fixed_rows_gather,
+                    rows_gather_kv_m4=entry.rows_gather_kv_m4,
+                    rows_gather_enabled=entry.rows_gather_enabled,
+                    rows_gather_min_context=entry.rows_gather_min_context,
+                    fused_rows_gather_kv_m4=entry.fused_rows_gather_kv_m4,
+                    rope_delta=entry.rope_delta,
+                )
+            elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
+                # The twin carries the request's rotary origin like every
+                # other slot; the traced body re-seeds it from the delta input.
                 if isinstance(entry, TensorOffsetKVCache):
                     twin = TensorOffsetKVCache(
                         entry.cache[0],
                         entry.cache[1],
                         entry.cache[2],
                         step=entry.step,
+                        rope_delta=entry.rope_delta,
                     )
                 elif isinstance(entry, TensorOffsetQuantizedPagedKVCache):
                     twin = TensorOffsetQuantizedPagedKVCache(
@@ -2346,6 +4328,7 @@ class CompiledVerifyBank:
                         kv_quant_config=entry.kv_quant_config,
                         source_dtypes=entry.source_dtypes,
                         head_dims=entry.head_dims,
+                        rope_delta=entry.rope_delta,
                     )
                 else:
                     twin = TensorOffsetVllmMetalPagedKVCache(
@@ -2354,6 +4337,7 @@ class CompiledVerifyBank:
                         offset=entry.cache[2],
                         block_size=entry.block_size,
                         num_blocks=entry.num_blocks,
+                        rope_delta=entry.rope_delta,
                     )
             else:
                 twin = type(entry)(len(entry.cache))
@@ -2384,14 +4368,22 @@ class CompiledVerifyBank:
         request's containers.
         """
 
+        rope_delta_input = bool(key[3])
         if not _env_enabled("MTPLX_COMPILED_VERIFY_SHARED_TRACES", default=True):
-            return mx.compile(self._make_verify_step(length, hidden_variant))
+            return mx.compile(
+                self._make_verify_step(
+                    length, hidden_variant, rope_delta_input=rope_delta_input
+                )
+            )
         spec_sig = tuple(self._spec or [])
         from .attention_context import exact_verify_required
 
         global_key = (
             id(self.runtime),
             self.capture_backend,
+            self._capture_layout_override,
+            self._extra_capture_layout,
+            self._prepare_compiled_aux is not None,
             spec_sig,
             int(length),
             str(hidden_variant or ""),
@@ -2402,6 +4394,11 @@ class CompiledVerifyBank:
             # vice versa. Without this key a t=0.6 request's shared trace
             # would silently serve a t=0 request with non-exact kernels.
             bool(exact_verify_required()),
+            # Input-signature dimension: an image request's step takes the
+            # rotary delta as one more graph input. The VALUE never keys
+            # anything, so every image request of the process shares one
+            # trace whatever its delta, and text requests keep theirs.
+            rope_delta_input,
         )
         entry = _SHARED_VERIFY_STEPS.get(global_key)
         if entry is not None:
@@ -2409,14 +4406,31 @@ class CompiledVerifyBank:
             # id() can be recycled after a model swap frees the old runtime;
             # a stale callable would replay graphs bound to freed weights.
             if runtime_ref() is self.runtime:
-                host["bank"] = self
+                host["bank_ref"] = weakref.ref(self)
                 return fn
             _SHARED_VERIFY_STEPS.pop(global_key, None)
-        host = {"bank": self}
+        # Programs may outlive requests. Keeping the bank here also keeps its
+        # shadow KV and traced state alive after the request/session is gone.
+        # The dispatch owns the bank; the process cache owns only the program.
+        host = {"bank_ref": weakref.ref(self)}
         fn = mx.compile(
-            self._make_verify_step(length, hidden_variant, trace_host=host)
+            self._make_verify_step(
+                length,
+                hidden_variant,
+                trace_host=host,
+                rope_delta_input=rope_delta_input,
+            )
         )
-        _SHARED_VERIFY_STEPS[global_key] = (fn, host, weakref.ref(self.runtime))
+        def release_program(reference, *, key=global_key):
+            # Compiled graphs may hold weight arrays even after their Python
+            # runtime is gone. Drop them at unload, not only on id() reuse.
+            entry = _SHARED_VERIFY_STEPS.get(key)
+            if entry is not None and entry[2] is reference:
+                _SHARED_VERIFY_STEPS.pop(key, None)
+
+        _SHARED_VERIFY_STEPS[global_key] = (
+            fn, host, weakref.ref(self.runtime, release_program)
+        )
         return fn
 
     def _make_verify_step(
@@ -2424,19 +4438,44 @@ class CompiledVerifyBank:
         length: int,
         hidden_variant: str | None,
         trace_host: dict[str, Any] | None = None,
+        rope_delta_input: bool = False,
     ):
+        """The pure verify step: ``(input_ids, [aux], [rope_delta], *state)``.
+
+        ``rope_delta_input`` adds the rotary delta of an image request as a
+        graph input, after the auxiliary and before the state leaves. It must
+        be an input: a delta closed over as a Python value would be folded
+        into the trace and replayed, stale, for the next image request.
+        """
+
         spec = list(self._spec or [])
+        if rope_delta_input and not any(
+            kind in (VERIFY_SPEC_KIND_QSA, VERIFY_SPEC_KIND_FULL_ATTN)
+            for _idx, kind, _n in spec
+        ):
+            raise ValueError(
+                "rope_delta has no consumer: only fixed QSA banks and "
+                "full-attention tensor-offset adapters carry a rotary origin"
+            )
         layout = self._capture_layout()
-        bank = self
-        static_host = {"bank": self}
+        static_host = {"bank_ref": weakref.ref(self)}
         host = trace_host if trace_host is not None else static_host
 
-        del bank
-
-        def verify_step(input_ids, *state_in):
+        def verify_step(input_ids, *args):
             # Python body executes at trace time only; replays skip it.
-            live = host["bank"]
+            live = host["bank_ref"]()
+            if live is None:
+                raise RuntimeError("compiled verifier traced without a live request bank")
             shadow = live._shadow
+            if live._prepare_compiled_aux is not None:
+                compiled_aux, *state_in = args
+            else:
+                compiled_aux = None
+                state_in = args
+            if rope_delta_input:
+                rope_delta, *state_in = state_in
+            else:
+                rope_delta = None
             live.stats["traces"] += 1
             if _decode_length(input_ids) != length:
                 raise ValueError("compiled verify length mismatch")
@@ -2446,14 +4485,30 @@ class CompiledVerifyBank:
             pos = 0
             for idx, kind, n_leaves in spec:
                 entry = shadow[idx]
-                if kind == VERIFY_SPEC_KIND_FULL_ATTN:
+                if kind == VERIFY_SPEC_KIND_QSA:
+                    entry.kv.cache[0] = state_in[pos]
+                    entry.kv.cache[1] = state_in[pos + 1]
+                    entry.kv.cache[2] = state_in[pos + 2]
+                    entry.raw_keys = state_in[pos + 3]
+                    entry.pooled = state_in[pos + 4]
+                    for slot in range(len(entry.kv.rollback_state)):
+                        entry.kv.rollback_state[slot] = None
+                    # The rotary origin is re-seeded like every other leaf:
+                    # the traced input for an image request, None on the text
+                    # trace, never whatever the twin held before.
+                    entry.rope_delta = rope_delta
+                elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
                     for slot in range(n_leaves):
                         entry.cache[slot] = state_in[pos + slot]
                     for slot in range(len(entry.rollback_state)):
                         entry.rollback_state[slot] = None
+                    # The rotary origin of a dense adapter is re-seeded the
+                    # same way: the traced delta input, or None on the text
+                    # trace.
+                    entry.rope_delta = rope_delta
                 else:
-                    entry.cache[0] = state_in[pos]
-                    entry.cache[1] = state_in[pos + 1]
+                    for slot in range(n_leaves):
+                        entry.cache[slot] = state_in[pos + slot]
                 pos += n_leaves
             # (2) The existing runtime forward, on shadow containers only.
             with attention_phase("decode_verify"):
@@ -2462,6 +4517,7 @@ class CompiledVerifyBank:
                     cache=shadow,
                     return_hidden=True,
                     hidden_variant=hidden_variant,
+                    compiled_aux=compiled_aux,
                 )
             logits, hidden, captures = result
             # (3) Read every leaf back out and return it explicitly.
@@ -2472,18 +4528,26 @@ class CompiledVerifyBank:
                 layer_capture = captures[idx]
                 for key_name in layout:
                     captures_flat.append(layer_capture[key_name])
+            for idx, names in live._extra_capture_layout:
+                layer_capture = captures[idx]
+                for key_name in names:
+                    captures_flat.append(layer_capture[key_name])
             state_out: list[Any] = []
             for idx, kind, _n in spec:
                 entry = shadow[idx]
-                if kind == VERIFY_SPEC_KIND_FULL_ATTN:
+                if kind == VERIFY_SPEC_KIND_QSA:
+                    state_out.extend(entry.state_leaves)
+                elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
                     state_out.extend(entry.cache[slot] for slot in range(_n))
                 else:
-                    state_out.extend((entry.cache[0], entry.cache[1]))
+                    state_out.extend(entry.cache[slot] for slot in range(_n))
             return (logits, hidden, *captures_flat, *state_out)
 
         return verify_step
 
     def _capture_layout(self) -> tuple[str, ...]:
+        if self._capture_layout_override is not None:
+            return self._capture_layout_override
         if self.capture_backend == "linear_gdn_from_conv_tape":
             return TAPE_CAPTURE_KEYS
         return STANDARD_CAPTURE_KEYS
@@ -2494,6 +4558,7 @@ class CompiledVerifyBank:
         n_captures = sum(
             len(layout) for _idx, kind, _n in spec if kind == VERIFY_SPEC_KIND_GDN
         )
+        n_captures += sum(len(names) for _idx, names in self._extra_capture_layout)
         n_state = sum(n for _idx, _kind, n in spec)
         expected = 2 + n_captures + n_state
         if len(outputs) != expected:
@@ -2521,6 +4586,11 @@ class CompiledVerifyBank:
             if self.capture_backend == "linear_gdn_from_conv_tape":
                 layer_capture["gdn_meta"] = self._gdn_meta(idx)
             captures[idx] = layer_capture
+        for idx, names in self._extra_capture_layout:
+            layer_capture = captures.setdefault(idx, {})
+            for key_name in names:
+                layer_capture[key_name] = captures_flat[pos]
+                pos += 1
         return captures
 
     def _gdn_meta(self, layer_idx: int) -> dict[str, int] | None:
@@ -2546,10 +4616,12 @@ class CompiledVerifyBank:
         leaves: list[Any] = []
         for idx, kind, _n in self._spec or []:
             entry = cache[idx]
-            if kind == VERIFY_SPEC_KIND_FULL_ATTN:
+            if kind == VERIFY_SPEC_KIND_QSA:
+                layer_leaves = tuple(entry.state_leaves)
+            elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
                 layer_leaves = tuple(entry.cache[slot] for slot in range(_n))
             else:
-                layer_leaves = (entry.cache[0], entry.cache[1])
+                layer_leaves = tuple(entry.cache[slot] for slot in range(_n))
             if any(leaf is None for leaf in layer_leaves):
                 return None
             leaves.extend(layer_leaves)
@@ -2559,7 +4631,15 @@ class CompiledVerifyBank:
         pos = 0
         for idx, kind, n_leaves in self._spec or []:
             entry = cache[idx]
-            if kind == VERIFY_SPEC_KIND_FULL_ATTN:
+            if kind == VERIFY_SPEC_KIND_QSA:
+                entry.kv.cache[0] = state_out[pos]
+                entry.kv.cache[1] = state_out[pos + 1]
+                entry.kv.cache[2] = state_out[pos + 2]
+                entry.raw_keys = state_out[pos + 3]
+                entry.pooled = state_out[pos + 4]
+                for slot in range(len(entry.kv.rollback_state)):
+                    entry.kv.rollback_state[slot] = None
+            elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
                 for slot in range(n_leaves):
                     entry.cache[slot] = state_out[pos + slot]
                 # Cleared rollback forces trim() onto the offset-only branch,
@@ -2567,8 +4647,8 @@ class CompiledVerifyBank:
                 for slot in range(len(entry.rollback_state)):
                     entry.rollback_state[slot] = None
             else:
-                entry.cache[0] = state_out[pos]
-                entry.cache[1] = state_out[pos + 1]
+                for slot in range(n_leaves):
+                    entry.cache[slot] = state_out[pos + slot]
             pos += n_leaves
 
     def _clear_shadow_leaf_refs(self) -> None:
@@ -2585,6 +4665,17 @@ class CompiledVerifyBank:
         for entry in self._shadow or []:
             if entry is None:
                 continue
+            if isinstance(entry, TensorOffsetQSACache):
+                for slot in range(len(entry.kv.cache)):
+                    entry.kv.cache[slot] = None
+                for slot in range(len(entry.kv.rollback_state)):
+                    entry.kv.rollback_state[slot] = None
+                entry.raw_keys = None
+                entry.pooled = None
+                # A twin holds the traced delta after a trace; like the other
+                # slots it is re-seeded from the inputs before any read.
+                entry.rope_delta = None
+                continue
             cache_list = getattr(entry, "cache", None)
             if isinstance(cache_list, list):
                 for slot in range(len(cache_list)):
@@ -2593,6 +4684,8 @@ class CompiledVerifyBank:
             if isinstance(rollback, list):
                 for slot in range(len(rollback)):
                     rollback[slot] = None
+            if isinstance(entry, RotaryOrigin):
+                entry.rope_delta = None
 
     # -- eager paths ---------------------------------------------------------------
 
@@ -2603,7 +4696,13 @@ class CompiledVerifyBank:
         cache,
         return_hidden: bool,
         hidden_variant: str | None,
+        compiled_aux=None,
     ):
+        kwargs = (
+            {"compiled_aux": compiled_aux}
+            if self._runtime_accepts_compiled_aux
+            else {}
+        )
         if self._capture_accepts_backend:
             return self.runtime.forward_ar_capture(
                 input_ids,
@@ -2611,12 +4710,14 @@ class CompiledVerifyBank:
                 return_hidden=return_hidden,
                 hidden_variant=hidden_variant,
                 capture_backend=self.capture_backend,
+                **kwargs,
             )
         return self.runtime.forward_ar_capture(
             input_ids,
             cache=cache,
             return_hidden=return_hidden,
             hidden_variant=hidden_variant,
+            **kwargs,
         )
 
     def _fallback(
@@ -2628,10 +4729,26 @@ class CompiledVerifyBank:
         hidden_variant: str | None,
         reason: str,
     ):
-        self.stats["fallback_calls"] += 1
-        self.stats["fallback_reasons"][reason] = (
-            self.stats["fallback_reasons"].get(reason, 0) + 1
+        if self.strict_no_fallback:
+            raise RuntimeError(f"qwen4 fixed-M4 verifier refused: {reason}")
+        _note_bank_fallback(reason)
+        self.last_dispatch_kind = "eager"
+        self.last_fallback_reason = reason
+        growth_transition = (
+            reason == "growth_budget_exhausted"
+            and not self._growth_budget_fallback_reported
         )
+        self.last_fallback_transition = growth_transition
+        self.stats["fallback_calls"] += 1
+        # Growth exhaustion is a one-way request state, not a fresh failure
+        # on every eager tail round.  Count its transition once while keeping
+        # fallback_calls as the honest per-call total.
+        if reason != "growth_budget_exhausted" or growth_transition:
+            self.stats["fallback_reasons"][reason] = (
+                self.stats["fallback_reasons"].get(reason, 0) + 1
+            )
+        if growth_transition:
+            self._growth_budget_fallback_reported = True
         return self._runtime_forward(
             input_ids,
             cache=cache,
@@ -2645,6 +4762,7 @@ class CompiledVerifyBank:
         *,
         cache,
         hidden_variant: str | None,
+        compiled_aux,
         state_in: list[Any],
         compiled_logits,
         compiled_hidden,
@@ -2659,14 +4777,17 @@ class CompiledVerifyBank:
                 cache=cache,
                 return_hidden=True,
                 hidden_variant=hidden_variant,
+                compiled_aux=compiled_aux,
             )
         eager_state = []
         for idx, kind, _n in self._spec or []:
             entry = cache[idx]
-            if kind == VERIFY_SPEC_KIND_FULL_ATTN:
+            if kind == VERIFY_SPEC_KIND_QSA:
+                eager_state.extend(entry.state_leaves)
+            elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
                 eager_state.extend(entry.cache[slot] for slot in range(_n))
             else:
-                eager_state.extend((entry.cache[0], entry.cache[1]))
+                eager_state.extend(entry.cache[slot] for slot in range(_n))
         reference = self._named_outputs(eager_logits, eager_hidden, eager_captures, eager_state)
         candidate = self._named_outputs(
             compiled_logits, compiled_hidden, compiled_captures, compiled_state_out
@@ -2683,6 +4804,7 @@ class CompiledVerifyBank:
         *,
         cache,
         hidden_variant: str | None,
+        compiled_aux,
         bucket: int,
         compiled_logits,
         compiled_hidden,
@@ -2704,39 +4826,40 @@ class CompiledVerifyBank:
         raised — so streaming continues compiled-authoritative.
         """
         self.stats["parity2_calls"] += 1
+        record = self._parity2_record()
+        width = str(_decode_length(input_ids))
+        if not self._parity2_reference_ready(record, width):
+            self._mirror_commit(cache, compiled_state_out)
+            return compiled_logits, compiled_hidden, compiled_captures
         # Seed the clone BEFORE mirror-commit: the real entries still hold the
         # pre-step leaves here (the compiled step ran purely on the shadow).
         clone = self._parity2_clone_cache(cache, bucket)
-        with attention_phase("decode_verify"):
+        with attention_phase("decode_verify"), self._parity2_reference_scope():
             eager_logits, eager_hidden, eager_captures = self._runtime_forward(
                 input_ids,
                 cache=clone,
                 return_hidden=True,
                 hidden_variant=hidden_variant,
+                compiled_aux=compiled_aux,
             )
         # Compiled is authoritative: the live stream advances on compiled state.
         self._mirror_commit(cache, compiled_state_out)
         clone_state: list[Any] = []
         for idx, kind, _n in self._spec or []:
             entry = clone[idx]
-            if kind == VERIFY_SPEC_KIND_FULL_ATTN:
+            if kind == VERIFY_SPEC_KIND_QSA:
+                clone_state.extend(entry.state_leaves)
+            elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
                 clone_state.extend(entry.cache[slot] for slot in range(_n))
             else:
-                clone_state.extend((entry.cache[0], entry.cache[1]))
+                clone_state.extend(entry.cache[slot] for slot in range(_n))
         reference = self._named_outputs(
             eager_logits, eager_hidden, eager_captures, clone_state
         )
         candidate = self._named_outputs(
             compiled_logits, compiled_hidden, compiled_captures, compiled_state_out
         )
-        # Uncapped compare so mismatched_leaves is a true count, not a preview.
-        report = compare_verify_outputs(
-            reference,
-            candidate,
-            max_report_lines=len(reference) + len(candidate) + 8,
-        )
-        if report:
-            self._record_parity2_divergence(report, reference, candidate, cache)
+        self._parity2_compare(record, width, reference, candidate, cache=cache)
         return compiled_logits, compiled_hidden, compiled_captures
 
     def _parity2_clone_cache(self, cache: Any, bucket: int) -> list[Any]:
@@ -2755,7 +4878,33 @@ class CompiledVerifyBank:
         clone: list[Any] = [None] * len(cache)
         for idx, kind, _n in self._spec or []:
             entry = cache[idx]
-            if kind == VERIFY_SPEC_KIND_FULL_ATTN:
+            if kind == VERIFY_SPEC_KIND_QSA:
+                kv = TensorOffsetKVCache(
+                    _copy_state_leaf(entry.kv.cache[0]),
+                    _copy_state_leaf(entry.kv.cache[1]),
+                    _copy_state_leaf(entry.kv.cache[2]),
+                    step=entry.kv.step,
+                )
+                twin = TensorOffsetQSACache(
+                    kv,
+                    _copy_state_leaf(entry.raw_keys),
+                    _copy_state_leaf(entry.pooled),
+                    compress_ratio=entry.ratio,
+                    rows_gather=entry.fixed_rows_gather,
+                    rows_gather_kv_m4=entry.rows_gather_kv_m4,
+                    rows_gather_enabled=entry.rows_gather_enabled,
+                    rows_gather_min_context=entry.rows_gather_min_context,
+                    fused_rows_gather_kv_m4=entry.fused_rows_gather_kv_m4,
+                    # The eager leg of the generic parity modes runs on this
+                    # fixed twin, so it rotates where the real entry does.
+                    rope_delta=entry.rope_delta,
+                )
+            elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
+                # No rotary delta on the reference leg, on purpose: the eager
+                # forward on this clone positions every row from the
+                # request's host table (``_parity2_reference_scope``), which
+                # is independent of the delta under test, on the same padded
+                # buffers the compiled step reduced over.
                 if isinstance(entry, TensorOffsetKVCache):
                     twin = TensorOffsetKVCache(
                         _copy_state_leaf(entry.cache[0]),
@@ -2791,46 +4940,213 @@ class CompiledVerifyBank:
                     twin.static_max_offset = int(bucket)
             else:
                 twin = type(entry)(len(entry.cache))
-                for slot, leaf in enumerate(entry.cache):
+                for slot, leaf in enumerate(entry.cache[:_n]):
                     twin[slot] = _copy_state_leaf(leaf)
             clone[idx] = twin
         return clone
 
-    def _record_parity2_divergence(
+    def _parity2_record(self) -> dict[str, Any]:
+        """This request's parity receipt (``compiled_verify.parity2``).
+
+        The shape the fixed-M4 lane's ``fixed_m4_parity2`` has, so one reader
+        serves both families: rounds compared, rounds that differed anywhere,
+        the largest differences, and the first divergent leaf.
+        """
+
+        return self.stats.setdefault(
+            "parity2",
+            {
+                "positions": "text" if self._rope_delta is None else "vision_delta",
+                "rope_delta": self._rope_delta_value,
+                "rounds": 0,
+                "rounds_by_width": {},
+                "divergent_rounds": 0,
+                "divergent_rounds_by_width": {},
+                # Rounds of an image request NOT compared, because their
+                # caller had no request scope open (``_parity2_reference_ready``).
+                "reference_scope_missing_rounds": 0,
+                "reference_scope_missing_by_width": {},
+                "compared_leaves_per_round": 0,
+                "logits_max_abs_diff": 0.0,
+                "logits_max_kl": 0.0,
+                "hidden_max_abs_diff": 0.0,
+                "state_max_abs_diff": 0.0,
+                "capture_max_abs_diff": 0.0,
+                "first_divergence": None,
+            },
+        )
+
+    def _parity2_reference_ready(self, record: dict[str, Any], width: str) -> bool:
+        """Whether this round has a reference independent of the delta.
+
+        A text round always has one. The reference of an image round is the
+        REQUEST's own position table, read from the caller's scope by the
+        eager leg (the dense adapter through ``_parity2_reference_scope``,
+        the Flash-Next attention through ``vision_rope_state``); the bank's
+        delta is never consulted, or a wrong delta would be compared with
+        itself and pass. A caller with no scope open leaves nothing
+        independent to compare with: the round is counted, not compared, so
+        the maxima stay the maxima of real comparisons.
+        """
+
+        if self._rope_delta is None:
+            return True
+        from .attention_context import vision_rope_state
+        from .dense_mrope import dense_mrope_state
+
+        if dense_mrope_state() is not None or vision_rope_state() is not None:
+            return True
+        record["reference_scope_missing_rounds"] += 1
+        record["reference_scope_missing_by_width"][width] = (
+            record["reference_scope_missing_by_width"].get(width, 0) + 1
+        )
+        return False
+
+    def _parity2_reference_scope(self):
+        """The eager leg of an image round positions rows from the host table.
+
+        The clone carries no rotary delta (``_parity2_clone_cache``); under
+        this scope the dense adapter resolves the clone's concrete offset
+        through the request's table, exactly as the eager route on a stock
+        cache does, on the same padded buffers the compiled step used.
+        """
+
+        if self._rope_delta is None:
+            return contextlib.nullcontext()
+        from .dense_mrope import host_positions_for_tensor_offsets
+
+        return host_positions_for_tensor_offsets()
+
+    def _parity2_compare(
         self,
-        report: list[str],
+        record: dict[str, Any],
+        width: str,
         reference: dict[str, Any],
         candidate: dict[str, Any],
+        *,
         cache: Any,
     ) -> None:
+        """Bit-for-bit on the device; the host sees only a divergence."""
+
+        names = sorted(set(reference) | set(candidate))
+        comparable: list[tuple[str, Any, Any]] = []
+        mismatched: list[str] = []
+        for name in names:
+            ref, cand = reference.get(name), candidate.get(name)
+            if ref is None and cand is None:
+                continue
+            if (
+                isinstance(ref, mx.array)
+                and isinstance(cand, mx.array)
+                and ref.shape == cand.shape
+                and ref.dtype == cand.dtype
+            ):
+                comparable.append((name, ref, cand))
+            elif not hasattr(ref, "shape") and not hasattr(cand, "shape"):
+                if ref != cand:
+                    mismatched.append(name)
+            else:
+                mismatched.append(name)
+        flags = [mx.array_equal(ref, cand) for _name, ref, cand in comparable]
+        ref32 = reference["logits"].astype(mx.float32)
+        cand32 = candidate["logits"].astype(mx.float32)
+        log_p = ref32 - mx.logsumexp(ref32, axis=-1, keepdims=True)
+        log_q = cand32 - mx.logsumexp(cand32, axis=-1, keepdims=True)
+        max_kl = mx.max(mx.sum(mx.exp(log_p) * (log_p - log_q), axis=-1))
+        logits_diff = mx.max(mx.abs(ref32 - cand32))
+        hidden_diff = mx.max(
+            mx.abs(
+                reference["hidden"].astype(mx.float32)
+                - candidate["hidden"].astype(mx.float32)
+            )
+        )
+        mx.eval(flags, max_kl, logits_diff, hidden_diff)
+        mismatched.extend(
+            name for (name, _ref, _cand), flag in zip(comparable, flags)
+            if not bool(flag.item())
+        )
+        mismatched.sort(key=names.index)
+
+        record["rounds"] += 1
+        record["rounds_by_width"][width] = record["rounds_by_width"].get(width, 0) + 1
+        record["compared_leaves_per_round"] = len(names)
+        record["logits_max_abs_diff"] = max(
+            record["logits_max_abs_diff"], float(logits_diff.item())
+        )
+        record["logits_max_kl"] = max(record["logits_max_kl"], float(max_kl.item()))
+        record["hidden_max_abs_diff"] = max(
+            record["hidden_max_abs_diff"], float(hidden_diff.item())
+        )
+        if not mismatched:
+            return
+
+        record["divergent_rounds"] += 1
+        record["divergent_rounds_by_width"][width] = (
+            record["divergent_rounds_by_width"].get(width, 0) + 1
+        )
         self.stats["parity2_divergent_calls"] += 1
+        # Size of every divergence, still on the device: one scalar per leaf.
+        sized = [
+            (
+                name,
+                mx.max(
+                    mx.abs(
+                        reference[name].astype(mx.float32)
+                        - candidate[name].astype(mx.float32)
+                    )
+                ),
+            )
+            for name in mismatched
+            if isinstance(reference.get(name), mx.array)
+            and isinstance(candidate.get(name), mx.array)
+            and reference[name].shape == candidate[name].shape
+        ]
+        mx.eval([diff for _name, diff in sized])
+        for name, diff in sized:
+            family = _artifact_kind(name)
+            if family in ("state", "capture"):
+                key = f"{family}_max_abs_diff"
+                record[key] = max(record[key], float(diff.item()))
+
         ordinal = int(self.stats["calls"])
         context = self._parity2_context_estimate(cache)
-        # Split on ": " (not ":"): state leaf names embed a colon, e.g.
-        # "state[1:fa].2: value mismatch (...)".
-        first_name = report[0].split(": ", 1)[0]
+        first_name = mismatched[0]
         artifact = _artifact_kind(first_name)
-        max_abs = _leaf_max_abs_diff(
-            reference.get(first_name), candidate.get(first_name)
-        )
-        mismatched = sum(1 for line in report if not line.startswith("... "))
-        record = {
-            "call": ordinal,
-            "context": context,
-            "artifact": artifact,
-            "leaf": first_name,
-            "max_abs_diff": max_abs,
-            "mismatched_leaves": mismatched,
-        }
+        max_abs = _leaf_max_abs_diff(reference.get(first_name), candidate.get(first_name))
+        if record["first_divergence"] is None:
+            # The readable lines cross to the host, so only the first
+            # divergent round writes them and only for its first few leaves
+            # (one K bank is hundreds of megabytes at long context).
+            detailed = mismatched[:8]
+            record["first_divergence"] = {
+                "round": int(record["rounds"]),
+                "width": int(width),
+                "context": context,
+                "leaf": first_name,
+                "artifact": artifact,
+                "mismatched_leaves": len(mismatched),
+                "report": compare_verify_outputs(
+                    {name: reference.get(name) for name in detailed},
+                    {name: candidate.get(name) for name in detailed},
+                    max_report_lines=len(detailed) + 2,
+                ),
+            }
         if self.stats["parity2_first_divergence"] is None:
-            self.stats["parity2_first_divergence"] = record
+            self.stats["parity2_first_divergence"] = {
+                "call": ordinal,
+                "context": context,
+                "artifact": artifact,
+                "leaf": first_name,
+                "max_abs_diff": max_abs,
+                "mismatched_leaves": len(mismatched),
+            }
         count = int(self.stats["parity2_divergent_calls"])
         if count <= 10:
             max_abs_text = "n/a" if max_abs is None else f"{max_abs:.3e}"
             print(
                 f"[parity2] divergence call={ordinal} context={context} "
                 f"artifact={artifact} leaf={first_name} "
-                f"max_abs_diff={max_abs_text} mismatched_leaves={mismatched}",
+                f"max_abs_diff={max_abs_text} mismatched_leaves={len(mismatched)}",
                 flush=True,
             )
             if count == 10:

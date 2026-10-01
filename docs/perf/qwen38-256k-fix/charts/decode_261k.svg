@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="500" viewBox="0 0 900 500" font-family="-apple-system,Helvetica,Arial,sans-serif">
+<rect width="900" height="500" fill="#ffffff"/>
+<text x="450" y="26" text-anchor="middle" font-size="17" font-weight="600" fill="#111">Qwen3.8 Flash-Next: decode tok/s at 261,120 tokens</text>
+<text x="450" y="46" text-anchor="middle" font-size="12" fill="#555">A/C/D/E fail in the first decode step (void); this PR (F) completes</text>
+<line x1="70" y1="380" x2="870" y2="380" stroke="#333" stroke-width="1"/>
+<line x1="70" y1="70" x2="70" y2="380" stroke="#333" stroke-width="1"/>
+<line x1="70" y1="380.0" x2="870" y2="380.0" stroke="#eee" stroke-width="1"/>
+<text x="62" y="384.0" text-anchor="end" font-size="11" fill="#555">0</text>
+<line x1="70" y1="318.0" x2="870" y2="318.0" stroke="#eee" stroke-width="1"/>
+<text x="62" y="322.0" text-anchor="end" font-size="11" fill="#555">14</text>
+<line x1="70" y1="256.0" x2="870" y2="256.0" stroke="#eee" stroke-width="1"/>
+<text x="62" y="260.0" text-anchor="end" font-size="11" fill="#555">29</text>
+<line x1="70" y1="194.0" x2="870" y2="194.0" stroke="#eee" stroke-width="1"/>
+<text x="62" y="198.0" text-anchor="end" font-size="11" fill="#555">43</text>
+<line x1="70" y1="132.0" x2="870" y2="132.0" stroke="#eee" stroke-width="1"/>
+<text x="62" y="136.0" text-anchor="end" font-size="11" fill="#555">58</text>
+<line x1="70" y1="70.0" x2="870" y2="70.0" stroke="#eee" stroke-width="1"/>
+<text x="62" y="74.0" text-anchor="end" font-size="11" fill="#555">72</text>
+<text x="150.0" y="398" text-anchor="middle" font-size="12" font-weight="600" fill="#333">A</text>
+<rect x="110.0" y="349.0" width="80.0" height="31.0" fill="#f7eaea" stroke="#b00" stroke-dasharray="4 3"/>
+<text x="150.0" y="343.0" text-anchor="middle" font-size="12" font-weight="600" fill="#b00">void (OOM)</text>
+<text x="310.0" y="398" text-anchor="middle" font-size="12" font-weight="600" fill="#333">C</text>
+<rect x="270.0" y="349.0" width="80.0" height="31.0" fill="#f7eaea" stroke="#b00" stroke-dasharray="4 3"/>
+<text x="310.0" y="343.0" text-anchor="middle" font-size="12" font-weight="600" fill="#b00">void (OOM)</text>
+<text x="470.0" y="398" text-anchor="middle" font-size="12" font-weight="600" fill="#333">D</text>
+<rect x="430.0" y="349.0" width="80.0" height="31.0" fill="#f7eaea" stroke="#b00" stroke-dasharray="4 3"/>
+<text x="470.0" y="343.0" text-anchor="middle" font-size="12" font-weight="600" fill="#b00">void (OOM)</text>
+<text x="630.0" y="398" text-anchor="middle" font-size="12" font-weight="600" fill="#333">E</text>
+<rect x="590.0" y="349.0" width="80.0" height="31.0" fill="#f7eaea" stroke="#b00" stroke-dasharray="4 3"/>
+<text x="630.0" y="343.0" text-anchor="middle" font-size="12" font-weight="600" fill="#b00">void (OOM)</text>
+<text x="790.0" y="398" text-anchor="middle" font-size="12" font-weight="600" fill="#333">F</text>
+<rect x="750.0" y="110.4" width="80.0" height="269.6" fill="#009E73" opacity="0.88"/>
+<line x1="790.0" y1="136.2" x2="790.0" y2="110.4" stroke="#222" stroke-width="1.5"/>
+<line x1="784.0" y1="136.2" x2="796.0" y2="136.2" stroke="#222" stroke-width="1.5"/>
+<line x1="784.0" y1="110.4" x2="796.0" y2="110.4" stroke="#222" stroke-width="1.5"/>
+<text x="790.0" y="104.4" text-anchor="middle" font-size="11" fill="#222">62.84</text>
+<text x="70" y="484" font-size="10.5" fill="#777">Decode (tok/s) at 261,120 tokens. Point = fastest seed; band = min-max. A/C/D/E from the 261K OOM receipts; F = this PR.</text>
+</svg>

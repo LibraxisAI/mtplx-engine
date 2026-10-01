@@ -3,7 +3,6 @@ from __future__ import annotations
 import io
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -251,6 +250,32 @@ def test_check_model_updates_skips_symlink_overlays(tmp_path, monkeypatch):
     assert [row.repo_id for row in rows] == ["owner/real"]
 
 
+def test_check_model_updates_retains_duplicate_root_identity(tmp_path):
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    marker = {"repo_id": "owner/pack", "resolved_sha": "sha-1"}
+    first = _write_pack(primary, "owner--pack", marker)
+    second = _write_pack(secondary, "owner--pack", marker)
+    manifest = {
+        "schema": 1,
+        "models": {"owner/pack": {"revision": "sha-1"}},
+    }
+
+    rows = check_model_updates(
+        cache_dir=primary,
+        search_dirs=[secondary],
+        manifest=manifest,
+    )
+
+    assert [row.path for row in rows] == [str(first), str(second)]
+    assert [row.root for row in rows] == [
+        str(primary.resolve()),
+        str(secondary.resolve()),
+    ]
+    assert [row.root_index for row in rows] == [0, 1]
+    assert [row.is_primary for row in rows] == [True, False]
+
+
 def test_check_model_updates_legacy_cache_size_diff(tmp_path, monkeypatch):
     # Pre-2.9 caches have no provenance marker at all. A size mismatch (or a
     # file missing locally — the mtp.safetensors trap) proves staleness and
@@ -320,31 +345,43 @@ def test_diff_against_local_dir_unsized_remote_still_flags(tmp_path):
     assert update_bytes is None  # unsized listing: flag the file, skip the sum
 
 
+def test_diff_against_local_dir_rejects_unsafe_repo_filename(tmp_path):
+    pack = tmp_path / "pack"
+    pack.mkdir()
+
+    with pytest.raises(RuntimeError, match="unsafe file path"):
+        model_updates._diff_against_local_dir(
+            pack, {"../escape": {"size": 1, "blob_id": "bad"}}
+        )
+
+
 # --- update_cached_model --------------------------------------------------
 
 
-def test_update_cached_model_pins_manifest_revision_and_unlinks_same_size(
-    tmp_path, monkeypatch
-):
+def _write_same_size_pack(root: Path) -> Path:
+    """A complete pack whose marker says same-size.json (4 bytes), a
+    tokenizer.json that will grow (2 bytes) and the weights were pulled at
+    sha-old."""
     pack = _write_pack(
-        tmp_path,
+        root,
         "owner--pack",
         {
             "repo_id": "owner/pack",
             "resolved_sha": "sha-old",
             "files": {
                 "same-size.json": {"size": 4, "blob_id": "aaa"},
-                "grows.bin": {"size": 2, "blob_id": "bbb"},
+                "tokenizer.json": {"size": 2, "blob_id": "bbb"},
+                "model.safetensors": {"size": 8, "blob_id": "www"},
             },
         },
     )
     (pack / "same-size.json").write_text("old!", encoding="utf-8")
-    (pack / "grows.bin").write_bytes(b"xx")
+    (pack / "tokenizer.json").write_bytes(b"xx")
+    (pack / "model.safetensors").write_bytes(b"w" * 8)
+    return pack
 
-    manifest = {
-        "schema": 1,
-        "models": {"owner/pack": {"revision": "sha-new"}},
-    }
+
+def _same_size_remote(monkeypatch) -> None:
     monkeypatch.setattr(
         model_updates,
         "_query_repo_snapshot",
@@ -352,30 +389,152 @@ def test_update_cached_model_pins_manifest_revision_and_unlinks_same_size(
             "sha-new",
             {
                 "same-size.json": {"size": 4, "blob_id": "ccc"},
-                "grows.bin": {"size": 9, "blob_id": "ddd"},
+                "tokenizer.json": {"size": 9, "blob_id": "ddd"},
+                "model.safetensors": {"size": 8, "blob_id": "www"},
             },
         ),
     )
+
+
+_MANIFEST = {"schema": 1, "models": {"owner/pack": {"revision": "sha-new"}}}
+
+
+def test_update_cached_model_pins_manifest_revision_and_sets_same_size_aside(
+    tmp_path, monkeypatch
+):
+    pack = _write_same_size_pack(tmp_path)
+    _same_size_remote(monkeypatch)
     captured: dict = {}
 
     def fake_pull(repo_id, **kwargs):
         captured["repo_id"] = repo_id
         captured.update(kwargs)
+        # During the pull the size-identical file is out of the way (so the
+        # delta refetches it) but still on disk under its .stale name.
+        assert not (pack / "same-size.json").exists()
+        assert (pack / "same-size.json.stale").read_text(encoding="utf-8") == "old!"
+        (pack / "same-size.json").write_text("new!", encoding="utf-8")
         return {"repo_id": repo_id, "path": str(pack)}
 
     monkeypatch.setattr(model_updates, "pull_model", fake_pull)
 
-    result = update_cached_model("owner/pack", cache_dir=tmp_path, manifest=manifest)
+    result = update_cached_model("owner/pack", cache_dir=tmp_path, manifest=_MANIFEST)
 
     assert result["repo_id"] == "owner/pack"
     assert captured["revision"] == "sha-new"
     assert captured["force_sync"] is True
     # the canonical dir it resolved must be the one pull_model targets
     assert captured["destination"] == pack
-    # size-identical content change must be unlinked so the delta re-fetches it
-    assert not (pack / "same-size.json").exists()
+    # the refetched file is in place and the set-aside copy is gone
+    assert (pack / "same-size.json").read_text(encoding="utf-8") == "new!"
+    assert not (pack / "same-size.json.stale").exists()
     # size-changing files ride the ordinary pull delta untouched
-    assert (pack / "grows.bin").exists()
+    assert (pack / "tokenizer.json").exists()
+    assert not list(pack.glob("*.stale"))
+
+
+def test_update_cached_model_interrupted_pull_leaves_the_pack_complete(
+    tmp_path, monkeypatch
+):
+    """C-09: the size-identical file used to be unlinked before the download
+    started, so a Ctrl-C or dropped connection left the pack permanently
+    incomplete. It is now renamed aside and renamed back on any failure."""
+    from mtplx.hf_loader import cached_model_is_complete
+
+    pack = _write_same_size_pack(tmp_path)
+    _same_size_remote(monkeypatch)
+
+    def interrupted_pull(repo_id, **kwargs):
+        assert not (pack / "same-size.json").exists()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(model_updates, "pull_model", interrupted_pull)
+
+    with pytest.raises(KeyboardInterrupt):
+        update_cached_model("owner/pack", cache_dir=tmp_path, manifest=_MANIFEST)
+
+    assert (pack / "same-size.json").read_text(encoding="utf-8") == "old!"
+    assert not (pack / "same-size.json.stale").exists()
+    assert cached_model_is_complete(pack)
+
+    def failing_pull(repo_id, **kwargs):
+        raise RuntimeError("connection dropped")
+
+    monkeypatch.setattr(model_updates, "pull_model", failing_pull)
+    with pytest.raises(RuntimeError, match="connection dropped"):
+        update_cached_model("owner/pack", cache_dir=tmp_path, manifest=_MANIFEST)
+    assert (pack / "same-size.json").read_text(encoding="utf-8") == "old!"
+    assert cached_model_is_complete(pack)
+
+
+def test_update_cached_model_restores_files_when_pull_returns_an_incomplete_pack(
+    tmp_path, monkeypatch
+):
+    pack = _write_same_size_pack(tmp_path)
+    _same_size_remote(monkeypatch)
+
+    def broken_pull(repo_id, **kwargs):
+        # Returns as if successful but the weights are gone and the
+        # size-identical file never landed.
+        (pack / "model.safetensors").unlink()
+        return {"repo_id": repo_id, "path": str(pack)}
+
+    monkeypatch.setattr(model_updates, "pull_model", broken_pull)
+
+    with pytest.raises(RuntimeError, match="did not produce a complete model"):
+        update_cached_model("owner/pack", cache_dir=tmp_path, manifest=_MANIFEST)
+
+    assert (pack / "same-size.json").read_text(encoding="utf-8") == "old!"
+    assert not (pack / "same-size.json.stale").exists()
+
+
+def test_update_cached_model_recovers_copies_left_by_a_killed_update(tmp_path, monkeypatch):
+    """A SIGKILL between staging and rollback leaves <name>.stale behind. The
+    next update puts a copy back when its original is missing and drops it
+    when the original landed."""
+    pack = _write_pack(tmp_path, "owner--pack", None)
+    (pack / "mtp.safetensors.stale").write_bytes(b"head")  # original missing
+    (pack / "config.json.stale").write_text("stale", encoding="utf-8")  # original present
+    seen: dict = {}
+
+    def fake_pull(repo_id, **kwargs):
+        seen["mtp"] = (pack / "mtp.safetensors").read_bytes()
+        seen["stale_left"] = sorted(p.name for p in pack.glob("*.stale"))
+        return {"repo_id": repo_id, "path": str(pack)}
+
+    monkeypatch.setattr(model_updates, "pull_model", fake_pull)
+
+    update_cached_model("owner/pack", cache_dir=tmp_path, manifest=_MANIFEST)
+
+    assert seen == {"mtp": b"head", "stale_left": []}
+    assert (pack / "config.json").read_text(encoding="utf-8") == "{}\n"
+
+
+def test_update_cached_model_refuses_symlinked_child(tmp_path, monkeypatch):
+    """The parent check used to resolve only the parent, so a symlink planted in
+    the cache passed and the file removals followed it outside the cache."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    outside = _write_pack(tmp_path / "elsewhere", "owner--pack", {"repo_id": "owner/pack"})
+    (outside / "same-size.json").write_text("old!", encoding="utf-8")
+    link = cache / "owner--pack"
+    link.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(
+        model_updates, "pull_model", lambda *a, **k: pytest.fail("must not pull")
+    )
+    monkeypatch.setattr(
+        model_updates,
+        "_query_repo_snapshot",
+        lambda *a, **k: pytest.fail("must not query"),
+    )
+
+    with pytest.raises(ValueError, match="top-level symlink"):
+        update_cached_model(
+            "owner/pack", cache_dir=cache, destination_path=link, manifest=_MANIFEST
+        )
+
+    assert (outside / "same-size.json").read_text(encoding="utf-8") == "old!"
+    assert not list(outside.glob("*.stale"))
 
 
 def test_update_cached_model_targets_bare_layout_dir(tmp_path, monkeypatch):
@@ -457,6 +616,61 @@ def test_update_cached_model_targets_exact_stale_path_when_duplicate_is_current(
     assert captured["destination"] == bare
 
 
+def test_update_cached_model_rejects_top_level_symlink(tmp_path, monkeypatch):
+    target = _write_pack(
+        tmp_path / "external",
+        "real-pack",
+        {"repo_id": "owner/pack", "resolved_sha": "sha-old"},
+    )
+    overlay = tmp_path / "owner--pack"
+    overlay.symlink_to(target, target_is_directory=True)
+    monkeypatch.setattr(
+        model_updates, "pull_model", lambda *_args, **_kwargs: pytest.fail("must not pull")
+    )
+
+    with pytest.raises(ValueError, match="top-level symlink"):
+        update_cached_model(
+            "owner/pack",
+            cache_dir=tmp_path,
+            destination_path=overlay,
+            manifest={"schema": 1, "models": {"owner/pack": {"revision": "new"}}},
+        )
+
+
+def test_update_cached_model_rejects_unsafe_changed_filename(tmp_path, monkeypatch):
+    pack = _write_pack(
+        tmp_path,
+        "owner--pack",
+        {
+            "repo_id": "owner/pack",
+            "resolved_sha": "sha-old",
+            "files": {"../escape": {"size": 1, "blob_id": "same"}},
+        },
+    )
+    monkeypatch.setattr(
+        model_updates,
+        "_query_repo_snapshot",
+        lambda *_args, **_kwargs: (
+            "sha-new",
+            {"../escape": {"size": 1, "blob_id": "same"}},
+        ),
+    )
+    monkeypatch.setattr(
+        model_updates, "pull_model", lambda *_args, **_kwargs: pytest.fail("must not pull")
+    )
+
+    with pytest.raises(RuntimeError, match="unsafe file path"):
+        update_cached_model(
+            "owner/pack",
+            cache_dir=tmp_path,
+            destination_path=pack,
+            manifest={
+                "schema": 1,
+                "models": {"owner/pack": {"revision": "sha-new"}},
+            },
+        )
+
+
 def test_cmd_models_update_progress_json_emits_pull_schema(monkeypatch, capsys):
     from types import SimpleNamespace
 
@@ -510,6 +724,63 @@ def test_cmd_models_update_progress_json_emits_pull_schema(monkeypatch, capsys):
     assert events[-1]["resolved_sha"] == "sha-new"
     assert events[-1]["delta_bytes"] == 60
     assert events[-1]["downloaded_bytes"] == 25
+
+
+def test_cmd_models_auto_update_targets_exact_primary_path_only(
+    monkeypatch, capsys
+):
+    from types import SimpleNamespace
+
+    from mtplx.commands import public
+
+    primary = ModelUpdateStatus(
+        repo_id="owner/pack",
+        path="/primary/bare-pack",
+        state=STATE_UPDATE_AVAILABLE,
+        local_revision="old",
+        remote_revision="new",
+        source="manifest",
+        root="/primary",
+        root_index=0,
+        is_primary=True,
+    )
+    secondary = ModelUpdateStatus(
+        repo_id="owner/pack",
+        path="/archive/owner--pack",
+        state=STATE_UPDATE_AVAILABLE,
+        local_revision="older",
+        remote_revision="new",
+        source="manifest",
+        root="/archive",
+        root_index=1,
+        is_primary=False,
+    )
+    monkeypatch.setattr(model_updates, "fetch_models_manifest", lambda: {"schema": 1, "models": {}})
+    monkeypatch.setattr(model_updates, "check_model_updates", lambda **_kwargs: [primary, secondary])
+    calls: list[tuple[str, str | None]] = []
+
+    def fake_update(repo, **kwargs):
+        calls.append((repo, kwargs.get("destination_path")))
+        return {
+            "repo_id": repo,
+            "path": kwargs.get("destination_path"),
+            "resolved_sha": "new",
+            "size_bytes": 10,
+            "started_size_bytes": 9,
+        }
+
+    monkeypatch.setattr(model_updates, "update_cached_model", fake_update)
+    args = SimpleNamespace(
+        cache_dir="/primary",
+        model_search_dirs=["/archive"],
+        json=True,
+        progress_json=False,
+        installed_path=None,
+    )
+
+    assert public._cmd_models_update(args, []) == 0
+    assert calls == [("owner/pack", "/primary/bare-pack")]
+    assert json.loads(capsys.readouterr().out)["updated"][0]["path"] == "/primary/bare-pack"
 
 
 def test_update_cached_model_fresh_pull_lets_pull_model_resolve(tmp_path, monkeypatch):

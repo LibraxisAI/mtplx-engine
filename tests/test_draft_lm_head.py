@@ -98,3 +98,30 @@ def test_install_draft_lm_head_quantizes_lora_wrapped_step_shared_heads() -> Non
     assert isinstance(wrapped, LoRALinear)
     assert wrapped.base.bits == 3
     assert logits.shape == (1, 2, 64)
+
+
+def test_install_draft_lm_head_shares_a_rotated_packed_target_head() -> None:
+    """Bonsai's 2-bit rotated head is the draft head: never requantized.
+
+    A 4-bit copy would be larger than the target head, and a copy made from
+    the raw packed rows would skip the activation transform. The server calls
+    this installer for every qwen3_next pack with a draft head, so it must
+    not raise on the rotated layer either.
+    """
+
+    from mtplx.models.prism_hadamard_qwen35 import HadamardQuantizedLinear
+
+    head = HadamardQuantizedLinear(1024, 64, block=1024)
+    rt = SimpleNamespace(model=SimpleNamespace(lm_head=head))
+
+    report = _install_draft_lm_head(rt, bits=4, group_size=64, mode="affine")
+
+    assert rt.model._mtplx_draft_lm_head is head
+    assert report["source"] == "rotated_packed_lm_head"
+    assert report["reused_existing_quantization"] is True
+    assert report["draft_only"]["bits"] == 2
+    assert report["draft_only"]["group_size"] == 128
+    logits = head(mx.ones((1, 2, 1024), dtype=mx.float16))
+    mx.eval(logits)
+    assert logits.shape == (1, 2, 64)
+

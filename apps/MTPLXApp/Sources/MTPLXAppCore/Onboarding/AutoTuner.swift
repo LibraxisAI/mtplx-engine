@@ -244,7 +244,7 @@ public struct AutoTuner: Sendable {
                     executable = try self.resolveOrBootstrapMtplxExecutable { message in
                         continuation.yield(.installingFanControl(message))
                     }
-                    continuation.yield(.installingFanControl("MTPLX runtime ready"))
+                    continuation.yield(.installingFanControl(tr("MTPLX runtime ready")))
                 } catch {
                     let message = (error as? LocalizedError)?.errorDescription
                         ?? error.localizedDescription
@@ -254,8 +254,8 @@ public struct AutoTuner: Sendable {
                 }
 
                 let fanControl = FanControlInstaller(processEnvironment: self.processEnvironment)
-                    .ensureReady(executable: executable, subprocess: subprocess) { message in
-                        continuation.yield(.installingFanControl(message))
+                    .ensureReady(executable: executable, subprocess: subprocess) { key in
+                        continuation.yield(.installingFanControl(tr(key)))
                     }
                 if Task.isCancelled {
                     continuation.yield(.cancelled)
@@ -269,7 +269,7 @@ public struct AutoTuner: Sendable {
                     // ramp. The CLI tune now degrades to auto fans on
                     // its own; surface the state and keep going.
                     continuation.yield(.installingFanControl(
-                        "Fan control unavailable; tuning with fans on auto"
+                        tr("Fan control unavailable; tuning with fans on auto")
                     ))
                 }
 
@@ -279,6 +279,10 @@ public struct AutoTuner: Sendable {
                     for: modelPath,
                     environment: self.processEnvironment
                 )
+                // `mtplx tune` pins fans only when asked. This flow readies
+                // fan control above and tells the user it is preparing max
+                // fans, so it asks; the CLI still degrades to auto fans when
+                // the ramp cannot be verified.
                 process.arguments = [
                     "tune",
                     "--model", modelPath,
@@ -286,6 +290,7 @@ public struct AutoTuner: Sendable {
                     "--json",
                     "--yes",
                     "--retune",
+                    "--max",
                     "--output-dir", outputDir.path,
                     "--run-id", String(runID),
                 ]
@@ -416,7 +421,7 @@ public struct AutoTuner: Sendable {
         if !trimmedStderr.isEmpty { return trimmedStderr }
         let trimmedStdout = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedStdout.isEmpty { return trimmedStdout }
-        return "Tuning failed before MTPLX could write results."
+        return tr("Tuning failed before MTPLX could write results.")
     }
 
     private static func candidateFailureMessage(tunePath: URL) -> String? {
@@ -643,7 +648,7 @@ public struct AutoTuner: Sendable {
                 preferDevelopmentWrapper: preferDevelopmentWrapper
             )
         }
-        return try MTPLXRuntimeBootstrapper(environment: processEnvironment).installOrUpdate(status: status)
+        return try MTPLXRuntimeBootstrapper(environment: processEnvironment).installOrUpdate { key in status(tr(key)) }
     }
 }
 

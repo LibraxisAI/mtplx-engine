@@ -165,6 +165,32 @@ def _session_bank_max_entries() -> int:
     return _bank_entries_from_env("MTPLX_SESSION_BANK_MAX_ENTRIES", default)
 
 
+def session_bank_idle_ttl_s() -> float:
+    """MTPLX_SESSION_BANK_IDLE_TTL_S: seconds a warm entry (and its session)
+    may sit untouched before the idle sweep drops it. Default 3600. ``0``
+    disables the sweep: entries then live until the byte budgets, real
+    memory pressure or a restart take them (the SSD tier still keeps them).
+    Issue #481 asked for this knob; nothing else in the daemon expires warm
+    state on idle time alone.
+    """
+    raw = os.environ.get("MTPLX_SESSION_BANK_IDLE_TTL_S")
+    if raw is None or not str(raw).strip():
+        return float(DEFAULT_IDLE_TTL_S)
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        logger.warning(
+            "MTPLX_SESSION_BANK_IDLE_TTL_S=%r is not a number; using %s",
+            raw,
+            DEFAULT_IDLE_TTL_S,
+        )
+        return float(DEFAULT_IDLE_TTL_S)
+    if value != value:  # NaN
+        return float(DEFAULT_IDLE_TTL_S)
+    # SessionBank rejects <= 0 (idle_ttl_s must be > 0); infinity is "never".
+    return value if value > 0 else float("inf")
+
+
 def _default_per_session_max_bytes() -> int:
     total_ram = _detect_total_ram_bytes_for_session_bank()
     if (
@@ -185,13 +211,11 @@ def model_weights_bytes(model_path: Any) -> int | None:
     scan undercounted those (or returned None outright), silently skewing
     the RAM-aware session-bank budget this number feeds.
 
-    The Flash-Next n-gram sidecar (~30 GiB) is excluded by name: in its
-    default streamed mode only touched pages become resident and they are
+    The Flash-Next n-gram sidecar (~30 GiB) is excluded by name: it streams
+    from SSD, so only touched pages become resident and they are
     reclaimable file-backed pages, not wired weight. Counting it here was
     the 2026-08-28 defect chain (false MODEL DOES NOT FIT, 30G-pessimistic
-    window and bank on 128G Macs). When the resident policy arms, the
-    caller adds ``ngram_table_bytes`` back explicitly — see
-    ``memory_plan.ngram_table_resident_policy``."""
+    window and bank on 128G Macs)."""
     from mtplx.memory_plan import NGRAM_TABLE_FILENAME
 
     try:
@@ -213,8 +237,8 @@ def model_weights_bytes(model_path: Any) -> int | None:
 
 def ngram_table_bytes(model_path: Any) -> int:
     """Size of the Flash-Next n-gram sidecar next to the weights (0 when
-    absent). Kept separate from ``model_weights_bytes`` so callers count it
-    as a commitment exactly when the resident policy says it will be one."""
+    absent). Kept separate from ``model_weights_bytes``: it streams from SSD
+    and is never a commitment."""
     from mtplx.memory_plan import NGRAM_TABLE_FILENAME
 
     try:
@@ -334,17 +358,55 @@ def resolve_session_bank_max_bytes(
     return DEFAULT_MAX_BYTES, False
 
 
+def per_session_play_ceiling_bytes(memory_plan: Any | None) -> int | None:
+    """The largest one-conversation snapshot the plan can restore.
+
+    A restore materializes the snapshot next to the banked copy, so one
+    session's warm state must fit twice in the play the engine budget
+    leaves after the weights and the runtime transients:
+    (usable - weights - RUNTIME_TRANSIENTS) / 2. PR #496 (Dizzler7) asked
+    for a flat 32 GiB so a 12 GiB deep-context snapshot (Qwen3.8-27B, Q8 KV,
+    >100k tokens) stops being refused on the 8 GiB tier; a flat number is
+    swap death on a 64 GB seat, this is the same ask sized by the machine:
+    64 GB + 27B: 13.2 GiB; 128 GB + 27B: 37 GiB (the budget rule then
+    holds it at 32); 128 GB + Flash-Next: 10.5 GiB; 48 GB + 27B: 7.2 GiB.
+    None without a plan (legacy tier ceilings apply).
+    """
+    if memory_plan is None or not getattr(memory_plan, "available", False):
+        return None
+    try:
+        from mtplx.memory_plan import RUNTIME_TRANSIENTS_BYTES
+
+        usable = int(getattr(memory_plan, "usable_bytes", 0) or 0)
+        weights = int(getattr(memory_plan, "model_weights_bytes", 0) or 0)
+        # A tight-machine plan carries its measured margin here; every
+        # other plan carries the constant, so nothing else moves.
+        transients = int(
+            getattr(memory_plan, "runtime_transients_bytes", RUNTIME_TRANSIENTS_BYTES)
+            or RUNTIME_TRANSIENTS_BYTES
+        )
+    except (ImportError, TypeError, ValueError):
+        return None
+    if usable <= 0 or weights <= 0:
+        return None
+    play = usable - weights - transients
+    return max(_AUTO_BUDGET_FLOOR_BYTES, play // 2)
+
+
 def resolve_session_bank_per_session_bytes(
     max_bytes: int,
     *,
     auto_active: bool = True,
+    memory_plan: Any | None = None,
 ) -> int:
     """Per-session cap resolution.
 
     Explicit env wins (clamped to the bank budget when the budget was
     auto-computed). In auto mode the default is 2/3 of the budget so one
-    conversation cannot monopolize the whole cache; in legacy mode the
-    RAM-tiered defaults are preserved exactly.
+    conversation cannot monopolize the whole cache, held under what the
+    machine can restore: the plan's play ceiling when a memory plan is
+    available (``per_session_play_ceiling_bytes``), else the RAM-tier
+    ceiling; in legacy mode the RAM-tiered defaults are preserved exactly.
     """
     raw = os.environ.get("MTPLX_SESSION_BANK_PER_SESSION_BYTES")
     if raw is not None and raw.strip() and not _is_auto_bytes_setting(raw):
@@ -354,15 +416,19 @@ def resolve_session_bank_per_session_bytes(
         )
         return min(parsed, int(max_bytes)) if auto_active else parsed
     if auto_active:
-        # 2/3 of the bank budget, additionally clamped to the RAM-tier
-        # ceiling (8 GiB below 96 GiB RAM, 24 GiB above). The auto rule on
-        # its own RAISED the admission gate on small boxes relative to the
-        # v1.0.4 flat gate (64 GB Mac: 15 GiB vs 8 GiB), admitting snapshots
-        # whose restore-time transient copies blow past physical RAM (#150,
-        # ArthoPacini). Oversized snapshots still get the live-ref lease
-        # fallback, so warm reuse survives the clamp.
+        # 2/3 of the bank budget. The auto rule on its own RAISED the
+        # admission gate on small boxes relative to the v1.0.4 flat gate
+        # (64 GB Mac: 15 GiB vs 8 GiB), admitting snapshots whose
+        # restore-time transient copies blow past physical RAM (#150,
+        # ArthoPacini); the ceiling below is that restore copy priced by
+        # the plan, or the RAM tier (8 GiB below 96 GiB RAM, 24 GiB above)
+        # when there is no plan. Oversized snapshots still get the live-ref
+        # lease fallback, so warm reuse survives the clamp.
         auto_cap = max(_AUTO_BUDGET_FLOOR_BYTES, int(max_bytes) * 2 // 3)
-        return min(auto_cap, _default_per_session_max_bytes())
+        ceiling = per_session_play_ceiling_bytes(memory_plan)
+        if ceiling is None:
+            ceiling = _default_per_session_max_bytes()
+        return min(auto_cap, ceiling)
     return _default_per_session_max_bytes()
 
 
@@ -421,6 +487,24 @@ IMPLICIT_SESSION_SOURCES = frozenset(
 _COMMON_PREFIX_REUSE_MIN_TOKENS = 4096
 _COMMON_PREFIX_REUSE_MIN_FRACTION = 0.25
 _COMMON_PREFIX_PROBE_TOKENS = 64
+# Turn-boundary reuse (#446): a live session's committed stream carries the
+# reasoning it streamed, and clients resend the history without it, so a
+# resent conversation's raw common prefix always ends where one of the
+# session's turns started generating. The fraction rule above shrinks that
+# match below its threshold as the conversation grows (22,437 shared tokens
+# passed at 89k and failed at 112k in the #446 chain), forking the identity
+# and dropping the restore to a 2,048-token block. A shared prefix of at
+# least the minimum that lands on a recorded turn prompt length (up to the
+# probe window past it, for templates whose generation-prompt tail the
+# rendered history repeats) is that conversation's own signature at any length.
+_TURN_PROMPT_LENS_MAX = 256
+
+
+def _common_prefix_reuse_threshold(prompt_len: int) -> int:
+    return max(
+        _COMMON_PREFIX_REUSE_MIN_TOKENS,
+        int(int(prompt_len) * _COMMON_PREFIX_REUSE_MIN_FRACTION),
+    )
 
 
 def _new_anon_session_id() -> str:
@@ -492,10 +576,18 @@ def is_background_request(
             break
     metadata_task = str(metadata.get("task") or metadata.get("openwebui_task") or "")
     current_system_hash = system_prompt_hash(messages)
+    # A system-prompt mismatch only infers a background task for the task
+    # shape itself: one system prompt plus one user turn, which is what an
+    # unmarked title/tags job looks like. A short-answer turn that continues
+    # a conversation (assistant history present) is foreground work from a
+    # second client and must keep its session — issue #454: every
+    # conversation after the first ran sessionless, re-prefilling every
+    # turn, because its 30-token answers matched this heuristic.
     system_mismatch = (
         main_system_hash is not None
         and current_system_hash is not None
         and current_system_hash != main_system_hash
+        and is_no_history_shape(messages)
     )
     return bool(header_task or metadata_task or system_mismatch)
 
@@ -544,6 +636,11 @@ def _marathon_postcommit_protect_tokens() -> int:
     whose token_count meets the threshold is granted the marathon wait
     below instead of the standard window. Off by default: the tradeoff
     (next-turn TTFB vs the re-prefill wall) is a product decision.
+
+    Since #432 the same threshold also guards the CROSS-session admission
+    sweep (EngineSessionManager.abort_cross_session_postcommits), where the
+    reported cost of ignoring it was worse: a 130-token vision request from
+    a second session killed a 200k commit and bought a 316s re-prefill.
     """
     raw = os.environ.get("MTPLX_POSTCOMMIT_MARATHON_PROTECT_TOKENS")
     if raw is None or not str(raw).strip():
@@ -561,6 +658,11 @@ def _marathon_postcommit_wait_s() -> float:
     Bounded on purpose — a wedged commit must still lose to the foreground
     eventually; 30s covers the measured marathon commit times with margin
     while staying far below the re-prefill wall it prevents.
+
+    #432 reuses this as the cross-session grace as well, so operators tune
+    one bound rather than two. The cross-session window is spent once per
+    landed commit, not once per arrival or per retry record; see
+    EngineSession.cross_session_postcommit_protection.
     """
     raw = os.environ.get("MTPLX_POSTCOMMIT_MARATHON_WAIT_S")
     if raw is None or not str(raw).strip():
@@ -572,6 +674,127 @@ def _marathon_postcommit_wait_s() -> float:
     if not math.isfinite(value) or value <= 0.0:
         return 30.0
     return value
+
+
+_DEFAULT_CANCELLED_HOLDER_HANDOFF_WAIT_S = 30.0
+_CANCELLED_HOLDER_HANDOFF_POLL_S = 0.02
+
+
+def _cancelled_holder_handoff_wait_s() -> float:
+    """MTPLX_SESSION_CANCEL_HANDOFF_WAIT_S: how long a request for an
+    explicitly named session waits for a generation that has ALREADY been
+    cancelled to let go of that session. Default 30 s; ``0`` restores the
+    immediate "already in flight" refusal.
+
+    Stop, then send again, is one client talking to one conversation: the
+    engine notices the cancel at its next decode round or prefill chunk
+    boundary, so for that long the old generation still holds the session
+    and a follow-up under the same id was refused. The native app used to
+    sidestep the question by giving the conversation a new session id after
+    every Stop, and a new id is a session with no committed stream and no
+    restore (2026-09-20: a 26,294 token prompt prefilled again, 24.5 s to
+    the first token). It now keeps the conversation's id, so the follow-up
+    can arrive inside that window and must be handed the session instead of
+    an error. The bound is one prefill chunk at long context with margin; a
+    holder that has not been cancelled is never waited for.
+    """
+    raw = os.environ.get("MTPLX_SESSION_CANCEL_HANDOFF_WAIT_S")
+    if raw is None or not str(raw).strip():
+        return _DEFAULT_CANCELLED_HOLDER_HANDOFF_WAIT_S
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_CANCELLED_HOLDER_HANDOFF_WAIT_S
+    if not math.isfinite(value):
+        return _DEFAULT_CANCELLED_HOLDER_HANDOFF_WAIT_S
+    return max(0.0, value)
+
+
+_DEFAULT_POSTCOMMIT_WAIT_STALL_S = 15.0
+_DEFAULT_POSTCOMMIT_WAIT_CEILING_S = 600.0
+
+
+def _postcommit_wait_stall_s() -> float:
+    """MTPLX_POSTCOMMIT_WAIT_STALL_S: heartbeat gap that means "wedged".
+
+    A postcommit prefill stamps the record at every chunk boundary; a 2048
+    token chunk is a few seconds even under memory pressure, so a job silent
+    for this long is not making progress and the waiter aborts it. Default
+    15 s. Values <= 0 disable the progress extension (the bounded wait then
+    aborts at its timeout exactly as before 2026-09-03).
+    """
+    raw = os.environ.get("MTPLX_POSTCOMMIT_WAIT_STALL_S")
+    if raw is None or not str(raw).strip():
+        return _DEFAULT_POSTCOMMIT_WAIT_STALL_S
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_POSTCOMMIT_WAIT_STALL_S
+    if not math.isfinite(value):
+        return _DEFAULT_POSTCOMMIT_WAIT_STALL_S
+    return value if value > 0.0 else 0.0
+
+
+def _postcommit_wait_ceiling_s() -> float:
+    """MTPLX_POSTCOMMIT_WAIT_CEILING_S: absolute cap on a progress-extended wait."""
+    raw = os.environ.get("MTPLX_POSTCOMMIT_WAIT_CEILING_S")
+    if raw is None or not str(raw).strip():
+        return _DEFAULT_POSTCOMMIT_WAIT_CEILING_S
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_POSTCOMMIT_WAIT_CEILING_S
+    if not math.isfinite(value) or value <= 0.0:
+        return _DEFAULT_POSTCOMMIT_WAIT_CEILING_S
+    return value
+
+
+def _wait_while_progressing(future: Any, record: Any, *, timeout_s: float) -> None:
+    """``future.result`` with a progress-gated extension past ``timeout_s``.
+
+    The bounded wait exists so a same-session request can pick up the
+    previous turn's committed state instead of re-prefilling it. When the
+    bound expires while the job is still prefilling, aborting is the worst
+    of both worlds: the partial prefill is thrown away and the request then
+    redoes the same tokens from scratch (2026-09-03 founder session: 30 s
+    waited, job aborted at ~75%, 38 s re-prefill on top -- 68 s of dead air
+    for a state the engine held in memory 120 ms earlier). The postcommit's
+    remaining work IS the request's own alternative, so a job that keeps
+    reaching chunk boundaries is waited for; only a job silent for
+    ``stall_s`` (or one that never started) is abandoned at the bound. The
+    absolute ceiling keeps a heartbeating-but-endless job from pinning a
+    request forever.
+
+    Raises TimeoutError when the wait is abandoned (same contract as
+    ``future.result(timeout=...)``), so the caller's abort path is unchanged.
+    """
+
+    stall_s = _postcommit_wait_stall_s()
+    ceiling_s = max(float(timeout_s), _postcommit_wait_ceiling_s())
+    deadline = time.monotonic() + float(timeout_s)
+    hard_deadline = time.monotonic() + ceiling_s
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise TimeoutError("postcommit wait bound reached")
+        try:
+            future.result(timeout=remaining)
+            return
+        except TimeoutError:
+            pass
+        except BaseException:
+            raise
+        if stall_s <= 0.0:
+            raise TimeoutError("postcommit wait bound reached")
+        started = getattr(record, "started_at_s", None) is not None
+        progressing = getattr(record, "progressing", None)
+        if not started or not callable(progressing) or not progressing(stall_s=stall_s):
+            raise TimeoutError("postcommit wait bound reached; job not progressing")
+        if time.monotonic() >= hard_deadline:
+            raise TimeoutError("postcommit wait ceiling reached")
+        # Still prefilling: grant another slice, never longer than the stall
+        # window, so a job that stops mid-slice is caught within stall_s.
+        deadline = min(hard_deadline, time.monotonic() + stall_s)
 
 
 def _postcommit_wait_timeout_s() -> float:
@@ -663,10 +886,33 @@ class PendingPostcommit:
     finished_at_s: float | None = None
     last_outcome: dict[str, Any] | None = None
     last_abort_reason: str | None = None
+    #: Monotonic stamp of the job's last chunk boundary (its abort check
+    #: doubles as the heartbeat). A waiter reads it to tell a job that is
+    #: still prefilling from one that is wedged.
+    last_progress_mono_s: float | None = None
+    progress_ticks: int = 0
 
     def mark_started(self) -> None:
         if self.started_at_s is None:
             self.started_at_s = time.time()
+            self.last_progress_mono_s = time.monotonic()
+
+    def note_progress(self) -> None:
+        self.last_progress_mono_s = time.monotonic()
+        self.progress_ticks += 1
+
+    def progressing(self, *, stall_s: float) -> bool:
+        """Whether the job reached a chunk boundary within ``stall_s``.
+
+        The start stamp alone is not progress: a job that never reaches its
+        first chunk boundary inside the caller's bound is abandoned there
+        exactly as before, so a wedged render/tokenize phase cannot borrow
+        the stall window.
+        """
+        stamp = self.last_progress_mono_s
+        if stamp is None or self.progress_ticks <= 0:
+            return False
+        return (time.monotonic() - float(stamp)) <= float(stall_s)
 
     def mark_finished(self, outcome: dict[str, Any] | None = None) -> None:
         self.finished_at_s = time.time()
@@ -715,6 +961,9 @@ class EngineSession:
         self.last_access_s = self.created_at_s
         self.committed_token_ids: tuple[int, ...] = ()
         self.boundaries: list[BoundarySnapshot] = []
+        # Prompt lengths of the turns this session generated from; the
+        # resolver's turn-boundary reuse (#446) reads them.
+        self.turn_prompt_lens: list[int] = []
         self.in_flight = False
         self.in_flight_started_s: float | None = None
         self.last_commit_s: float | None = None
@@ -724,6 +973,14 @@ class EngineSession:
         self.bytes_estimate = 0
         self.revision = 0
         self._lock = Lock()
+        # The cancel signal of the generation that holds ``_lock`` (or held
+        # it last). Written only by the thread that has just taken the lock
+        # and never cleared on release, so a waiter that failed to take the
+        # lock always reads the signal of a holder that exists. See
+        # ``wait_for_cancelled_holder``.
+        self._holder_cancel_event: Any | None = None
+        # Last handoff from a cancelled generation, for the admin view.
+        self.last_cancel_handoff: dict[str, Any] | None = None
         # Reference to the most recent postcommit work scheduled for this
         # session. The next request in this session waits briefly on this
         # before acquiring the session lock so the SessionBank entry is
@@ -743,6 +1000,12 @@ class EngineSession:
         # Last wait outcome, exposed via to_admin_dict for the metrics endpoint.
         self.last_postcommit_wait: dict[str, Any] | None = None
         self.last_postcommit_outcome: dict[str, Any] | None = None
+        # Monotonic deadline for cross-session marathon protection (#432).
+        # Armed on the first protected admission sweep and cleared only when
+        # a postcommit actually lands, so the whole abort/re-arm chain shares
+        # one bounded grace instead of one per record. See
+        # `cross_session_postcommit_protection`.
+        self._cross_session_protect_deadline_s: float | None = None
 
     @property
     def pending_postcommit(self) -> Any:
@@ -812,6 +1075,65 @@ class EngineSession:
                 return None
             return record.to_admin_dict()
 
+    def cross_session_postcommit_protection(
+        self,
+        *,
+        protect_tokens: int,
+        grace_s: float,
+    ) -> dict[str, Any] | None:
+        """Should this session's pending postcommit survive a foreign request?
+
+        Returns None when the caller must abort exactly as before (no
+        pending record, protection disabled, commit below the threshold, or
+        the grace already spent). Returns a grant dict when the commit is
+        marathon-sized and still inside its grace window.
+
+        Issue #432: `MTPLX_POSTCOMMIT_MARATHON_PROTECT_TOKENS` guarded only
+        the same-session arrival path, so a 130-token vision request from
+        another session killed a 200k-token commit at admission and the deep
+        session then paid a 316s full re-prefill. The docstring rationale for
+        the unconditional abort prices the arriving request's TTFT but not
+        the destroyed checkpoint.
+
+        THE BOUND: the deadline is armed once, on the first protected sweep,
+        and is NOT refreshed by later arrivals. It is cleared only by a
+        postcommit that actually lands (`finish_pending_postcommit` with a
+        stored outcome). An aborted commit re-arms with a fresh record up to
+        16 times, so a per-record deadline would multiply the grace by the
+        retry chain; keying it to the session caps total cross-session
+        protection at one `grace_s` window (default 30s, the same
+        `MTPLX_POSTCOMMIT_MARATHON_WAIT_S` bound the same-session path uses)
+        per landed commit. Past the deadline the foreground wins every time,
+        so a wedged commit cannot starve other sessions.
+        """
+        if protect_tokens <= 0 or grace_s <= 0.0:
+            return None
+        with self._postcommit_lock:
+            record = self._pending_postcommit
+            if record is None:
+                return None
+            try:
+                token_count = int(getattr(record, "token_count", 0) or 0)
+            except (TypeError, ValueError):
+                token_count = 0
+            if token_count < protect_tokens:
+                return None
+            now = time.monotonic()
+            deadline = self._cross_session_protect_deadline_s
+            if deadline is None:
+                deadline = now + float(grace_s)
+                self._cross_session_protect_deadline_s = deadline
+            if now >= deadline:
+                return None
+            remaining_s = deadline - now
+        return {
+            "session_id": self.session_id,
+            "token_count": token_count,
+            "protect_tokens": int(protect_tokens),
+            "grace_s": float(grace_s),
+            "grace_remaining_s": round(remaining_s, 3),
+        }
+
     def abort_pending_postcommit(self, reason: str) -> dict[str, Any]:
         with self._postcommit_lock:
             record = self._pending_postcommit
@@ -834,9 +1156,16 @@ class EngineSession:
         record.mark_finished(outcome)
         if outcome is not None:
             self.last_postcommit_outcome = outcome
+        landed = bool((outcome or {}).get("stored"))
         with self._postcommit_lock:
             if self._pending_postcommit is record:
                 self._pending_postcommit = None
+            if landed:
+                # A landed commit re-arms the cross-session marathon grace
+                # (#432). Aborted/abandoned outcomes deliberately do NOT:
+                # the re-armed retry inherits the spent deadline so the
+                # whole chain shares one bounded window.
+                self._cross_session_protect_deadline_s = None
 
     def wait_for_pending_postcommit(
         self,
@@ -936,14 +1265,18 @@ class EngineSession:
         # cache warmup, not a correctness dependency. Timeout is the most
         # common non-success outcome and is reported distinctly so operators
         # can spot a stuck postcommit lane.
+        progress_extended_s = 0.0
         try:
-            future.result(timeout=timeout_s)
+            _wait_while_progressing(future, record, timeout_s=timeout_s)
             outcome = {
                 "waited": True,
                 "elapsed_s": time.monotonic() - t0,
                 "outcome": "completed",
                 "timeout_s": timeout_s,
             }
+            progress_extended_s = max(0.0, outcome["elapsed_s"] - timeout_s)
+            if progress_extended_s > 0.0:
+                outcome["progress_extended_s"] = progress_extended_s
             # "completed" only means the future resolved — abandoned jobs
             # also complete (they return normally after logging their own
             # outcome). Surface the job's result so receipts distinguish a
@@ -1112,13 +1445,88 @@ class EngineSession:
         record.mark_finished(outcome)
         return outcome
 
-    def try_begin_generation(self) -> bool:
-        if not self._lock.acquire(blocking=False):
+    def try_begin_generation(
+        self,
+        *,
+        cancel_event: Any | None = None,
+        timeout_s: float = 0.0,
+    ) -> bool:
+        """Take the session's generation slot, or report it busy.
+
+        ``cancel_event`` is the caller's own cancel signal. The session keeps
+        it while the caller holds the slot, so a later request can tell a
+        generation that was told to stop (a handoff) from one that is still
+        wanted (a collision).
+        """
+        if timeout_s > 0.0:
+            acquired = self._lock.acquire(timeout=float(timeout_s))
+        else:
+            acquired = self._lock.acquire(blocking=False)
+        if not acquired:
             return False
+        self._holder_cancel_event = cancel_event
         self.in_flight = True
         self.in_flight_started_s = time.time()
         self.touch()
         return True
+
+    def holder_cancel_requested(self) -> bool:
+        """True when the generation holding the slot has been cancelled."""
+        event = self._holder_cancel_event
+        return event is not None and bool(event.is_set())
+
+    def wait_for_cancelled_holder(
+        self,
+        *,
+        cancel_event: Any | None = None,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]:
+        """Take the slot from a holder that has already been cancelled.
+
+        Returns a receipt; ``acquired`` says whether the caller now holds the
+        slot. Waits only while the CURRENT holder's cancel signal is set: a
+        holder that was never cancelled, or a third request that took the
+        slot in between, ends the wait at once and the caller refuses as
+        before. The caller's own cancel ends it too (the user pressed Stop a
+        second time while waiting).
+        """
+        budget_s = (
+            _cancelled_holder_handoff_wait_s()
+            if timeout_s is None
+            else max(0.0, float(timeout_s))
+        )
+        started = time.monotonic()
+        receipt: dict[str, Any] = {
+            "acquired": False,
+            "waited_s": 0.0,
+            "timeout_s": float(budget_s),
+            "outcome": "holder_not_cancelled",
+        }
+        if budget_s <= 0.0:
+            receipt["outcome"] = "disabled"
+            return receipt
+        deadline = started + budget_s
+        while True:
+            if not self.holder_cancel_requested():
+                break
+            if cancel_event is not None and cancel_event.is_set():
+                receipt["outcome"] = "waiter_cancelled"
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                receipt["outcome"] = "timeout"
+                break
+            if self.try_begin_generation(
+                cancel_event=cancel_event,
+                timeout_s=min(_CANCELLED_HOLDER_HANDOFF_POLL_S, remaining),
+            ):
+                receipt["acquired"] = True
+                receipt["outcome"] = "handed_off"
+                break
+        receipt["waited_s"] = round(time.monotonic() - started, 4)
+        if receipt["outcome"] != "holder_not_cancelled":
+            self.last_cancel_handoff = dict(receipt)
+        return receipt
 
     def end_generation(self) -> None:
         self.in_flight = False
@@ -1144,8 +1552,16 @@ class EngineSession:
         boundary_kind: str = "assistant_end",
         nbytes: int = 0,
     ) -> EngineSessionCommit:
-        if finish_reason not in {"stop", "length"}:
+        # "tool_calls" is the OpenAI label the bridge stamps on a turn that
+        # stopped naturally after complete tool calls; the KV boundary is as
+        # safe as "stop". Refusing it (as before 2026-09-03) left every agent
+        # tool round without a committed stream, so the committed-think and
+        # committed-body canonicalization never applied to the turns that
+        # need it most, and each tool result re-prefilled the whole previous
+        # assistant turn. Aborted/cancelled/error finishes stay refused.
+        if finish_reason not in {"stop", "length", "tool_calls"}:
             return EngineSessionCommit(False, f"unsafe_finish:{finish_reason}", self.prefix_len)
+        self.note_turn_prompt_len(len(prompt_ids))
         tokens = tuple(int(token) for token in prompt_ids) + tuple(int(token) for token in generated_ids)
         self.committed_token_ids = tokens
         self.last_commit_s = time.time()
@@ -1192,6 +1608,7 @@ class EngineSession:
                 )
             if len(tokens) == len(current):
                 return EngineSessionCommit(False, "prompt_prefix_unchanged", self.prefix_len)
+        self.note_turn_prompt_len(len(tokens))
         self.committed_token_ids = tokens
         self.last_commit_s = time.time()
         self.last_finish_reason = str(finish_reason)
@@ -1291,6 +1708,29 @@ class EngineSession:
         self.touch()
         return boundary
 
+    def note_turn_prompt_len(self, prompt_len: int) -> None:
+        """Record the prompt length a turn generated from (#446 identity)."""
+        prompt_len = int(prompt_len)
+        if prompt_len <= 0 or prompt_len in self.turn_prompt_lens:
+            return
+        self.turn_prompt_lens.append(prompt_len)
+        overflow = len(self.turn_prompt_lens) - _TURN_PROMPT_LENS_MAX
+        if overflow > 0:
+            del self.turn_prompt_lens[:overflow]
+
+    def turn_boundary_at(self, common_prefix: int) -> int | None:
+        """Turn prompt length that a shared prefix ends on, or None.
+
+        The match may run up to the probe window past the boundary: a chat
+        template can repeat the generation prompt's tail (``<think>``) in the
+        rendered history before the streamed reasoning diverges from it.
+        """
+        common_prefix = int(common_prefix)
+        for prompt_len in reversed(self.turn_prompt_lens):
+            if prompt_len <= common_prefix <= prompt_len + _COMMON_PREFIX_PROBE_TOKENS:
+                return prompt_len
+        return None
+
     def nearest_boundary_at_or_before(self, token_len: int) -> BoundarySnapshot | None:
         candidates = [boundary for boundary in self.boundaries if boundary.token_len <= token_len]
         if not candidates:
@@ -1314,12 +1754,14 @@ class EngineSession:
             "last_commit_s": self.last_commit_s,
             "last_finish_reason": self.last_finish_reason,
             "revision": self.revision,
+            "turn_prompt_lens": list(self.turn_prompt_lens[-8:]),
             "in_flight": self.in_flight,
             "in_flight_started_s": self.in_flight_started_s,
             "last_cache_miss_reason": self.last_cache_miss_reason,
             "last_restore_mode": self.last_restore_mode,
             "last_postcommit_wait": self.last_postcommit_wait,
             "last_postcommit_outcome": self.last_postcommit_outcome,
+            "last_cancel_handoff": self.last_cancel_handoff,
             "pending_postcommit": bool(self.pending_postcommit is not None),
             "pending_postcommit_detail": self.pending_postcommit_admin(),
             "boundaries": [
@@ -1342,11 +1784,13 @@ class EngineSessionManager:
         self,
         *,
         bank: SessionBank | None = None,
-        idle_ttl_s: float = DEFAULT_IDLE_TTL_S,
+        idle_ttl_s: float | None = None,
         cold_tier: Any | None = None,
         model_weights_bytes: int | None = None,
         memory_plan: Any | None = None,
     ) -> None:
+        if idle_ttl_s is None:
+            idle_ttl_s = session_bank_idle_ttl_s()
         # Byte caps resolve model-aware by default (v2): unset or "auto" env
         # gives the bank half of the RAM surplus left after the model weights
         # (floored 1 GiB, capped 48 GiB), so a 32 GB Mac never inherits the
@@ -1367,6 +1811,7 @@ class EngineSessionManager:
                 per_session_max_bytes=resolve_session_bank_per_session_bytes(
                     resolved_max_bytes,
                     auto_active=auto_active,
+                    memory_plan=memory_plan,
                 ),
                 idle_ttl_s=idle_ttl_s,
                 cold_tier=cold_tier,
@@ -1470,7 +1915,19 @@ class EngineSessionManager:
         chat_id: str | None = None,
         conversation_id: str | None = None,
         prompt_ids: list[int] | tuple[int, ...] | None = None,
+        diagnostic_out: dict[str, Any] | None = None,
     ) -> tuple[str, str]:
+        # The caller owns its evidence even while another request resolves
+        # during a postcommit wait. The last value is only for health.
+        self.last_prefix_diagnostic = None
+        if diagnostic_out is not None:
+            diagnostic_out.clear()
+
+        def record(diagnostic: dict[str, Any]) -> None:
+            self.last_prefix_diagnostic = diagnostic
+            if diagnostic_out is not None:
+                diagnostic_out.update(diagnostic)
+
         headers = headers or {}
         metadata = metadata or {}
         lowered_headers = {
@@ -1505,11 +1962,11 @@ class EngineSessionManager:
         if prompt_ids:
             best = self.longest_prefix_session(prompt_ids)
             if best is not None:
-                self.last_prefix_diagnostic = self._prefix_diagnostic(
+                record(self._prefix_diagnostic(
                     prompt_ids,
                     selected=best,
                     exact=True,
-                )
+                ))
                 return best.session_id, "longest_prefix"
             pending, matched = self.pending_near_prefix_session(prompt_ids)
             if pending is not None:
@@ -1528,7 +1985,7 @@ class EngineSessionManager:
                         - int(matched),
                     }
                 )
-                self.last_prefix_diagnostic = diagnostic
+                record(diagnostic)
                 return pending.session_id, "pending_postcommit_near_prefix"
             best, matched = self.best_common_prefix_session(prompt_ids)
             if best is not None:
@@ -1543,11 +2000,17 @@ class EngineSessionManager:
                             best.committed_token_ids
                         ),
                         "reason": "common_prefix_reuse",
+                        "reuse_rule": (
+                            "fraction"
+                            if int(matched) >= _common_prefix_reuse_threshold(len(prompt_ids))
+                            else "turn_boundary"
+                        ),
+                        "turn_boundary": best.turn_boundary_at(matched),
                     }
                 )
-                self.last_prefix_diagnostic = diagnostic
+                record(diagnostic)
                 return best.session_id, "common_prefix_reuse"
-            self.last_prefix_diagnostic = self._prefix_diagnostic(prompt_ids)
+            record(self._prefix_diagnostic(prompt_ids))
         else:
             self.last_prefix_diagnostic = None
         return _new_anon_session_id(), "new"
@@ -1591,8 +2054,21 @@ class EngineSessionManager:
         its decode ~30-50% at <2s cadence). Called at request admission,
         off the scheduler-owner thread. Best-effort: a job past its last
         abort check still completes; that window is a few hundred ms.
+
+        Marathon exception (#432, reporter nomishbhardwaj): that trade
+        inverts once the foreign commit is huge. A 130-token vision request
+        interleaved into a 200k-token agent session killed the session's
+        pending commit at admission every time, and the deep session then
+        paid a 316s full re-prefill (measured: cached=0 at 207k, cached=18432
+        of 114655 at 115k) to save the vision request a few seconds. When
+        MTPLX_POSTCOMMIT_MARATHON_PROTECT_TOKENS is set, a commit at or above
+        that size keeps a bounded grace instead of dying here; see
+        EngineSession.cross_session_postcommit_protection for the bound.
         """
         aborted: list[str] = []
+        protected: list[dict[str, Any]] = []
+        protect_tokens = _marathon_postcommit_protect_tokens()
+        grace_s = _marathon_postcommit_wait_s()
         for other in self._sessions_snapshot():
             session_id = getattr(other, "session_id", None)
             if except_session_id is not None and session_id == except_session_id:
@@ -1600,18 +2076,30 @@ class EngineSessionManager:
             try:
                 if not other.has_pending_postcommit():
                     continue
+                if protect_tokens > 0:
+                    grant = other.cross_session_postcommit_protection(
+                        protect_tokens=protect_tokens,
+                        grace_s=grace_s,
+                    )
+                    if grant is not None:
+                        protected.append(grant)
+                        continue
                 outcome = other.abort_pending_postcommit(reason)
                 if outcome.get("aborted"):
                     aborted.append(str(session_id))
             except BaseException:
                 continue
-        if not aborted:
+        if not aborted and not protected:
             return None
-        return {
+        result: dict[str, Any] = {
             "count": len(aborted),
             "sessions": aborted[:8],
             "reason": reason,
         }
+        if protected:
+            result["marathon_protected"] = protected[:8]
+            result["marathon_protected_count"] = len(protected)
+        return result
 
     @contextmanager
     def generation_slot(
@@ -1619,17 +2107,44 @@ class EngineSessionManager:
         session: EngineSession,
         *,
         source: str | None = None,
+        cancel_event: Any | None = None,
+        handoff_out: dict[str, Any] | None = None,
     ) -> Iterator[EngineSession]:
+        """Hold ``session`` for one generation.
+
+        A busy session forks to a fresh anonymous one when the id was only
+        inferred from the prompt (#94: parallel clients without session ids).
+        A busy session the client NAMED is refused, with one exception: when
+        the generation holding it has already been cancelled, the request is
+        the same conversation coming back after a Stop, so it waits (bounded,
+        ``_cancelled_holder_handoff_wait_s``) for the old generation to let
+        go. ``cancel_event`` is this request's own cancel signal; the receipt
+        of a wait lands in ``handoff_out``.
+        """
         acquired = session
-        if not session.try_begin_generation():
+        if not session.try_begin_generation(cancel_event=cancel_event):
             if str(source or "") not in IMPLICIT_SESSION_SOURCES:
-                raise EngineSessionBusy(
-                    f"session {session.session_id} is already in flight"
+                handoff = session.wait_for_cancelled_holder(
+                    cancel_event=cancel_event
                 )
-            while True:
-                acquired = self.get_or_create(_new_anon_session_id())
-                if acquired.try_begin_generation():
-                    break
+                if handoff_out is not None and handoff.get("outcome") not in {
+                    "holder_not_cancelled",
+                    "disabled",
+                }:
+                    handoff_out.update(handoff)
+                if not handoff.get("acquired"):
+                    detail = f"session {session.session_id} is already in flight"
+                    if handoff.get("outcome") == "timeout":
+                        detail += (
+                            " (its cancelled generation did not stop within "
+                            f"{float(handoff.get('timeout_s') or 0.0):g}s)"
+                        )
+                    raise EngineSessionBusy(detail)
+            else:
+                while True:
+                    acquired = self.get_or_create(_new_anon_session_id())
+                    if acquired.try_begin_generation(cancel_event=cancel_event):
+                        break
         try:
             yield acquired
         finally:
@@ -1669,6 +2184,8 @@ class EngineSessionManager:
         probe = tokens[:_COMMON_PREFIX_PROBE_TOKENS]
         best: EngineSession | None = None
         best_common = 0
+        boundary_best: EngineSession | None = None
+        boundary_common = 0
         for session in self._sessions_snapshot():
             prefix = session.committed_token_ids
             if not prefix:
@@ -1679,12 +2196,20 @@ class EngineSessionManager:
             if common > best_common:
                 best_common = common
                 best = session
-        threshold = max(
-            _COMMON_PREFIX_REUSE_MIN_TOKENS,
-            int(len(tokens) * _COMMON_PREFIX_REUSE_MIN_FRACTION),
-        )
-        if best is not None and best_common >= threshold:
+            if (
+                common >= _COMMON_PREFIX_REUSE_MIN_TOKENS
+                and common > boundary_common
+                and session.turn_boundary_at(common) is not None
+            ):
+                boundary_common = common
+                boundary_best = session
+        if best is not None and best_common >= _common_prefix_reuse_threshold(len(tokens)):
             return best, best_common
+        # The same conversation resent with its history re-rendered (#446):
+        # the shared prefix ends where this session started generating a
+        # turn, whatever fraction of the new prompt that is.
+        if boundary_best is not None:
+            return boundary_best, boundary_common
         return None, 0
 
     def pending_near_prefix_session(

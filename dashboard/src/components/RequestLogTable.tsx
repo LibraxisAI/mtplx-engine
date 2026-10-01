@@ -170,7 +170,9 @@ function Row({
           </span>
         </Td>
         <Td align="right" highlight={false}>
-          <span className="text-[var(--text-muted)] text-xs">—</span>
+          <span className="text-[var(--text-muted)] text-xs">
+            {relativeTime(row.completed_at_s)}
+          </span>
         </Td>
       </tr>
       {isOpen ? (
@@ -185,7 +187,3 @@ function Row({
     </>
   );
 }
-
-// `relativeTime` is exported via utils; keep the import to satisfy treeshake
-// without changing the existing table cell rendering.
-export const _unused = relativeTime;

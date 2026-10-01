@@ -5,12 +5,15 @@ The manifest is the bless-list `mtplx models --check` and the app consult:
 for each official pack it pins the exact HF commit users should update
 into, the minimum engine version that can load it, and a one-line note
 shown next to the update button. Run AFTER the pack uploads so the pinned
-revisions are the post-upload commits.
+revisions are the post-upload commits. Before the two 2.12.0 uploads, repeat
+``--not-yet-published REPO`` for each unavailable new repo. Every other lookup
+failure is an error; an unresolved marked repo is recorded separately, never
+published with a fabricated revision. audit_catalog_sizes.py uses the same flag.
 
 Usage:
   .venv/bin/python scripts/gen_models_manifest.py \
       --out site/releases/models.json \
-      --note-39 "Quantized MTP draft head: smaller download, faster decode."
+      --note-38 "Quantized MTP draft head: smaller download, faster decode."
 """
 
 from __future__ import annotations
@@ -28,6 +31,11 @@ sys.path.insert(0, str(REPO_ROOT))
 # The Qwen 3.8 packs carry prequantized MTP heads (loader >= 2.0.1) and need
 # the 3.8 family support that landed in 2.7.0.
 BLESSED = {
+    "Youssofal/Qwen3.8-Flash-Next-MTPLX-Optimized-Quality": "2.12.0",
+    "Youssofal/Ternary-Bonsai-2-27B-MTPLX-Optimized-Speed": "2.12.0",
+    # MiMo V2.6 Qwen 9B joined the catalog in 2.12.0, the engine that keys the
+    # MiMo family on the checkpoint's architecture instead of its folder name.
+    "Youssofal/MiMo-V2.6-Qwen-9B-MTPLX-Optimized-Speed": "2.12.0",
     # Flash-Next (qwen4_exp) needs the family backend + streamed n-gram
     # accounting that ship in 2.10.0.
     "Youssofal/Qwen3.8-Flash-Next-MTPLX-Bare-Speed": "2.10.0",
@@ -59,28 +67,48 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--note-38", default=QWEN38_NOTE_DEFAULT)
+    from scripts.model_release_policy import NOT_YET_PUBLISHED_REPOS, add_not_yet_published_argument
+    from mtplx.model_catalog import catalog_model_matching
+
+    add_not_yet_published_argument(ap)
     args = ap.parse_args()
 
     from huggingface_hub import HfApi
 
     api = HfApi()
     models: dict[str, dict] = {}
+    pending: list[str] = []
+    errors: list[str] = []
     for repo, min_engine in BLESSED.items():
         try:
             info = api.model_info(repo_id=repo)
         except Exception as exc:
-            print(f"skip {repo}: {exc}", file=sys.stderr)
+            if repo in args.not_yet_published:
+                pending.append(repo)
+                print(f"NOT YET PUBLISHED {repo}: {exc}", file=sys.stderr)
+            else:
+                errors.append(repo)
+                print(f"ERROR {repo}: {exc}", file=sys.stderr)
+            continue
+        if not info.sha:
+            errors.append(repo)
+            print(f"ERROR {repo}: missing revision", file=sys.stderr)
             continue
         entry: dict = {
             "revision": info.sha,
             "min_engine_version": min_engine,
         }
-        if "/Qwen3.8-" in f"/{repo.split('/', 1)[1]}" or repo.split("/", 1)[1].startswith(
+        if repo in NOT_YET_PUBLISHED_REPOS:
+            entry["note"] = catalog_model_matching(repo).detail
+        elif "/Qwen3.8-" in f"/{repo.split('/', 1)[1]}" or repo.split("/", 1)[1].startswith(
             "Qwen3.8-"
         ):
             entry["note"] = args.note_38
         models[repo] = entry
         print(f"{repo} -> {info.sha[:12]}")
+
+    if errors:
+        raise SystemExit(f"Failed to resolve {len(errors)} repositories; manifest was not written.")
 
     payload = {
         "schema": 1,
@@ -88,6 +116,7 @@ def main() -> None:
             "%Y-%m-%dT%H:%M:%SZ"
         ),
         "models": models,
+        "not_yet_published": sorted(pending),
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")

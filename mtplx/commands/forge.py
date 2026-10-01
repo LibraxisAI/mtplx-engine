@@ -21,8 +21,10 @@ from mtplx.artifacts import inspect_model, text_config
 from mtplx.benchmarks.validators.basic import summarize_benchmark_quality
 from mtplx.hf_loader import (
     directory_size_bytes,
+    ensure_model_root,
     hf_token_for_download,
     pull_model,
+    read_source_marker,
     repo_id_from_model_ref,
 )
 from mtplx.gemma4_pair import (
@@ -30,6 +32,7 @@ from mtplx.gemma4_pair import (
     is_gemma4_pair_repo_id,
     resolve_gemma4_pair_paths,
 )
+from mtplx.metadata_scrub import scrub_json_documents, scrub_text_value
 from mtplx.mtp_patch import MTPContract
 from mtplx.version import __version__
 
@@ -66,6 +69,26 @@ REQUANTIZE_REFUSAL = (
     "pass --allow-degraded-mtp to confirm"
 )
 ACCEPTANCE_COLLAPSE_THRESHOLD = 0.05
+# MTP contract calibration (`mtplx mtp-chain-probe`) moves a pack off the head
+# source's declared contract (or the family default) only on real evidence.
+# Each compared contract needs this many distinct prompts and drafted chains
+# ("draft rounds": one per anchor and window, each chain `depth` tokens long),
+# and the winner must accept this many more draft tokens per round than the
+# declared contract. With 48 rounds, a paired per-round difference whose
+# standard deviation is 0.7 tokens has a standard error of about 0.1, so the
+# 0.25-token margin is about 2.5 standard errors; 0.25 tokens per round is
+# about 8 percent of decode speed at a typical 2 accepted tokens per round.
+# Four prompts keep one prompt's content from deciding the contract.
+CONTRACT_CALIBRATION_MIN_PROMPTS = 4
+CONTRACT_CALIBRATION_MIN_DRAFT_ROUNDS = 48
+CONTRACT_CALIBRATION_MARGIN = 0.25
+# The default probe sample clears that bar with room for a failed variant:
+# 8 prompts x 4 non-overlapping windows x 2 anchors = 64 rounds per contract
+# (192 drafted tokens at depth 3). The old default was 1 prompt and 1 window,
+# 2 rounds, on which a single lucky token picked the contract.
+CONTRACT_CALIBRATION_DEFAULT_DEPTH = 3
+CONTRACT_CALIBRATION_DEFAULT_PROMPTS = 8
+CONTRACT_CALIBRATION_DEFAULT_WINDOWS = 4
 FORGE_VERIFY_DEFAULT_MAX_TOKENS = 2048
 FORGE_VERIFY_DEFAULT_PROMPT_SUITE = "long-code-uncapped"
 MTP_PAYLOAD_AUDIT_ZERO_SAMPLE_LIMIT = 12
@@ -86,13 +109,13 @@ class ForgeError(RuntimeError):
         self.code = code
 
 
-def cmd_forge_public(args: Any) -> int:
+def cmd_forge_public(args: Any, *, model_root: str | Path | None = None) -> int:
     action = getattr(args, "forge_action", None)
     try:
         if action == "probe":
             return _cmd_probe(args)
         if action == "build":
-            return _cmd_build(args)
+            return _cmd_build(args, model_root=model_root)
         if action == "discover":
             return _cmd_discover(args)
         if action == "publish":
@@ -256,10 +279,14 @@ def _write_publish(
 
 
 def _read_recipe(raw: str) -> dict[str, Any]:
+    from mtplx.commands.forge_qwen4_exp import NAMED_RECIPES, named_recipe
+
+    if raw in NAMED_RECIPES:
+        return named_recipe(raw)
     try:
         value = json.loads(raw or "{}")
     except json.JSONDecodeError as exc:
-        raise ForgeError(f"--recipe must be JSON: {exc}", code=2) from exc
+        raise ForgeError(f"--recipe must be JSON or a named preset ({', '.join(NAMED_RECIPES)}): {exc}", code=2) from exc
     if not isinstance(value, dict):
         raise ForgeError("--recipe must decode to an object", code=2)
     return value
@@ -435,8 +462,8 @@ def _probe_runtime_mtp_evidence(
     except Exception as exc:
         return False, str(exc), {}
     compatibility = getattr(inspection, "compatibility", {}) or {}
-    if bool(compatibility.get("can_run")):
-        return True, None, compatibility
+    # Runtime compatibility includes autoregressive trunks without a draft
+    # head. Forge's speculative build requires actual MTP weight evidence.
     mtp = getattr(inspection, "mtp", None)
     tensor_count = int(getattr(mtp, "tensor_count", 0) or 0) if mtp is not None else 0
     if tensor_count > 0 or _inspection_has_mtp_weight_evidence(inspection):
@@ -459,10 +486,10 @@ def _no_mtp_probe_message(diagnostic: str | None, *, config_only: bool = False) 
         )
     return (
         "Source has no MTP head, and Forge currently builds speculative "
-        "MTP artifacts only. This does NOT block running the model: MTPLX "
-        "serves MTP-less checkpoints autoregressive directly (mtplx run / "
-        "mtplx serve — MTP unavailable, mtp_off). AR-only Forge "
-        "conversion/quantization lands in a later update."
+        "MTP artifacts only; it cannot create missing trained MTP weights. "
+        "AR-only Forge conversion/quantization is not supported yet. "
+        "For runtime-compatible checkpoints, use mtplx run / mtplx serve "
+        "directly with MTP disabled (mtp_off)."
     )
 
 
@@ -988,6 +1015,10 @@ def _cmd_verify(args: Any) -> int:
     else:
         run = _run_dir(Path("outputs/forge-verify"), f"verify-{int(time.time())}")
     existing = _read_runtime(model_path)
+    if (existing or {}).get("quality_pack"):
+        from mtplx.commands.forge_qwen4_audit import verify_pack_checksums
+
+        verify_pack_checksums(model_path, existing["quality_pack"]["files"])
     mtp_contract = _runtime_or_default_mtp_contract(existing, model_path)
     rows = _run_verify(
         model_path,
@@ -999,6 +1030,10 @@ def _cmd_verify(args: Any) -> int:
     )
     payload: dict[str, Any] = {"rows": rows}
     if rows and bool(getattr(args, "stamp", False)):
+        if (existing or {}).get("quality_pack"):
+            _require_verify_rows(rows, require_all_depths=_build_requires_all_depths(model_path),
+                                 verify_depths=_forge_verify_depths(model_path))
+            _require_speed_win_or_write_outcome(model_path, run, rows)
         # In-place first-load smoke stamp: the same metadata stamper the
         # build lane uses, fed by the rows just measured — no rebuild, no
         # tree copy. This is what clears the 'unverified' marker on packs
@@ -1017,7 +1052,7 @@ def _cmd_verify(args: Any) -> int:
             source_repo=source_repo,
             source_sha=str(existing_provenance.get("source_sha") or ""),
             source_format=str(probe.get("source_format") or SOURCE_UNKNOWN),
-            recipe={},
+            recipe=existing_provenance.get("forge_recipe") or {},
             forge_inputs={"lane": "verify-stamp"},
             rows=rows,
             mtp_contract=mtp_contract,
@@ -1033,16 +1068,27 @@ def _cmd_verify(args: Any) -> int:
     return 0 if rows else 1
 
 
-def _cmd_build(args: Any) -> int:
+def _cmd_build(args: Any, *, model_root: str | Path | None = None) -> int:
+    from mtplx.commands.forge_qwen4_exp import QUALITY_RECIPE, recipe_params
+
     recipe = _read_recipe(args.recipe)
     if getattr(args, "dtype", None):
         recipe["body_dtype"] = str(args.dtype)
     _body_dtype(recipe)  # validate early, before any download starts
     _guard_degraded_mtp(recipe, allow=bool(getattr(args, "allow_degraded_mtp", False)))
+    quality = recipe.get("name") == QUALITY_RECIPE
+    verification = getattr(args, "verification", "full-load")
+    if verification not in ("full-load", "streaming"):
+        raise ForgeError(f"Unknown verification mode: {verification}", code=2)
+    if quality:
+        recipe_params(recipe)  # fail incompatible named recipes before touching output
+    elif verification == "streaming":
+        raise ForgeError("--verification streaming currently requires flash-next-optimized-quality", code=2)
     run = _run_dir(args.out, args.run_id)
     branded_name = _sanitize_branded_name(args.branded_name)
     if not branded_name:
         raise ForgeError("--branded-name cannot be empty", code=2)
+    resolved_model_root = _default_model_root(model_root)
 
     _write_download(run, bytes_on_disk=0, label="starting", finished=False)
 
@@ -1056,11 +1102,31 @@ def _cmd_build(args: Any) -> int:
     if _cancel_requested(args.run_id):
         raise ForgeError("forge cancelled", code=130)
 
-    source_path, source_repo, source_sha = _prepare_source(args.repo, run, probe)
+    source_path, source_repo, source_sha = _prepare_source(
+        args.repo,
+        run,
+        probe,
+        model_root=resolved_model_root,
+    )
     if _cancel_requested(args.run_id):
         raise ForgeError("forge cancelled", code=130)
 
-    destination = _unique_model_dir(branded_name)
+    quality_source = None
+    if quality:
+        from mtplx.commands.forge_qwen4_audit import source_identity, validate_bf16_source
+
+        if probe.get("source_format") != SOURCE_BF16_NATIVE or probe.get("recommended_backend") != "qwen4_exp":
+            raise ForgeError("The Quality preset requires an original BF16 qwen4_exp source; a quantized pack cannot be upgraded", code=2)
+        validate_bf16_source(source_path)
+        quality_source = source_identity(source_path)
+        source_sha = quality_source["revision"]
+        source_repo = quality_source["repo"] or source_repo
+        atomic_write_json(run / "source_manifest.json", quality_source)
+
+    destination = _unique_model_dir(
+        branded_name,
+        model_root=resolved_model_root,
+    )
     source_format = str(probe.get("source_format") or SOURCE_UNKNOWN)
     _err(f"[forge] source format: {source_format}")
     if source_format in {SOURCE_MLX_AFFINE, SOURCE_MLX_AFFINE_WITH_MTP} or probe.get("already_mtplx"):
@@ -1071,6 +1137,24 @@ def _cmd_build(args: Any) -> int:
             )
         _mirror_model_tree(source_path, destination)
         _write_progress(run, "convert", progress=1.0, label="to_mlx", finished=True)
+    elif (
+        source_format == SOURCE_BF16_NATIVE
+        and str(probe.get("recommended_backend") or "") == "qwen4_exp"
+    ):
+        # Flash-Next: the pinned mlx-lm has no qwen4_exp, and the family needs
+        # the n-gram table streamed into its SSD sidecar rather than converted
+        # as a 95 GiB parameter (#390). MTPLX's own backend does the body.
+        from mtplx.commands.forge_qwen4_exp import Qwen4ForgeError, run_lane
+
+        _err("[forge] converting with the MTPLX qwen4_exp lane (n-gram sidecar + streamed body + MTP head)")
+
+        def _lane_progress(name: str, progress: float, label: str, finished: bool) -> None:
+            _write_progress(run, name, progress=progress, label=label, finished=finished)
+
+        try:
+            run_lane(source_path, destination, recipe=recipe, progress=_lane_progress)
+        except Qwen4ForgeError as exc:
+            raise ForgeError(f"qwen4_exp lane failed: {exc}", code=2) from exc
     elif source_format in {SOURCE_AUTOAWQ, SOURCE_COMPRESSED_TENSORS_AWQ}:
         _convert_compressed_tensors_awq(
             source_path,
@@ -1102,15 +1186,72 @@ def _cmd_build(args: Any) -> int:
     _ensure_vision_tower(source_path, destination)
     _validate_vision_payload(source_path, destination)
 
-    _calibrate_sidecar(
-        source_path,
-        destination,
-        recipe=recipe,
-        run=run,
-    )
+    if not quality:
+        _calibrate_sidecar(
+            source_path,
+            destination,
+            recipe=recipe,
+            run=run,
+        )
 
-    existing_runtime = _read_runtime(destination) or _read_runtime(source_path)
-    require_all_depths = True
+    if quality:
+        from mtplx.commands.forge_qwen4_audit import audit_pack, checksum, quality_metadata
+
+        checksums = {p.name: checksum(p) for p in sorted(destination.glob("*.safetensors"))}
+        atomic_write_json(run / "converted_checksums.json", checksums)
+        audit = audit_pack(source_path, destination, recipe, expected_checksums=checksums)
+        # The native head is already written. Its pre-FC norms are deliberately
+        # zero-centred, so generic sidecar "repair" must not re-extract or
+        # reinterpret them. Source parity and complete header accounting above
+        # validate this head; the full-load contract probe still follows below.
+        _write_progress(run, "calibrate", progress=1.0 if verification == "streaming" else 0.75,
+                        label="native_mtp_source_audited", finished=verification == "streaming")
+        atomic_write_json(run / "streaming_audit.json", audit)
+        config = _load_json(destination / "config.json")
+        config["mtplx_quality"] = quality_metadata(quality_source, audit)
+        atomic_write_json(destination / "config.json", config)
+        if verification == "streaming":
+            from mtplx.backends.descriptors import QWEN4_EXP_SAMPLER_DEFAULTS
+
+            # Do not calibrate, load the model, or reuse a source's serving stamp.
+            runtime_metadata = {
+                "mtplx_version": __version__,
+                "arch_id": "qwen4-next",
+                "model_family": "qwen4_exp",
+                "served_model_id": config["mtplx_quality"]["served_id"],
+                "mtp_depth_max": 3,
+                "recommended_profile": "turbo",
+                # The family law the Speed packs carry (1.0 / 0.95 / 20).
+                "sampler": QWEN4_EXP_SAMPLER_DEFAULTS.to_dict(),
+                "exactness_baseline": {
+                    "status": "pending_full_load",
+                    "streaming_audit": "streaming_audit.json",
+                },
+                # A valid, explicitly unverified contract. Empty evidence
+                # must not inherit the source model's verified-on stamp.
+                "verified_on": {},
+                "min_engine_version": config["mtplx_quality"]["min_engine_version"],
+                "quality_pack": config["mtplx_quality"],
+                "verification": {"mode": "streaming", "status": "streaming-audited",
+                                 "full_load_verified": False, "audit": "streaming_audit.json"},
+                "forge_provenance": {
+                    "source_repo": source_repo or source_path.name, "source_sha": source_sha,
+                    "source_format": source_format, "forge_recipe": recipe,
+                    "forged_at": _now_iso(), "mtplx_version": __version__, "forged_locally": True,
+                },
+            }
+            atomic_write_json(destination / "streaming_audit.json", audit)
+            atomic_write_json(destination / "mtplx_runtime.json", runtime_metadata)
+            _write_brand(run, branded_name, runtime_metadata)
+            _write_forge(run, destination, runtime_metadata)
+            _err("[forge] streaming-audited: full-load serving verification still required; no verified stamp written")
+            if bool(getattr(args, "json", False)):
+                _json_out({"local_path": str(destination), "runtime_metadata": runtime_metadata})
+            return 0
+
+    existing_runtime = None if quality else (_read_runtime(destination) or _read_runtime(source_path))
+    require_all_depths = _build_requires_all_depths(destination)
+    verify_depths = _forge_verify_depths(destination)
     rows = _verify_rows_from_runtime(existing_runtime)
     calibration_diagnostic: str | None = None
     has_saved_contract = _runtime_has_mtp_contract(existing_runtime, destination)
@@ -1122,6 +1263,7 @@ def _cmd_build(args: Any) -> int:
             model_path=destination,
             source_path=source_path,
             require_all_depths=require_all_depths,
+            verify_depths=verify_depths,
         )
         if has_saved_contract or has_legacy_speed_grid
         else "missing saved MTP contract"
@@ -1154,7 +1296,9 @@ def _cmd_build(args: Any) -> int:
         )
     if not rows:
         raise ForgeError("verification produced no usable AR/MTP rows")
-    _require_verify_rows(rows, require_all_depths=require_all_depths)
+    _require_verify_rows(
+        rows, require_all_depths=require_all_depths, verify_depths=verify_depths
+    )
     _require_speed_win_or_write_outcome(
         destination,
         run,
@@ -1185,7 +1329,44 @@ def _cmd_build(args: Any) -> int:
     return 0
 
 
-def _prepare_source(source: str, run: Path, probe: dict[str, Any]) -> tuple[Path, str | None, str | None]:
+def _already_downloaded_source(
+    repo_id: str, *, model_root: str | Path | None = None
+) -> tuple[Path, str] | None:
+    """A copy of ``repo_id`` already on disk, and the revision it really is.
+
+    Forge went straight to `pull_model` for every repo id, so a source the
+    machine already held - MTPLX's own cache, or the shared Hugging Face cache
+    another MLX tool filled - was downloaded a second time. `resolve_model_path`
+    is the one lookup every other command uses, so forge now asks it first.
+    The returned sha comes from the copy itself (its pull marker, or the
+    commit-named snapshot directory of a Hugging Face cache entry) so the
+    provenance stamped on the built artifact describes what was actually
+    built from, never whatever revision the remote is at now.
+    """
+
+    try:
+        from mtplx.hf_loader import resolve_model_path
+
+        path = resolve_model_path(repo_id, cache_dir=model_root)
+    except Exception:
+        return None
+    if not path.is_dir():
+        return None
+    marker = read_source_marker(path) or {}
+    sha = str(marker.get("resolved_sha") or "")
+    if not sha and path.parent.name == "snapshots":
+        # Hugging Face cache layout: models--org--name/snapshots/<commit sha>.
+        sha = path.name
+    return path, sha
+
+
+def _prepare_source(
+    source: str,
+    run: Path,
+    probe: dict[str, Any],
+    *,
+    model_root: str | Path | None = None,
+) -> tuple[Path, str | None, str | None]:
     local, repo_id = _normalize_source(source)
     if local is not None:
         size = directory_size_bytes(local) if local.is_dir() else local.stat().st_size
@@ -1200,6 +1381,23 @@ def _prepare_source(source: str, run: Path, probe: dict[str, Any]) -> tuple[Path
         return local, None, None
     if repo_id is None:
         raise ForgeError("build requires a local path or Hugging Face repo id", code=2)
+
+    already = _already_downloaded_source(
+        repo_id, model_root=_default_model_root(model_root)
+    )
+    if already is not None:
+        path, sha = already
+        size = directory_size_bytes(path)
+        _write_download(
+            run,
+            bytes_on_disk=size,
+            total_bytes=size,
+            mb_per_s=0.0,
+            label="already downloaded",
+            finished=True,
+        )
+        _err(f"[forge] using the copy already on disk: {path}")
+        return path, repo_id, sha
 
     total = probe.get("estimated_size_bytes")
     started_at = time.monotonic()
@@ -1239,6 +1437,7 @@ def _prepare_source(source: str, run: Path, probe: dict[str, Any]) -> tuple[Path
     _err(f"[forge] downloading {repo_id}")
     result = pull_model(
         repo_id,
+        cache_dir=_default_model_root(model_root),
         progress_callback=progress,
         progress_interval_s=2.0,
     )
@@ -1634,6 +1833,7 @@ def _ensure_mtp_sidecar(source: Path, destination: Path) -> bool:
         return _extract_embedded_mtp(
             source,
             target,
+            config=config,
             sanitize_values=_should_sanitize_extracted_mtp_weights(config),
         )
     return False
@@ -1658,16 +1858,64 @@ def _extract_embedded_mtp(
     source: Path,
     target: Path,
     *,
+    config: dict[str, Any] | None = None,
     sanitize_values: bool = False,
 ) -> bool:
     index_path = source / "model.safetensors.index.json"
-    if not index_path.exists():
-        return False
-    index = _load_json(index_path)
-    weight_map = index.get("weight_map") if isinstance(index, dict) else None
-    if not isinstance(weight_map, dict):
-        return False
+    if index_path.exists():
+        index = _load_json(index_path)
+        weight_map = index.get("weight_map") if isinstance(index, dict) else None
+        if not isinstance(weight_map, dict):
+            return False
+    else:
+        # A model small enough for one model.safetensors ships no index
+        # (#492, a 4B distill). inspect reads the shard headers in that case
+        # (artifacts._local_model_weight_keys) and reports the head as present,
+        # so forge went ahead, and this function then returned False for want
+        # of an index: the trunk was converted, no mtp.safetensors was written,
+        # and the build died at calibration with "return_hidden requires an
+        # MTP-patched runtime". Build the same map from the headers inspect
+        # reads, so the two agree about what a checkpoint contains.
+        weight_map = {}
+        for shard in sorted(source.glob("model*.safetensors")):
+            _header_size, header = _read_safetensors_header(shard)
+            for key in header:
+                if key != "__metadata__":
+                    weight_map[str(key)] = shard.name
+        if not weight_map:
+            return False
+
+    if config is None:
+        config_path = source / "config.json"
+        try:
+            config = _load_json(config_path) if config_path.exists() else {}
+        except Exception:
+            config = {}
+
+    # Prefix-keyed heads (Qwen, Gemma) win: their layout is unambiguous and
+    # predates this branch.  Only when no "mtp." key exists do we look for an
+    # appended-layer head (GLM MoE), whose keys stay unnormalised because
+    # glm_mtp_patch derives the local MTP index from the literal
+    # "model.layers.{start+i}." form.
     mtp_keys = [key for key in weight_map if artifacts.is_mtp_key(str(key))]
+    key_transform: Callable[[str], str] | None = artifacts.normalize_mtp_key
+    if not mtp_keys and artifacts.uses_appended_layer_mtp(config):
+        mtp_keys = [
+            key
+            for key in weight_map
+            if artifacts.is_appended_layer_mtp_key(str(key), config)
+        ]
+        key_transform = None
+    if not mtp_keys and artifacts.uses_mtp_layers_namespace(config):
+        # MiMo keeps the head in its own "model.mtp_layers.N." namespace beside
+        # the decoder stack.  mimo_mtp_patch reads that form directly, so the
+        # keys stay unnormalised here too.
+        mtp_keys = [
+            key
+            for key in weight_map
+            if artifacts.is_mtp_layers_namespace_key(str(key), config)
+        ]
+        key_transform = None
     if not mtp_keys:
         return False
 
@@ -1679,7 +1927,7 @@ def _extract_embedded_mtp(
         source,
         by_file,
         target,
-        key_transform=artifacts.normalize_mtp_key,
+        key_transform=key_transform,
         sanitize_values=sanitize_values,
     )
     return True
@@ -1994,7 +2242,11 @@ def _calibrate_mtp_contract(
     existing: dict[str, Any] | None,
     max_fans: bool = False,
 ) -> dict[str, Any]:
-    fallback = _runtime_or_default_mtp_contract(existing)
+    # The contract the head source declares (runtime file or config), or the
+    # family default when it declares none. Calibration keeps it unless the
+    # probe clearly beats it.
+    fallback = _runtime_or_default_mtp_contract(existing, model_path)
+    fallback_source = _declared_mtp_contract_source(existing, model_path)
     allow_uncalibrated = bool(
         recipe.get("allow_uncalibrated_mtp_contract")
         or recipe.get("allow_uncalibrated_contract")
@@ -2021,6 +2273,14 @@ def _calibrate_mtp_contract(
         finished=False,
     )
     output_path = run / "contract_probe.json"
+    depth = int(recipe.get("contract_calibration_depth") or CONTRACT_CALIBRATION_DEFAULT_DEPTH)
+    # The probe must measure the declared contract itself, or it has nothing
+    # to beat. The probe spells the runtime's "cache" position mode "local".
+    reference_position = (
+        "local"
+        if _contract_position_class(fallback.get("mtp_position_mode")) == "cache"
+        else str(fallback.get("mtp_position_mode"))
+    )
     command = [
         sys.executable,
         "-P",
@@ -2032,27 +2292,40 @@ def _calibrate_mtp_contract(
         "--prompts",
         str(prompts_path),
         "--depth",
-        str(int(recipe.get("contract_calibration_depth") or 3)),
+        str(depth),
         "--limit",
-        str(int(recipe.get("contract_calibration_limit") or 1)),
+        str(int(recipe.get("contract_calibration_limit") or CONTRACT_CALIBRATION_DEFAULT_PROMPTS)),
         "--max-prompt-tokens",
         str(int(recipe.get("contract_calibration_max_prompt_tokens") or 192)),
         "--windows",
-        str(int(recipe.get("contract_calibration_windows") or 1)),
+        str(int(recipe.get("contract_calibration_windows") or CONTRACT_CALIBRATION_DEFAULT_WINDOWS)),
         "--stride",
-        str(int(recipe.get("contract_calibration_stride") or 1)),
+        # Windows a chain apart share no drafted position.
+        str(int(recipe.get("contract_calibration_stride") or depth)),
         "--top-ranks",
         str(recipe.get("contract_calibration_top_ranks") or "1,2,4,8"),
         "--base-hidden-variants",
-        str(recipe.get("base_hidden_variants") or "post_norm,pre_norm"),
+        _with_probe_candidate(
+            recipe.get("base_hidden_variants") or "post_norm,pre_norm",
+            fallback.get("base_hidden_variant"),
+        ),
         "--mtp-hidden-variants",
-        str(recipe.get("mtp_hidden_variants") or "post_norm,pre_norm,fc,prev"),
+        _with_probe_candidate(
+            recipe.get("mtp_hidden_variants") or "post_norm,pre_norm,fc,prev",
+            fallback.get("hidden_variant"),
+        ),
         "--cache-policies",
         str(recipe.get("mtp_cache_policies") or "persistent"),
         "--concat-orders",
-        str(recipe.get("concat_orders") or "embedding_hidden,hidden_embedding"),
+        _with_probe_candidate(
+            recipe.get("concat_orders") or "embedding_hidden,hidden_embedding",
+            fallback.get("concat_order"),
+        ),
         "--mtp-position-modes",
-        str(recipe.get("mtp_position_modes") or "local,absolute"),
+        _with_probe_candidate(
+            recipe.get("mtp_position_modes") or "local,absolute",
+            reference_position,
+        ),
         "--history-modes",
         str(recipe.get("mtp_history_modes") or "recursive"),
         "--anchors",
@@ -2141,7 +2414,9 @@ def _calibrate_mtp_contract(
         )
     try:
         payload = _load_json(output_path)
-        contract = _contract_from_chain_probe(payload, fallback=fallback)
+        contract = _contract_from_chain_probe(
+            payload, fallback=fallback, fallback_source=fallback_source
+        )
     except ForgeError as exc:
         payload_for_summary = payload if "payload" in locals() else None
         summary = _contract_probe_summary(
@@ -2221,9 +2496,9 @@ def _calibrate_mtp_contract(
         diagnostic=calibration_diagnostic or None,
     )
     label = (
-        "contract_calibration"
-        if calibration_status in {"", "exact_agreement"}
-        else "contract_calibration_diagnostic"
+        "contract_calibration_inconclusive"
+        if calibration_status == "inconclusive"
+        else "contract_calibration"
     )
     _write_progress(
         run,
@@ -2287,6 +2562,23 @@ def _runtime_or_default_mtp_contract(
     return _normalize_mtp_contract_for_config(None, config)
 
 
+def _declared_mtp_contract_source(
+    runtime: dict[str, Any] | None,
+    model_path: Path | None = None,
+) -> str:
+    """Where the fallback MTP contract comes from.
+
+    ``declared`` when the head source names its contract (its runtime file or
+    its config), otherwise ``family_default``: the loader's default contract.
+    """
+    if isinstance(runtime, dict) and isinstance(runtime.get("mtp_contract"), dict):
+        return "declared"
+    config = _load_model_config_for_contract(model_path)
+    if isinstance(config.get("mtplx_mtp_contract"), dict):
+        return "declared"
+    return "family_default"
+
+
 def _runtime_has_mtp_contract(
     runtime: dict[str, Any] | None,
     model_path: Path | None = None,
@@ -2334,109 +2626,270 @@ def _start_max_session_if_requested(enabled: bool) -> Any | None:
     return session
 
 
+def _contract_position_class(value: Any) -> str:
+    """The runtime reads "local" (and an unset mode) as the "cache" position
+    mode (``generation._resolve_runtime_mtp_position_mode``), so the two
+    name one contract."""
+    text = str(value or "cache").strip().lower().replace("-", "_")
+    if text in {"", "0", "off", "false", "default", "cache", "local"}:
+        return "cache"
+    return text
+
+
+def _with_probe_candidate(raw: Any, value: Any) -> str:
+    """A chain-probe candidate list that also contains ``value``."""
+    items = [item.strip() for item in str(raw).split(",") if item.strip()]
+    text = str(value or "").strip()
+    if text and text not in items:
+        items.append(text)
+    return ",".join(items)
+
+
+def _contract_key(
+    *,
+    base_hidden_variant: Any,
+    hidden_variant: Any,
+    concat_order: Any,
+    mtp_position_mode: Any,
+) -> tuple[str, str, str, str]:
+    return (
+        str(base_hidden_variant or "post_norm"),
+        str(hidden_variant or "post_norm"),
+        str(concat_order or "embedding_hidden"),
+        _contract_position_class(mtp_position_mode),
+    )
+
+
+def _add_counts(left: list[int], right: list[int]) -> list[int]:
+    size = max(len(left), len(right))
+    return [
+        (left[index] if index < len(left) else 0)
+        + (right[index] if index < len(right) else 0)
+        for index in range(size)
+    ]
+
+
+def _probe_contract_candidates(variants: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The chain probe's variants pooled by the contract each would stamp.
+
+    Anchors, cache policies and history modes are measurement conditions, and
+    the probe runs every contract under the same set, so a contract's evidence
+    is the sum over its variants. ``accepted_per_round`` is the mean accepted
+    draft prefix: the draft tokens verification keeps per round, which is
+    what decode speed follows. A match after a miss earns nothing.
+    """
+    pooled: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for order, variant in enumerate(variants):
+        key = _contract_key(
+            base_hidden_variant=variant.get("base_hidden_variant"),
+            hidden_variant=variant.get("mtp_hidden_variant") or variant.get("hidden_variant"),
+            concat_order=variant.get("concat_order"),
+            mtp_position_mode=variant.get("mtp_position_mode"),
+        )
+        entry = pooled.setdefault(
+            key,
+            {
+                "key": key,
+                "order": order,
+                "position_mode": str(variant.get("mtp_position_mode") or ""),
+                "prompts": set(),
+                "draft_rounds": 0,
+                "drafted_tokens": 0,
+                "accepted_tokens": 0.0,
+                "matches_by_depth": [],
+                "totals_by_depth": [],
+                "hint": False,
+            },
+        )
+        totals = [int(value) for value in _numeric_list(variant.get("totals_by_depth"))]
+        matches = [int(value) for value in _numeric_list(variant.get("matches_by_depth"))]
+        rounds = totals[0] if totals else 0
+        prefixes = _numeric_list(variant.get("prefixes"))
+        entry["draft_rounds"] += rounds
+        entry["drafted_tokens"] += sum(totals)
+        entry["accepted_tokens"] += (
+            sum(prefixes) if prefixes else float(variant.get("mean_prefix") or 0.0) * rounds
+        )
+        entry["matches_by_depth"] = _add_counts(entry["matches_by_depth"], matches)
+        entry["totals_by_depth"] = _add_counts(entry["totals_by_depth"], totals)
+        for row in variant.get("rows") or []:
+            if isinstance(row, dict) and row.get("prompt_id") is not None:
+                entry["prompts"].add(str(row["prompt_id"]))
+        topk = variant.get("topk_hits_by_depth") or variant.get("topk_rates_by_depth")
+        if sum(matches) > 0 or (
+            isinstance(topk, dict)
+            and any(value > 0 for series in topk.values() for value in _numeric_list(series))
+        ):
+            entry["hint"] = True
+    candidates = []
+    for entry in pooled.values():
+        entry["prompt_count"] = len(entry.pop("prompts"))
+        rounds = entry["draft_rounds"]
+        entry["accepted_per_round"] = entry["accepted_tokens"] / rounds if rounds else 0.0
+        candidates.append(entry)
+    return candidates
+
+
+def _probe_candidate_has_evidence(candidate: dict[str, Any] | None) -> bool:
+    return bool(
+        candidate is not None
+        and candidate["prompt_count"] >= CONTRACT_CALIBRATION_MIN_PROMPTS
+        and candidate["draft_rounds"] >= CONTRACT_CALIBRATION_MIN_DRAFT_ROUNDS
+    )
+
+
+def _probe_candidate_summary(candidate: dict[str, Any] | None) -> dict[str, Any] | None:
+    if candidate is None:
+        return None
+    base, hidden, concat, position = candidate["key"]
+    return {
+        "base_hidden_variant": base,
+        "hidden_variant": hidden,
+        "concat_order": concat,
+        "mtp_position_mode": candidate["position_mode"] or position,
+        "prompts": candidate["prompt_count"],
+        "draft_rounds": candidate["draft_rounds"],
+        "drafted_tokens": candidate["drafted_tokens"],
+        "accepted_per_round": round(candidate["accepted_per_round"], 4),
+        "agreement_by_depth": [
+            round(matches / total, 4) if total else None
+            for matches, total in zip(candidate["matches_by_depth"], candidate["totals_by_depth"])
+        ],
+    }
+
+
 def _contract_from_chain_probe(
     payload: dict[str, Any],
     *,
     fallback: dict[str, Any],
+    fallback_source: str = "family_default",
 ) -> dict[str, Any]:
+    """The MTP contract the chain probe supports, or ``fallback`` kept.
+
+    ``fallback`` is the head source's declared contract, or the family default
+    when nothing is declared. The probe moves a pack off it only on real
+    evidence: the declared contract and the challenger each measured on
+    CONTRACT_CALIBRATION_MIN_PROMPTS prompts and
+    CONTRACT_CALIBRATION_MIN_DRAFT_ROUNDS drafted chains, and the challenger
+    accepting CONTRACT_CALIBRATION_MARGIN more draft tokens per round. A thin
+    sample, all zeros or a tie keeps ``fallback`` and records the calibration
+    as inconclusive. The declared contract is "confirmed" when it beats every
+    alternative by the margin.
+    """
     variants = payload.get("variants") if isinstance(payload, dict) else None
-    if not isinstance(variants, list) or not variants:
-        return fallback
-    winner = max(
-        (variant for variant in variants if isinstance(variant, dict)),
-        key=_chain_probe_contract_score,
-        default=None,
+    candidates = _probe_contract_candidates(
+        [variant for variant in variants or [] if isinstance(variant, dict)]
     )
-    if not winner:
-        return fallback
-    score = _chain_probe_contract_score(winner)
-    agreement = _numeric_list(winner.get("agreement_by_depth"))
-    if score <= 0.0:
-        return _contract_from_probe_variant(
-            winner,
-            payload=payload,
-            fallback=fallback,
-            score=score,
-            status="no_agreement_signal",
-            diagnostic=(
-                "MTP contract calibration found no agreement signal; "
-                "the MTP sidecar is probably mismatched to the trunk"
+    reference_key = _contract_key(
+        base_hidden_variant=fallback.get("base_hidden_variant"),
+        hidden_variant=fallback.get("hidden_variant"),
+        concat_order=fallback.get("concat_order"),
+        mtp_position_mode=fallback.get("mtp_position_mode"),
+    )
+    reference = next((item for item in candidates if item["key"] == reference_key), None)
+    ranked = sorted(
+        (item for item in candidates if _probe_candidate_has_evidence(item)),
+        key=lambda item: (-item["accepted_per_round"], item["order"]),
+    )
+    rivals = [item for item in ranked if item["key"] != reference_key]
+    if any(item["accepted_tokens"] > 0 for item in candidates):
+        signal = "exact_agreement"
+    elif any(item["hint"] for item in candidates):
+        signal = "topk_only_no_exact_agreement"
+    else:
+        signal = "no_agreement_signal"
+    kept = "declared" if fallback_source == "declared" else "family default"
+    margin = CONTRACT_CALIBRATION_MARGIN
+    status = "inconclusive"
+    reason: str | None = None
+    diagnostic: str | None = None
+    chosen: dict[str, Any] | None = None
+    if not _probe_candidate_has_evidence(reference):
+        reason = "insufficient_evidence"
+        diagnostic = (
+            "MTP contract calibration was inconclusive: "
+            f"{reference['prompt_count'] if reference else 0} prompt(s) and "
+            f"{reference['draft_rounds'] if reference else 0} draft round(s) per "
+            f"contract are below the minimum of {CONTRACT_CALIBRATION_MIN_PROMPTS} "
+            f"prompts and {CONTRACT_CALIBRATION_MIN_DRAFT_ROUNDS} rounds, so the "
+            f"{kept} contract was kept"
+        )
+    elif ranked[0]["accepted_per_round"] <= 0.0:
+        reason = "no_signal"
+        found = (
+            "only top-k hints and no exact agreement signal"
+            if signal == "topk_only_no_exact_agreement"
+            else "no agreement signal"
+        )
+        diagnostic = (
+            f"MTP contract calibration found {found} in "
+            f"{reference['draft_rounds']} draft rounds over "
+            f"{reference['prompt_count']} prompts; the MTP sidecar is probably "
+            f"mismatched to the trunk, and the {kept} contract was kept"
+        )
+    elif rivals and rivals[0]["accepted_per_round"] - reference["accepted_per_round"] >= margin:
+        status = "switched"
+        top = rivals[0]["accepted_per_round"]
+        # Alternatives inside the margin of the best are a tie among
+        # themselves; take the one that changes the fewest declared fields.
+        chosen = min(
+            (
+                item
+                for item in rivals
+                if top - item["accepted_per_round"] < margin
+                and item["accepted_per_round"] - reference["accepted_per_round"] >= margin
+            ),
+            key=lambda item: (
+                sum(left != right for left, right in zip(item["key"], reference_key)),
+                -item["accepted_per_round"],
+                item["order"],
             ),
         )
-    if not agreement or sum(agreement) <= 0.0:
-        return _contract_from_probe_variant(
-            winner,
-            payload=payload,
-            fallback=fallback,
-            score=score,
-            status="topk_only_no_exact_agreement",
-            diagnostic=(
-                "MTP contract calibration found only top-k hints and no exact "
-                "agreement signal; the MTP sidecar is probably mismatched to the trunk"
-            ),
+    elif not rivals or reference["accepted_per_round"] - rivals[0]["accepted_per_round"] >= margin:
+        status = "confirmed"
+    else:
+        reason = "tie"
+        diagnostic = (
+            f"MTP contract calibration was inconclusive: no contract beat the {kept} "
+            f"contract by the {margin:.2f}-token margin ({kept} "
+            f"{reference['accepted_per_round']:.2f}, closest alternative "
+            f"{rivals[0]['accepted_per_round']:.2f} accepted draft tokens per "
+            f"round), so the {kept} contract was kept"
         )
-    return _contract_from_probe_variant(
-        winner,
-        payload=payload,
-        fallback=fallback,
-        score=score,
-        status="exact_agreement",
-        diagnostic=None,
+    alternatives = rivals or sorted(
+        (item for item in candidates if item["key"] != reference_key),
+        key=lambda item: (-item["accepted_per_round"], item["order"]),
     )
-
-
-def _contract_from_probe_variant(
-    winner: dict[str, Any],
-    *,
-    payload: dict[str, Any],
-    fallback: dict[str, Any],
-    score: float,
-    status: str,
-    diagnostic: str | None,
-) -> dict[str, Any]:
-    contract = dict(fallback)
-    contract.update(
-        {
-            "base_hidden_variant": str(
-                winner.get("base_hidden_variant")
-                or fallback.get("base_hidden_variant")
-                or "post_norm"
-            ),
-            "hidden_variant": str(
-                winner.get("mtp_hidden_variant")
-                or winner.get("hidden_variant")
-                or fallback.get("hidden_variant")
-                or "post_norm"
-            ),
-            "concat_order": str(
-                winner.get("concat_order")
-                or fallback.get("concat_order")
-                or "embedding_hidden"
-            ),
-            "mtp_position_mode": str(
-                winner.get("mtp_position_mode")
-                or fallback.get("mtp_position_mode")
-                or "cache"
-            ),
-            "calibration": {
-                "probe": "mtp-chain-probe",
-                "status": status,
-                "score": score,
-                "diagnostic": diagnostic,
-                "agreement_by_depth": winner.get("agreement_by_depth"),
-                "topk_rates_by_depth": winner.get("topk_rates_by_depth"),
-                "cache_policy": winner.get("cache_policy"),
-                "history_mode": winner.get("history_mode"),
-                "anchor": winner.get("anchor"),
-                "mean_prefix": winner.get("mean_prefix"),
-            },
-        }
-    )
-    for key in ("mtp_quant_bits", "mtp_quant_group_size", "mtp_quant_mode", "mtp_quant_policy"):
-        if payload.get(key) is not None:
-            contract[key] = payload[key]
+    calibration = {
+        "probe": "mtp-chain-probe",
+        "status": status,
+        "reason": reason,
+        "signal": signal,
+        "kept": None if chosen is not None else fallback_source,
+        "diagnostic": diagnostic,
+        "metric": "accepted_draft_tokens_per_round",
+        "required_margin": margin,
+        "min_prompts": CONTRACT_CALIBRATION_MIN_PROMPTS,
+        "min_draft_rounds": CONTRACT_CALIBRATION_MIN_DRAFT_ROUNDS,
+        "candidates_tested": len(candidates),
+        "reference": _probe_candidate_summary(reference),
+        "best_alternative": _probe_candidate_summary(alternatives[0] if alternatives else None),
+        "chosen": _probe_candidate_summary(chosen),
+    }
+    contract = {key: value for key, value in fallback.items() if key != "calibration"}
+    if chosen is not None:
+        base, hidden, concat, position = chosen["key"]
+        contract["base_hidden_variant"] = base
+        contract["hidden_variant"] = hidden
+        contract["concat_order"] = concat
+        if position != reference_key[3]:
+            contract["mtp_position_mode"] = chosen["position_mode"] or position
+    if isinstance(payload, dict):
+        for key in ("mtp_quant_bits", "mtp_quant_group_size", "mtp_quant_mode", "mtp_quant_policy"):
+            if payload.get(key) is not None:
+                contract[key] = payload[key]
     return MTPContract().with_metadata(contract, preserve_explicit=False).to_dict() | {
-        "calibration": contract["calibration"]
+        "calibration": calibration
     }
 
 
@@ -2467,15 +2920,6 @@ def _contract_probe_summary(
         "best_topk_hint": float(best_topk),
         "diagnostic": diagnostic,
     }
-
-
-def _chain_probe_contract_score(variant: dict[str, Any]) -> float:
-    agreement = _numeric_list(variant.get("agreement_by_depth"))
-    topk = variant.get("topk_rates_by_depth")
-    top4 = _numeric_list(topk.get("4") if isinstance(topk, dict) else None)
-    top8 = _numeric_list(topk.get("8") if isinstance(topk, dict) else None)
-    d1 = agreement[0] if agreement else 0.0
-    return (4.0 * sum(agreement)) + (1.5 * sum(top4)) + sum(top8) + (2.0 * d1)
 
 
 def _numeric_list(value: Any) -> list[float]:
@@ -2537,15 +2981,17 @@ def _run_verify(
         "--run-id",
         tune_run_id,
         "--depths",
-        "1,2,3",
+        ",".join(str(depth) for depth in _forge_verify_depths(model_path)),
         "--max-tokens",
         str(max(1, int(max_tokens))),
         "--prompt-suite",
         str(prompt_suite),
         "--yes",
     ]
+    # Tune pins fans only when asked, so a build without --max leaves them on
+    # automatic; --max keeps the strict verified-ramp behavior.
     if max_fans:
-        command.append("--require-max-fans")
+        command.extend(["--max", "--require-max-fans"])
     if isinstance(mtp_contract, dict):
         base_hidden_variant = mtp_contract.get("base_hidden_variant")
         hidden_variant = mtp_contract.get("hidden_variant")
@@ -2596,6 +3042,17 @@ def _run_verify(
             )
         )
     return rows
+
+
+def _build_requires_all_depths(model_path: Path) -> bool:
+    """Whether a build must see every tune depth (D1..Dn) before it passes.
+
+    The tune lane sweeps depths, so a missing one is a failed measurement.
+    The family-serve lane measures exactly two rows -- AR and the family's
+    speculative default (D3 on Flash-Next) -- through the real serve path,
+    so requiring D1/D2 there rejected every qwen4_exp build after a passing
+    verify."""
+    return _verify_rows_lane(model_path) != "family-serve"
 
 
 def _verify_rows_lane(model_path: Path) -> str:
@@ -3107,18 +3564,45 @@ def _annotate_verify_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return annotated
 
 
-def _verify_rows_have_all_depths(rows: list[dict[str, Any]]) -> bool:
-    depths = {int(row.get("depth") or 0) for row in rows if isinstance(row, dict)}
-    return all(depth in depths for depth in (0, 1, 2, 3))
+DEFAULT_FORGE_VERIFY_DEPTHS = (1, 2, 3)
+
+
+def _forge_verify_depths(model_path: Path) -> tuple[int, ...]:
+    """Depths forge asks tune to measure, taken from the model's tune policy.
+
+    Backends do not all reach D3. MiMo drafts one token per step, so a fixed
+    1,2,3 makes tune reject the whole run with "tune depths must be one of 1".
+    """
+    from mtplx.backends.descriptors import tune_policy_for_model
+
+    try:
+        policy = tune_policy_for_model(model_ref=str(model_path))
+    except Exception:
+        return DEFAULT_FORGE_VERIFY_DEPTHS
+    depths = tuple(
+        int(candidate[1:])
+        for candidate in getattr(policy, "candidates", ())
+        if str(candidate).startswith("D") and str(candidate)[1:].isdigit()
+    )
+    return depths or DEFAULT_FORGE_VERIFY_DEPTHS
+
+
+def _verify_rows_have_all_depths(
+    rows: list[dict[str, Any]],
+    depths: tuple[int, ...] = DEFAULT_FORGE_VERIFY_DEPTHS,
+) -> bool:
+    present = {int(row.get("depth") or 0) for row in rows if isinstance(row, dict)}
+    return all(depth in present for depth in (0, *depths))
 
 
 def _require_verify_rows(
     rows: list[dict[str, Any]],
     *,
     require_all_depths: bool = False,
+    verify_depths: tuple[int, ...] = DEFAULT_FORGE_VERIFY_DEPTHS,
 ) -> None:
     depths = {int(row.get("depth") or 0) for row in rows if isinstance(row, dict)}
-    required = (0, 1, 2, 3) if require_all_depths else (0,)
+    required = (0, *verify_depths) if require_all_depths else (0,)
     missing = [depth for depth in required if depth not in depths]
     if missing:
         raise ForgeError(
@@ -3158,11 +3642,13 @@ def _saved_verify_rows_reuse_blocker(
     model_path: Path,
     source_path: Path | None = None,
     require_all_depths: bool,
+    verify_depths: tuple[int, ...] = DEFAULT_FORGE_VERIFY_DEPTHS,
 ) -> str | None:
     if not rows:
         return "missing saved verification rows"
-    if require_all_depths and not _verify_rows_have_all_depths(rows):
-        return "saved verification is missing AR/D1/D2/D3 rows"
+    if require_all_depths and not _verify_rows_have_all_depths(rows, verify_depths):
+        expected = ", ".join(["AR", *(f"D{depth}" for depth in verify_depths)])
+        return f"saved verification is missing {expected} rows"
     if not any(int(row.get("depth") or 0) > 0 for row in rows):
         return "saved verification has no MTP depth rows"
     if any(row.get("hit_token_budget") for row in rows):
@@ -3276,6 +3762,32 @@ def _recommended_profile_stamp(model_path: Path, *, best_depth: int) -> str:
     return resolved_default_profile_name_for_ref(model_path)
 
 
+def _resolve_source_identity(source_repo: str, source_sha: str) -> tuple[str, str]:
+    """Name the trunk by its Hub repo id when ``source_repo`` is a local pull.
+
+    Forge is usually pointed at a directory under the model cache. Stamping
+    that directory as ``base_trunk`` and ``source_repo`` published the
+    maintainer's home directory with every pack. The pull marker inside the
+    directory records the repo id and commit it was synced from; a cache
+    directory without a marker still carries the repo id in its
+    ``owner--name`` layout. Anything else is returned untouched.
+    """
+
+    candidate = Path(source_repo).expanduser()
+    if not source_repo or not candidate.is_dir():
+        return source_repo, source_sha
+    marker = read_source_marker(candidate) or {}
+    repo_id = marker.get("repo_id")
+    if not (isinstance(repo_id, str) and repo_id.count("/") == 1):
+        repo_id = candidate.name.replace("--", "/") if candidate.name.count("--") == 1 else None
+    if not repo_id or repo_id.startswith("/") or repo_id.endswith("/"):
+        return source_repo, source_sha
+    resolved_sha = marker.get("resolved_sha")
+    if not source_sha and isinstance(resolved_sha, str) and resolved_sha:
+        source_sha = resolved_sha
+    return repo_id, source_sha
+
+
 def _stamp_runtime_metadata(
     model_path: Path,
     *,
@@ -3290,9 +3802,13 @@ def _stamp_runtime_metadata(
     existing: dict[str, Any] | None,
 ) -> dict[str, Any]:
     metadata = dict(existing or {})
+    source_repo, source_sha = _resolve_source_identity(source_repo, source_sha)
     if _runtime_evidence_has_launch_blocker(metadata.get("exactness_baseline")):
         metadata["exactness_baseline"] = {}
     config = _load_json(model_path / "config.json") if (model_path / "config.json").exists() else {}
+    # How calibration chose (or kept) the contract; the normalized contract
+    # below carries only the contract fields.
+    calibration = mtp_contract.get("calibration") if isinstance(mtp_contract, dict) else None
     mtp_contract = _normalize_mtp_contract_for_config(mtp_contract, config)
     inspection = None
     try:
@@ -3334,6 +3850,11 @@ def _stamp_runtime_metadata(
         "macos": platform.mac_ver()[0],
         "model": branded_name,
     }
+    metadata["verification"] = {"mode": "full-load", "status": "verified", "full_load_verified": True}
+    if config.get("mtplx_quality"):
+        metadata["quality_pack"] = config["mtplx_quality"]
+        metadata["min_engine_version"] = config["mtplx_quality"]["min_engine_version"]
+        metadata["served_model_id"] = config["mtplx_quality"]["served_id"]
     metadata.setdefault("exactness_baseline", {})
     speed_evidence = _speed_evidence(rows)
     artifact_fingerprint = _verification_artifact_fingerprint(model_path)
@@ -3362,6 +3883,8 @@ def _stamp_runtime_metadata(
         "forged_locally": True,
         "published_to_hf": None,
     }
+    if isinstance(calibration, dict):
+        metadata["forge_provenance"]["mtp_contract_calibration"] = dict(calibration)
     return metadata
 
 
@@ -3635,6 +4158,10 @@ def _cmd_publish(args: Any) -> int:
         finished=False,
     )
     started = time.monotonic()
+    # Local metadata keeps the paths forge read and wrote: useful on this
+    # machine, a home directory anywhere else. The folder goes up without the
+    # documents that carry them and scrubbed copies follow in their place.
+    scrubbed = scrub_json_documents(local)
     _err(f"[forge] uploading {local}")
     upload_result = api.upload_folder(
         folder_path=str(local),
@@ -3642,11 +4169,25 @@ def _cmd_publish(args: Any) -> int:
         repo_type="model",
         token=token,
         commit_message="Publish MTPLX forged model",
+        ignore_patterns=[document.name for document in scrubbed],
     )
     revision = _revision_from_upload_result(upload_result)
+    for document in scrubbed:
+        _err(f"[forge] {document.name}: {len(document.leaks)} local path(s) scrubbed before upload")
+        document_result = api.upload_file(
+            path_or_fileobj=document.payload,
+            path_in_repo=document.name,
+            repo_id=args.repo,
+            repo_type="model",
+            token=token,
+            commit_message=f"Publish {document.name} without local paths",
+        )
+        revision = _revision_from_upload_result(document_result) or revision
     if readme_path and readme_path.exists():
         readme_result = api.upload_file(
-            path_or_fileobj=str(readme_path),
+            path_or_fileobj=scrub_text_value(
+                readme_path.read_text(encoding="utf-8")
+            ).encode("utf-8"),
             path_in_repo="README.md",
             repo_id=args.repo,
             repo_type="model",
@@ -3719,7 +4260,11 @@ def _try_hf_runtime(repo_id: str) -> dict[str, Any] | None:
         return None
 
 
-def _default_model_root() -> Path:
+def _default_model_root(model_root: str | Path | None = None) -> Path:
+    if model_root is not None:
+        if isinstance(model_root, str) and not model_root.strip():
+            raise ForgeError("model root cannot be empty", code=2)
+        return Path(model_root).expanduser()
     env = os.environ.get("MTPLX_FORGE_MODEL_ROOT") or os.environ.get("MTPLX_MODEL_DIR")
     if env:
         return Path(env).expanduser()
@@ -3729,15 +4274,20 @@ def _default_model_root() -> Path:
     return Path("~/.mtplx/models").expanduser()
 
 
-def _unique_model_dir(branded_name: str) -> Path:
+def _unique_model_dir(
+    branded_name: str, *, model_root: str | Path | None = None
+) -> Path:
     """Return an unused artifact path without creating the final directory.
 
     `mlx_lm.convert` refuses an output path that already exists, while local
     mirror paths are happy to create their destination on first copy.
     """
 
-    root = _default_model_root()
-    root.mkdir(parents=True, exist_ok=True)
+    root = _default_model_root(model_root)
+    try:
+        ensure_model_root(root)
+    except RuntimeError as exc:
+        raise ForgeError(str(exc), code=2) from exc
     base = root / branded_name
     if not base.exists():
         return base
@@ -3760,6 +4310,7 @@ def _mirror_model_tree(source: Path, destination: Path) -> None:
     if not source.is_dir():
         raise ForgeError(f"source must be a model directory: {source}")
     destination.mkdir(parents=True, exist_ok=False)
+    directory_chain = {_directory_identity(source)}
     for child in source.iterdir():
         target = destination / child.name
         if child.name == "mtplx_runtime.json":
@@ -3767,29 +4318,85 @@ def _mirror_model_tree(source: Path, destination: Path) -> None:
         if child.name == "config.json" and child.is_file():
             _copy_file(child, target)
             continue
-        _mirror_entry(child, target)
+        _mirror_entry(child, target, _directory_chain=directory_chain)
 
 
-def _mirror_entry(source: Path, target: Path) -> None:
-    if source.is_dir() and not source.is_symlink():
+def _directory_identity(path: Path) -> tuple[int, int]:
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        raise ForgeError(f"cannot inspect model directory {path}: {exc}") from exc
+    return int(stat.st_dev), int(stat.st_ino)
+
+
+def _mirror_entry(
+    source: Path,
+    target: Path,
+    *,
+    _directory_chain: set[tuple[int, int]] | None = None,
+) -> None:
+    if source.is_dir():
+        identity = _directory_identity(source)
+        chain = _directory_chain or set()
+        if identity in chain:
+            raise ForgeError(f"model source contains a directory symlink cycle: {source}")
+        child_chain = {*chain, identity}
         target.mkdir(parents=True, exist_ok=True)
         for child in source.iterdir():
-            _mirror_entry(child, target / child.name)
+            _mirror_entry(
+                child,
+                target / child.name,
+                _directory_chain=child_chain,
+            )
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists() or target.is_symlink():
         return
+    _link_or_copy_file(source, target)
+
+
+def _link_or_copy_file(source: Path, target: Path) -> None:
+    """Atomically materialize an immutable payload without durable symlinks."""
+
     try:
-        os.symlink(source.resolve(strict=False), target)
-    except OSError:
-        _copy_file(source, target)
+        resolved = source.resolve(strict=True)
+    except OSError as exc:
+        raise ForgeError(f"cannot resolve model payload {source}: {exc}") from exc
+    if not resolved.is_file():
+        raise ForgeError(f"model payload is not a regular file: {source}")
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        try:
+            os.link(resolved, tmp)
+        except OSError:
+            shutil.copy2(resolved, tmp)
+        os.replace(tmp, target)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _copy_file(source: Path, target: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists() or target.is_symlink():
         return
-    shutil.copy2(source, target)
+    try:
+        resolved = source.resolve(strict=True)
+    except OSError as exc:
+        raise ForgeError(f"cannot resolve model payload {source}: {exc}") from exc
+    if not resolved.is_file():
+        raise ForgeError(f"model payload is not a regular file: {source}")
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        shutil.copy2(resolved, tmp)
+        os.replace(tmp, target)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _read_runtime(path: Path) -> dict[str, Any] | None:

@@ -6,6 +6,8 @@ cached row and only a store mutation (or the staleness TTL) may trigger a
 fresh sqlite connection.
 """
 
+import time
+
 from mtplx.cache_bank import SessionBankColdTier
 
 
@@ -34,6 +36,12 @@ def test_repeated_stats_polls_reuse_cached_aggregate(tmp_path, monkeypatch):
     try:
         calls = _count_connects(tier, monkeypatch)
         first = tier.stats()
+        # The first poll starts the cold-start census in the background; its
+        # own two manifest reads (the totals paired with the walk) are not
+        # polls. Let it land before counting, or the count races the thread.
+        deadline = time.monotonic() + 5.0
+        while tier.stats().get("disk_usage_scan_pending") and time.monotonic() < deadline:
+            time.sleep(0.005)
         connects_after_first = len(calls)
         assert connects_after_first >= 1
         for _ in range(10):

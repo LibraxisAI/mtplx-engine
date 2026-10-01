@@ -2,9 +2,13 @@ import Foundation
 
 // MARK: - OnboardingStep
 //
-// The six-step linear flow. Order is canonical; `goNext` / `goBack`
+// The seven-step linear flow. Order is canonical; `goNext` / `goBack`
 // walk the case array in declaration order so the enum doubles as the
 // progress indicator's source of truth.
+//
+// `language` comes first so every later step already renders in the
+// language the user picked; the choice persists through LanguageStore
+// and can be changed again in Settings.
 //
 // `runtimeSetup` sits before download on purpose: the download and
 // tune steps both shell the `mtplx` CLI, so the runtime (plus fan
@@ -13,12 +17,18 @@ import Foundation
 // "Skip tune" could finish onboarding with no runtime installed.
 
 public enum OnboardingStep: String, CaseIterable, Equatable, Sendable {
+    case language
     case welcome
     case hardwareScan = "hardware_scan"
     case modelPick = "model_pick"
     case runtimeSetup = "runtime_setup"
     case download
     case tune
+
+    /// Position in the canonical flow, for the "Step N of M" capsule.
+    public var index: Int {
+        Self.allCases.firstIndex(of: self) ?? 0
+    }
 }
 
 // MARK: - ModelPickChoice
@@ -32,6 +42,10 @@ public enum OnboardingStep: String, CaseIterable, Equatable, Sendable {
 public enum ModelPickChoice: Equatable, Sendable, Hashable {
     case none
     case curatedQwen35FourBit
+    case curatedQwen35FourBQuality
+    case curatedBonsaiOptimizedSpeed
+    case curatedFlashNextOptimizedQuality
+    case curatedMiMoQwen9BOptimizedSpeed
     case curatedQwen35NineBSpeed
     case curatedQwen38OptimizedSpeed
     case curatedQwen38BareSpeed
@@ -145,7 +159,7 @@ public struct OnboardingFeatureState: Equatable, Sendable {
     public var localProbe: LocalModelProbe?
 
     public init(
-        step: OnboardingStep = .welcome,
+        step: OnboardingStep = .language,
         hardware: DetectedHardware? = nil,
         pick: ModelPickChoice = .none,
         otherProbe: OtherModelProbe? = nil,
@@ -171,6 +185,15 @@ public struct OnboardingFeatureState: Equatable, Sendable {
             return nil
         case .curatedQwen35FourBit:
             return catalog.first { $0.id == "qwen35-4b-optimized-speed" }
+        case .curatedQwen35FourBQuality:
+            return catalog.first { $0.id == "qwen35-4b-optimized-quality" }
+        case .curatedBonsaiOptimizedSpeed:
+            return catalog.first { $0.id == "bonsai-2-27b-optimized-speed" }
+        case .curatedFlashNextOptimizedQuality:
+            return catalog.first { $0.id == "flash-next-optimized-quality" }
+        case .curatedMiMoQwen9BOptimizedSpeed:
+            // Modern-tier only with no FP16 sibling, so no legacy swap.
+            return catalog.first { $0.id == "mimo-v26-qwen-9b-optimized-speed" }
         case .curatedQwen35NineBSpeed:
             let useFP16 = hardware?.tier == .legacyApple
             let id = useFP16 ? "qwen35-9b-optimized-speed-fp16" : "qwen35-9b-optimized-speed"
@@ -232,6 +255,10 @@ public struct OnboardingFeatureState: Equatable, Sendable {
         case .none:
             return nil
         case .curatedQwen35FourBit,
+                 .curatedQwen35FourBQuality,
+                 .curatedBonsaiOptimizedSpeed,
+                 .curatedFlashNextOptimizedQuality,
+                 .curatedMiMoQwen9BOptimizedSpeed,
              .curatedQwen35NineBSpeed,
              .curatedQwen38OptimizedSpeed,
              .curatedQwen38BareSpeed,
@@ -306,7 +333,7 @@ public struct OnboardingFeatureState: Equatable, Sendable {
     /// flag — it covers the user-input-driven cases only.
     public var canAdvance: Bool {
         switch step {
-        case .welcome:
+        case .language, .welcome:
             return true
         case .hardwareScan:
             return hardware != nil
@@ -315,6 +342,10 @@ public struct OnboardingFeatureState: Equatable, Sendable {
             case .none:
                 return false
             case .curatedQwen35FourBit,
+                 .curatedQwen35FourBQuality,
+                 .curatedBonsaiOptimizedSpeed,
+                 .curatedFlashNextOptimizedQuality,
+                 .curatedMiMoQwen9BOptimizedSpeed,
                  .curatedQwen35NineBSpeed,
                  .curatedQwen38OptimizedSpeed,
                  .curatedQwen38BareSpeed,

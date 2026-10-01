@@ -27,6 +27,54 @@ class SamplerConfig:
     frequency_penalty: float = 0.0
 
 
+class NonFiniteLogitsError(RuntimeError):
+    """A logits row carried NaN/inf (or no finite mass at all).
+
+    Raised at every host boundary that turns a logits row into a probability
+    distribution. Until 2026-09-08 these rows silently became token 0, which
+    is ``!`` in the Qwen vocabulary: a numerical fault in a kernel, a
+    quantized KV page or an overflowed fp16 activation surfaced on the wire
+    as thousands of exclamation marks (issue #311) and was contained by the
+    repetition stop instead of being diagnosed. The request now fails with a
+    truthful error that names the counts, and nothing is banked.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        nan_count: int | None = None,
+        inf_count: int | None = None,
+        vocab_size: int | None = None,
+    ) -> None:
+        detail = message
+        parts = []
+        if nan_count is not None:
+            parts.append(f"nan={int(nan_count)}")
+        if inf_count is not None:
+            parts.append(f"inf={int(inf_count)}")
+        if vocab_size is not None:
+            parts.append(f"vocab={int(vocab_size)}")
+        if parts:
+            detail = f"{message} ({', '.join(parts)})"
+        super().__init__(detail)
+        self.nan_count = nan_count
+        self.inf_count = inf_count
+        self.vocab_size = vocab_size
+
+
+def non_finite_logits_error(logits: np.ndarray, where: str) -> NonFiniteLogitsError:
+    """Build the error with the row's NaN/inf census (cheap, host side)."""
+
+    row = np.asarray(logits)
+    return NonFiniteLogitsError(
+        f"non-finite logits in {where}",
+        nan_count=int(np.isnan(row).sum()),
+        inf_count=int(np.isinf(row).sum()),
+        vocab_size=int(row.size),
+    )
+
+
 @dataclass(frozen=True)
 class SparseDistribution:
     token_ids: np.ndarray
@@ -47,14 +95,10 @@ class SparseDistribution:
         sanitized = np.where(np.isfinite(probs) & (probs > 0), probs, 0.0)
         total = sanitized.sum()
         if not np.isfinite(total) or total <= 0:
-            valid_ids = token_ids[
-                (token_ids >= 0) & (token_ids < int(self.vocab_size))
-            ]
-            if valid_ids.shape[0] == 0:
-                raise ValueError("SparseDistribution probabilities must have positive mass")
-            token_ids = np.array([int(valid_ids[0])], dtype=np.int64)
-            sanitized = np.array([1.0], dtype=np.float64)
-            total = 1.0
+            # A row with no finite positive mass is a numerical fault, never
+            # a distribution. It used to collapse to the first id (token 0,
+            # ``!``); it is now the same hard failure the softmax raises.
+            raise non_finite_logits_error(probs, "SparseDistribution")
         object.__setattr__(self, "token_ids", token_ids)
         object.__setattr__(self, "probs", sanitized / total)
 
@@ -88,7 +132,7 @@ def softmax(logits: np.ndarray, temperature: float = 1.0) -> np.ndarray:
     exp = np.exp(scaled)
     total = np.sum(exp)
     if not np.isfinite(total) or total <= 0:
-        raise ValueError("Cannot normalize logits into a probability distribution")
+        raise non_finite_logits_error(logits, "softmax")
     return exp / total
 
 

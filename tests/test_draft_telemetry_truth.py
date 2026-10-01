@@ -375,6 +375,9 @@ def test_opencode_injection_is_launch_default_tier_and_runs_curve(monkeypatch):
     client, state = _truth_client(
         monkeypatch, draft_sampler=launch, captured=captured, curve=curve
     )
+    # A 0.6-family launch: the fixture's default model now boots at its own
+    # 1.0, where this curve is the identity and could not show it ran.
+    state.args.temperature = 0.6
 
     payload = _chat(
         client,

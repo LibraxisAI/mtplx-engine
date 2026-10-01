@@ -72,6 +72,52 @@ def test_stream_splitter_suppresses_orphan_spans():
     assert splitter.suppressed_tool_markup_chars > 0
 
 
+def test_stream_splitter_consumes_the_whole_tool_call_block():
+    # 2026-09-22 image-cell transcript on Flash-Next: two hallucinated calls
+    # in a no-tools request streamed as "...module.</tool_call></tool_call>"
+    # because the span closed at the body's `</function>` and the block's own
+    # `</tool_call>` then streamed as visible text.
+    splitter = srv._ThinkingContentStreamSplitter(
+        thinking_enabled=False,
+        suppress_orphan_tool_markup=True,
+    )
+    chunks = []
+    for piece in (
+        "I'll explore the project structure first.\n\n",
+        "<tool_call>\n<function=list_files>\n<parameter=path>.</parameter>\n</function>\n</tool_call>\n",
+        "<tool_call>\n<function=glob_files>\n<parameter=pattern>*.py</parameter>\n</function>\n</tool_call>",
+    ):
+        chunks.extend(splitter.feed(piece))
+    chunks.extend(splitter.finish())
+    content = "".join(text for field, text in chunks if field == "content")
+    assert "</tool_call>" not in content
+    assert "</function>" not in content
+    assert "list_files" not in content and "glob_files" not in content
+    assert "I'll explore the project structure first." in content
+    # The streamed text converges on the non-stream stripper's result.
+    non_stream, stripped = srv._strip_orphan_tool_markup(
+        "I'll explore the project structure first.\n\n"
+        "<tool_call>\n<function=list_files>\n<parameter=path>.</parameter>\n</function>\n</tool_call>\n"
+        "<tool_call>\n<function=glob_files>\n<parameter=pattern>*.py</parameter>\n</function>\n</tool_call>"
+    )
+    assert stripped == 2
+    assert content.strip() == non_stream.strip()
+
+
+def test_stream_splitter_bare_function_span_still_closes_on_function():
+    splitter = srv._ThinkingContentStreamSplitter(
+        thinking_enabled=False,
+        suppress_orphan_tool_markup=True,
+    )
+    chunks = []
+    for piece in ("Look: ", "<function=search>\n<parameter=q>x</parameter>\n</function>", " done."):
+        chunks.extend(splitter.feed(piece))
+    chunks.extend(splitter.finish())
+    content = "".join(text for field, text in chunks if field == "content")
+    assert "<function" not in content and "</function>" not in content
+    assert "Look:" in content and "done." in content
+
+
 def test_stream_splitter_passthrough_when_tools_active():
     splitter = srv._ThinkingContentStreamSplitter(
         thinking_enabled=False,

@@ -16,6 +16,8 @@ import json
 import os
 import signal
 import socket
+import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -27,6 +29,16 @@ from typing import Any, Callable, Iterator, Mapping
 DAEMON_PROBE_PORTS: tuple[int, ...] = (8000, 18083, 18084, 18085)
 ATTACH_PROBE_ENV = "MTPLX_START_ATTACH_PROBE"
 _PROBE_DISABLED_VALUES = frozenset({"0", "off", "no", "false", "disabled"})
+# Attached chat runs against a daemon on this machine, so the TCP connect
+# either succeeds at once or the daemon is gone.
+ATTACH_CHAT_CONNECT_TIMEOUT_S = 5.0
+# A healthy streamed request never goes quiet for long: the server writes an
+# SSE keep-alive comment every 5 s before the first token (10 s progress
+# chunks fill any later gap), and its own stall watchdog fails a frozen model
+# owner with an error frame well inside 300 s. Only a daemon that is wedged
+# (or a dead connection) puts nothing on the wire for this long, so waiting
+# it out never trips on a slow prefill of a large prompt.
+ATTACH_CHAT_INACTIVITY_TIMEOUT_S = 120.0
 
 
 @dataclass(frozen=True)
@@ -217,8 +229,191 @@ def classify_port_occupant(
     return PortOccupant(kind=PORT_MTPLX_SERVER, daemon=daemon)
 
 
-def port_busy_advice(occupant: PortOccupant, *, port: int) -> list[str]:
-    """Actionable, occupant-aware copy for a busy port."""
+def app_configured_port() -> int | None:
+    """The port the macOS app has persisted, or None when there is no app
+    setting. Public alias so caller lanes can ask "did the user configure
+    this port?" without reaching into a private helper."""
+
+    return _app_persisted_port()
+
+
+# A stopping MTPLX server keeps its listener while it drains, but its
+# /health stops answering first, so classify_port_occupant reads it as
+# PORT_FOREIGN for those few seconds. Issue #409: every stop/start cycle
+# then tripped the "in use by another app" fallback and silently moved a
+# configured 1234 to 1235. Long enough to cover a normal drain, short
+# enough that a genuinely foreign listener does not stall a launch.
+PORT_SETTLE_TIMEOUT_S = 5.0
+PORT_SETTLE_POLL_S = 0.25
+
+
+def wait_for_port_settle(
+    host: str,
+    port: int,
+    *,
+    timeout_s: float = PORT_SETTLE_TIMEOUT_S,
+    poll_s: float = PORT_SETTLE_POLL_S,
+    api_key: str | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> PortOccupant:
+    """Re-classify a foreign-looking port until it settles, or time out.
+
+    Returns the last classification. Anything other than PORT_FOREIGN is
+    terminal and returns immediately.
+
+    This does NOT claim to identify the owning process; it separates a
+    TRANSIENT occupant that clears on its own (our own draining server,
+    a socket in the tail of TIME_WAIT, a listener mid-restart) from a
+    STEADY foreign listener that is still there after the window. That is
+    the distinction the caller's decision actually needs, and it needs no
+    lsof, no psutil, and no new dependency.
+    """
+
+    deadline = clock() + max(0.0, float(timeout_s))
+    occupant = classify_port_occupant(host, port, api_key=api_key)
+    while occupant.kind == PORT_FOREIGN and clock() < deadline:
+        sleep(max(0.0, float(poll_s)))
+        occupant = classify_port_occupant(host, port, api_key=api_key)
+    return occupant
+
+
+@dataclass(frozen=True)
+class ForeignListener:
+    """Who holds a port that does not answer ``/health`` (issue #503).
+
+    ``launch_id`` is the ``MTPLX_APP_LAUNCH_ID`` the macOS app gave the
+    process at launch: set, the "foreign" listener is one of our own daemons
+    that wedged (socket alive, ``/health`` dead); None, it is a stranger's
+    process or a CLI-started server. SYNC PAIR: PortPreflight.appOwnedListener
+    in the app resolves the same identity and reaps its own wedged daemon in
+    place; the CLI names it and leaves the process alone.
+    """
+
+    pid: int
+    launch_id: str | None
+
+    @property
+    def owned_by_app(self) -> bool:
+        return bool(self.launch_id)
+
+
+def listening_process_ids(port: int) -> list[int]:
+    """PIDs with a TCP listener on ``port`` (``/usr/sbin/lsof``; empty on failure)."""
+
+    try:
+        proc = subprocess.run(
+            ["/usr/sbin/lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-t"],
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    pids: list[int] = []
+    for line in proc.stdout.splitlines():
+        try:
+            pid = int(line.strip())
+        except ValueError:
+            continue
+        if pid > 1:
+            pids.append(pid)
+    return pids
+
+
+def process_app_launch_id(pid: int) -> str | None:
+    """The ``MTPLX_APP_LAUNCH_ID`` in ``pid``'s environment, or None.
+
+    Read from the kernel's own argv/env image (``KERN_PROCARGS2``), never
+    from ``ps`` text, so an argument that merely contains the token cannot
+    pass as ownership. None off macOS, for another user's process, or for a
+    process without the marker.
+    """
+
+    if sys.platform != "darwin":
+        return None
+    try:
+        import ctypes
+        import ctypes.util
+
+        libc = ctypes.CDLL(ctypes.util.find_library("c"))
+        ctl_kern, kern_procargs2 = 1, 49
+        mib = (ctypes.c_int * 3)(ctl_kern, kern_procargs2, int(pid))
+        size = ctypes.c_size_t(0)
+        if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
+            return None
+        buffer = ctypes.create_string_buffer(max(1, size.value))
+        if libc.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
+            return None
+        raw = buffer.raw[: size.value]
+    except (OSError, AttributeError, ValueError):
+        return None
+    if len(raw) < 4:
+        return None
+    argc = int.from_bytes(raw[:4], "little", signed=True)
+    if argc < 0:
+        return None
+    cursor = 4
+
+    def skip_cstring(at: int) -> int | None:
+        end = raw.find(b"\0", at)
+        return None if end < 0 else end + 1
+
+    nxt = skip_cstring(cursor)  # the exec path
+    if nxt is None:
+        return None
+    cursor = nxt
+    while cursor < len(raw) and raw[cursor] == 0:
+        cursor += 1
+    for _ in range(argc):
+        nxt = skip_cstring(cursor)
+        if nxt is None:
+            return None
+        cursor = nxt
+    prefix = b"MTPLX_APP_LAUNCH_ID="
+    while cursor < len(raw):
+        while cursor < len(raw) and raw[cursor] == 0:
+            cursor += 1
+        if cursor >= len(raw):
+            break
+        end = raw.find(b"\0", cursor)
+        if end < 0:
+            end = len(raw)
+        entry = raw[cursor:end]
+        cursor = end + 1
+        if entry.startswith(prefix):
+            value = entry[len(prefix):].decode("utf-8", "replace").strip()
+            return value or None
+    return None
+
+
+def describe_foreign_listener(port: int) -> ForeignListener | None:
+    """Identity of the process holding a foreign-looking ``port``, or None."""
+
+    pids = listening_process_ids(port)
+    if not pids:
+        return None
+    for pid in pids:
+        launch_id = process_app_launch_id(pid)
+        if launch_id:
+            return ForeignListener(pid=pid, launch_id=launch_id)
+    return ForeignListener(pid=pids[0], launch_id=None)
+
+
+def port_busy_advice(
+    occupant: PortOccupant,
+    *,
+    port: int,
+    listener: ForeignListener | None = None,
+) -> list[str]:
+    """Actionable, occupant-aware copy for a busy port.
+
+    ``listener`` (``describe_foreign_listener``) turns the generic "another
+    app" line into the truth when the port is held by a daemon the macOS app
+    launched that stopped answering (issue #503): the pid, and how to clear
+    it, instead of a hunt through other apps.
+    """
 
     if occupant.kind == PORT_APP_DAEMON:
         model = occupant.daemon.model if occupant.daemon else None
@@ -233,6 +428,21 @@ def port_busy_advice(occupant: PortOccupant, *, port: int) -> list[str]:
             f"Port {port} is an MTPLX server started outside the app.",
             "Press Ctrl-C in that server's terminal, or run: "
             f"mtplx stop --port {port}",
+        ]
+    if listener is not None and listener.owned_by_app:
+        return [
+            (
+                f"Port {port} is held by pid {listener.pid}, an MTPLX daemon "
+                "the app launched that is no longer answering (it wedged)."
+            ),
+            (
+                "Press Stop in the MTPLX app (or quit the app), or run: "
+                f"kill {listener.pid}"
+            ),
+        ]
+    if listener is not None:
+        return [
+            f"Port {port} is in use by another app (not MTPLX): pid {listener.pid}.",
         ]
     return [
         f"Port {port} is in use by another app (not MTPLX).",
@@ -388,11 +598,13 @@ class AttachChatSession:
         daemon: RunningDaemon,
         *,
         api_key: str | None = None,
-        timeout: float | None = None,
+        connect_timeout: float = ATTACH_CHAT_CONNECT_TIMEOUT_S,
+        inactivity_timeout: float = ATTACH_CHAT_INACTIVITY_TIMEOUT_S,
     ) -> None:
         self.daemon = daemon
         self.api_key = api_key
-        self.timeout = timeout
+        self.connect_timeout = float(connect_timeout)
+        self.inactivity_timeout = float(inactivity_timeout)
         self.history: list[dict[str, str]] = []
         self.last_stats: Mapping[str, Any] | None = None
 
@@ -420,7 +632,7 @@ class AttachChatSession:
         connection = http.client.HTTPConnection(
             self.daemon.host,
             self.daemon.port,
-            timeout=self.timeout,
+            timeout=self.connect_timeout,
         )
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -428,6 +640,17 @@ class AttachChatSession:
         stats: Mapping[str, Any] | None = None
         cancelled = False
         try:
+            try:
+                connection.connect()
+            except TimeoutError:
+                raise AttachChatError(
+                    f"could not connect to the server within {self.connect_timeout:.0f}s"
+                ) from None
+            # The short timeout above governed the TCP connect only. From here
+            # on the socket waits at most the inactivity deadline for the
+            # response headers and then between SSE frames: a wedged daemon
+            # used to leave this loop blocked forever with a blank answer.
+            connection.sock.settimeout(self.inactivity_timeout)
             connection.request(
                 "POST", "/v1/chat/completions", body=body, headers=self._headers()
             )
@@ -465,6 +688,11 @@ class AttachChatSession:
                 # Closing the connection triggers the server's
                 # disconnect-cancel path, so generation stops promptly.
                 cancelled = True
+        except TimeoutError:
+            raise AttachChatError(
+                "server stopped responding "
+                f"(nothing received for {self.inactivity_timeout:.0f}s)"
+            ) from None
         finally:
             try:
                 connection.close()

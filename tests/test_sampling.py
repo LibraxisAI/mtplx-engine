@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import pytest
+
 import numpy as np
 import mlx.core as mx
 
 from mtplx.fast_sampling import sample_token_ids_from_mlx_logits
 from mtplx.sampling import (
+    NonFiniteLogitsError,
     SamplerConfig,
     SparseDistribution,
     acceptance_probability,
@@ -80,15 +83,15 @@ def test_sparse_distribution_sampling_returns_original_token_ids():
     assert sample_from_distribution(dist, np.random.default_rng(0)) == 11
 
 
-def test_sparse_distribution_zero_or_nan_mass_falls_back_to_safe_token():
-    dist = SparseDistribution(
-        token_ids=np.array([7, 11]),
-        probs=np.array([0.0, np.nan]),
-        vocab_size=12,
-    )
-
-    assert dist.token_ids.tolist() == [7]
-    assert np.allclose(dist.probs, [1.0])
+def test_sparse_distribution_zero_or_nan_mass_is_a_hard_error():
+    # Used to collapse to the first id (token 0 is ``!`` in the Qwen vocab):
+    # a row with no finite positive mass is a numerical fault, not a law.
+    with pytest.raises(NonFiniteLogitsError):
+        SparseDistribution(
+            token_ids=np.array([7, 11]),
+            probs=np.array([0.0, np.nan]),
+            vocab_size=12,
+        )
 
 
 def test_residual_distribution_nan_mass_falls_back_to_target():

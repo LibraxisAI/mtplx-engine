@@ -186,6 +186,7 @@ public struct OpenCodeIntegration: Sendable {
                 baseURL: baseURL,
                 apiKey: configuration.apiKey,
                 contextLimit: contextLimit,
+                vision: MTPLXModelOption.supportsVision(model: configuration.model),
                 reasoningEffort: Self.resolvedReasoningEffort(
                     forModelID: modelID,
                     configuredEffort: configuration.reasoningEffort
@@ -272,7 +273,7 @@ public struct OpenCodeIntegration: Sendable {
                 wasRunning: false,
                 didTerminateExistingInstance: false,
                 didOpen: false,
-                detail: "OpenCode.app not found at \(desktopApplicationURL.path)"
+                detail: tr("OpenCode.app not found at %@", desktopApplicationURL.path)
             )
         }
         guard isCurrent?() ?? true else { return staleDesktopHandoffResult() }
@@ -352,7 +353,7 @@ public struct OpenCodeIntegration: Sendable {
             wasRunning: false,
             didTerminateExistingInstance: false,
             didOpen: false,
-            detail: "AppKit is unavailable"
+            detail: tr("AppKit is unavailable")
         )
         #endif
     }
@@ -365,7 +366,7 @@ public struct OpenCodeIntegration: Sendable {
             wasRunning: false,
             didTerminateExistingInstance: false,
             didOpen: false,
-            detail: "OpenCode handoff cancelled because the daemon lifecycle changed.",
+            detail: tr("OpenCode handoff cancelled because the daemon lifecycle changed."),
             launchedProcessID: launchedDesktopIdentity?.processID,
             launchedDesktopIdentity: launchedDesktopIdentity
         )
@@ -398,6 +399,18 @@ public struct OpenCodeIntegration: Sendable {
     }
 
     public static func modelID(for model: String) -> String {
+        // Exact released identities, including legacy Bonsai folder/served
+        // aliases. MiMo must match here: its names also contain "qwen" and
+        // "optimized-speed", which the generic branch below claims for the
+        // Qwen 3.6 27B.
+        if let option = MTPLXModelOption.option(matching: model),
+           [
+               "flash-next-optimized-quality",
+               "bonsai-2-27b-optimized-speed",
+               "mimo-v26-qwen-9b-optimized-speed",
+           ].contains(option.id) {
+            return "mtplx-\(option.id)"
+        }
         let lower = model.lowercased()
         if lower.contains("gemma4") || lower.contains("gemma-4") {
             return "gemma4-mtplx-optimized-speed"
@@ -434,6 +447,10 @@ public struct OpenCodeIntegration: Sendable {
             if lower.contains("optimized-speed") {
                 return "mtplx-flash-next-optimized-speed"
             }
+        }
+        if (lower.contains("flash-next") || lower.contains("flash_next"))
+            && lower.contains("optimized-quality") {
+            return sanitizedModelID(from: model)
         }
         // Qwen 3.8 family before the generic qwen branches: a 3.8 name
         // also contains "qwen"+"optimized-speed"/"optimized-quality" and
@@ -472,6 +489,10 @@ public struct OpenCodeIntegration: Sendable {
             return "mtplx-qwen36-27b-gdn8-speed4"
         }
 
+        return sanitizedModelID(from: model)
+    }
+
+    private static func sanitizedModelID(from model: String) -> String {
         let lastComponent = URL(fileURLWithPath: model).lastPathComponent
         let seed = lastComponent.isEmpty ? model : lastComponent
         let sanitized = seed
@@ -533,6 +554,9 @@ public struct OpenCodeIntegration: Sendable {
     /// family effort dial.
     public static func reasoningEffortLevels(forModelID modelID: String) -> [String]? {
         let lower = modelID.lowercased()
+        if MTPLXModelOption.isBonsai2Model(modelID) {
+            return ["xhigh", "medium"]
+        }
         // Flash-Next (qwen4_exp) before the 3.8 markers: the pack names
         // carry "Qwen3.8-Flash-Next" and would otherwise be claimed by the
         // 27B codec below (engine twin: descriptors._QWEN4_PREVIEW_MARKER
@@ -541,7 +565,7 @@ public struct OpenCodeIntegration: Sendable {
             // QWEN4_EXP_REASONING_CODEC: same official effort triple.
             return ["xhigh", "medium", "low"]
         }
-        if lower.contains("qwen38") || lower.contains("qwen3.8") || lower.contains("qwen3-8") {
+        if MTPLXModelOption.modelFamily(for: modelID) == "qwen3_8" {
             // QWEN3_8_REASONING_CODEC: official reasoning_effort levels.
             return ["xhigh", "medium", "low"]
         }
@@ -565,7 +589,7 @@ public struct OpenCodeIntegration: Sendable {
             // before the 3.8 markers, which the pack names also contain.
             return "medium"
         }
-        if lower.contains("qwen38") || lower.contains("qwen3.8") || lower.contains("qwen3-8") {
+        if MTPLXModelOption.modelFamily(for: modelID) == "qwen3_8" {
             // QWEN3_8_REASONING_CODEC default: medium (strict max-fan A/B,
             // 2026-08-14 — same correct uncapped result 51.52s vs 314.91s
             // at xhigh).
@@ -895,11 +919,21 @@ public struct OpenCodeIntegration: Sendable {
         return variants
     }
 
+    /// OpenCode plans `min(limit.output, 32_000)` of the window for the reply
+    /// and compacts once a turn's total tokens reach the rest (overflow.ts,
+    /// 1.18.29). Mirroring the context into the output limit left a zero-token
+    /// conversation window on small seats, so every reply was summarised
+    /// (issue #480). Half the window, capped at the 32,000 OpenCode injects.
+    static func outputLimit(forContextWindow context: Int) -> Int {
+        min(32_000, max(1, context / 2))
+    }
+
     private static func providerConfig(
         modelID: String,
         baseURL: String,
         apiKey: String?,
         contextLimit: Int,
+        vision: Bool,
         reasoningEffort: String?
     ) -> [String: JSONValue] {
         var options: [String: JSONValue] = [
@@ -931,10 +965,10 @@ public struct OpenCodeIntegration: Sendable {
             "temperature": .bool(true),
             "limit": .object([
                 "context": .number(Double(contextLimit)),
-                "output": .number(Double(contextLimit)),
+                "output": .number(Double(Self.outputLimit(forContextWindow: contextLimit))),
             ]),
             "modalities": .object([
-                "input": .array([.string("text")]),
+                "input": .array(vision ? [.string("text"), .string("image")] : [.string("text")]),
                 "output": .array([.string("text")]),
             ]),
         ]

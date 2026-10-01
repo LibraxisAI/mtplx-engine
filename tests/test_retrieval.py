@@ -457,6 +457,36 @@ def test_registry_from_args_falls_back_to_the_cli_cache_dir():
     assert registry_from_args(args).cache_dir == "/custom/cli"
 
 
+def test_registry_from_args_forwards_ordered_model_roots(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def resolve(ref, *, cache_dir=None, search_dirs=None):
+        captured.update(
+            ref=ref,
+            cache_dir=cache_dir,
+            search_dirs=search_dirs,
+        )
+        return Path("/resolved/embed")
+
+    monkeypatch.setattr("mtplx.hf_loader.resolve_model_path", resolve)
+    registry = registry_from_args(
+        SimpleNamespace(
+            embedding_model=["org/embed"],
+            retrieval_cache_dir="/models/primary",
+            retrieval_model_roots=["/models/archive", "/models/external"],
+        )
+    )
+    spec = registry.specs_for_role("embedding")[0]
+
+    registry._backend_key(spec)
+
+    assert captured == {
+        "ref": "org/embed",
+        "cache_dir": "/models/primary",
+        "search_dirs": ("/models/archive", "/models/external"),
+    }
+
+
 # ---- metrics --------------------------------------------------------------
 
 
@@ -785,8 +815,8 @@ class _StubRegistry:
 
     def descriptors(self):
         return [
-            {"id": "e1", "role": "embedding", "model_ref": "org/e1", "loaded": True, "max_tokens": 8192},
-            {"id": "r1", "role": "rerank", "model_ref": "org/r1", "loaded": False, "max_tokens": 8192},
+            {"id": "e1", "role": "embedding", "model_ref": "org/e1", "loaded": True, "max_tokens": 8192, "resolved": True},
+            {"id": "r1", "role": "rerank", "model_ref": "org/r1", "loaded": False, "max_tokens": 8192, "resolved": True},
         ]
 
     def status(self):
@@ -1221,12 +1251,14 @@ def test_a_failed_request_is_recorded_so_the_model_is_not_shown_as_idle(monkeypa
     registry = RetrievalRegistry()
     registry.register(RetrievalSpec("broken", "org/missing", "embedding"))
 
-    with pytest.raises(FileNotFoundError):
+    # A checkpoint that is not on disk is a served retrieval failure (404 with
+    # the pull hint), not a raw loader exception escaping as a 500.
+    with pytest.raises(RetrievalError):
         registry.embed(["text"])
 
     entry = {e["id"]: e for e in registry.descriptors()}["broken"]
     assert entry["errors"] == 1
-    assert "FileNotFoundError" in entry["lastError"]
+    assert "RetrievalError" in entry["lastError"]
     assert entry["requests"] == 0
 
 
@@ -1447,3 +1479,135 @@ def test_idle_watcher_survives_logging_a_release_and_archives_the_bank(caplog):
     assert any("retrieval idle release" in record.message for record in caplog.records)
     assert not any("idle watcher" in record.message for record in caplog.records)
     assert archived
+
+
+# ---- missing retrieval models (issue #445) --------------------------------
+
+
+def _missing_resolver(monkeypatch, *, present: dict[str, str] | None = None):
+    """Resolve only the refs in ``present``; everything else is not cached."""
+
+    def resolve(ref, cache_dir=None):
+        mapped = (present or {}).get(str(ref))
+        if mapped is None:
+            raise FileNotFoundError(
+                f"Model {ref} is not cached. Run: mtplx pull {ref}"
+            )
+        return Path(mapped)
+
+    monkeypatch.setattr("mtplx.hf_loader.resolve_model_path", resolve)
+
+
+def test_a_missing_retrieval_model_is_reported_before_the_server_starts(monkeypatch):
+    """A typo in --embedding-model must be a refusal to start, not a 500 later."""
+    _missing_resolver(monkeypatch)
+    registry = RetrievalRegistry()
+    registry.register(RetrievalSpec("gone", "org/gone", "embedding"))
+
+    failures = registry.unresolved()
+    assert [spec.served_id for spec, _ in failures] == ["gone"]
+    # The hint the user needs is carried through verbatim.
+    assert "mtplx pull org/gone" in failures[0][1]
+
+
+def test_a_present_retrieval_model_has_nothing_unresolved(monkeypatch, tmp_path):
+    _missing_resolver(monkeypatch, present={"org/here": str(tmp_path)})
+    registry = RetrievalRegistry()
+    registry.register(RetrievalSpec("here", "org/here", "embedding"))
+
+    assert registry.unresolved() == []
+
+
+def test_a_missing_checkpoint_is_a_retrieval_error_not_a_raw_loader_error(monkeypatch):
+    """/v1/embeddings answers 404 with the pull hint instead of a 500 traceback."""
+    _missing_resolver(monkeypatch)
+    registry = RetrievalRegistry()
+    registry.register(RetrievalSpec("gone", "org/gone", "embedding"))
+
+    with pytest.raises(RetrievalError) as excinfo:
+        registry.embed(["text"])
+    assert "mtplx pull org/gone" in str(excinfo.value)
+    assert "embedding model 'gone'" in str(excinfo.value)
+
+
+def test_a_checkpoint_deleted_after_boot_is_resolved_again(monkeypatch, tmp_path):
+    """The cached residency key must not outlive the directory it points at."""
+    live = tmp_path / "live"
+    live.mkdir()
+    _missing_resolver(monkeypatch, present={"org/model": str(live)})
+    registry = RetrievalRegistry()
+    spec = RetrievalSpec("m", "org/model", "embedding")
+    registry.register(spec)
+    assert registry.unresolved() == []
+
+    # The user deletes the checkpoint while the daemon is up and no weights
+    # were ever loaded, so nothing in memory can stand in for it.
+    live.rmdir()
+    _missing_resolver(monkeypatch)
+    with pytest.raises(RetrievalError) as excinfo:
+        registry.embed(["text"])
+    assert "mtplx pull org/model" in str(excinfo.value)
+
+
+def test_a_loaded_model_keeps_serving_when_its_directory_moves(monkeypatch, tmp_path):
+    """Resident weights are the model; a moved directory must not 404 them."""
+    live = tmp_path / "live"
+    live.mkdir()
+    _missing_resolver(monkeypatch, present={"org/model": str(live)})
+    registry = RetrievalRegistry()
+    spec = RetrievalSpec("m", "org/model", "embedding")
+    registry.register(spec)
+    with registry._acquire(spec) as backend:
+        backend._model = object()  # stands in for loaded weights
+
+    live.rmdir()
+    _missing_resolver(monkeypatch)
+    with registry._acquire(spec) as still_there:
+        assert still_there is backend
+
+
+def test_descriptors_mark_a_missing_model_as_unresolved(monkeypatch, tmp_path):
+    _missing_resolver(monkeypatch, present={"org/here": str(tmp_path)})
+    registry = RetrievalRegistry()
+    registry.register(RetrievalSpec("here", "org/here", "embedding"))
+    registry.register(RetrievalSpec("gone", "org/gone", "embedding"))
+
+    resolved = {entry["id"]: entry["resolved"] for entry in registry.descriptors()}
+    assert resolved == {"here": True, "gone": False}
+
+
+def test_models_listing_hides_a_retrieval_model_that_did_not_resolve():
+    """A model the daemon cannot load must not be advertised as servable."""
+
+    class _PartlyBrokenRegistry(_StubRegistry):
+        def descriptors(self):
+            entries = super().descriptors()
+            entries[0] = {**entries[0], "resolved": False}
+            return entries
+
+    payload = _client(_PartlyBrokenRegistry()).get(
+        "/v1/models", params={"capability": "embedding"}
+    ).json()
+    assert payload["data"] == []
+
+
+def test_embeddings_answers_a_structured_404_for_a_missing_checkpoint(monkeypatch):
+    _missing_resolver(monkeypatch)
+    registry = RetrievalRegistry()
+    registry.register(RetrievalSpec("gone", "org/gone", "embedding"))
+
+    response = _client(registry).post("/v1/embeddings", json={"input": "hello"})
+    assert response.status_code == 404
+    assert "mtplx pull org/gone" in response.json()["error"]["message"]
+
+
+def test_rerank_answers_a_structured_404_for_a_missing_checkpoint(monkeypatch):
+    _missing_resolver(monkeypatch)
+    registry = RetrievalRegistry()
+    registry.register(RetrievalSpec("gone", "org/gone", "rerank"))
+
+    response = _client(registry).post(
+        "/v1/rerank", json={"query": "q", "documents": ["d"]}
+    )
+    assert response.status_code == 404
+    assert "mtplx pull org/gone" in response.json()["error"]["message"]

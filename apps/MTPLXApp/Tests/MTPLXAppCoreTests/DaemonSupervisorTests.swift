@@ -525,6 +525,129 @@ final class DaemonSupervisorTests: XCTestCase {
         XCTAssertFalse(supervisor.isRunning())
     }
 
+    func testStopBeforePostRunLivenessCheckDoesNotWriteFailureReport() async throws {
+        let reportURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mtplx-cancelled-start-\(UUID().uuidString).log")
+        let gate = BeforeRunGate()
+        await gate.arm()
+        let supervisor = DaemonSupervisor(
+            startFailureReportURL: reportURL,
+            beforePostRunLivenessCheck: { await gate.waitIfArmed() }
+        )
+        let startTask = Task {
+            try await supervisor.start(
+                command: DaemonCommand(executableURL: URL(fileURLWithPath: "/bin/sleep"), arguments: ["30"]),
+                healthBaseURL: URL(string: "http://127.0.0.1:9")!,
+                probeHealth: false
+            )
+        }
+        await gate.waitUntilEntered()
+        await supervisor.stop(graceSeconds: 0)
+        await gate.release()
+        do {
+            _ = try await startTask.value
+            XCTFail("A cancelled start must not succeed")
+        } catch {
+            XCTAssertEqual(error as? DaemonSupervisorError, .launchFailed("daemon launch was cancelled"))
+        }
+
+        XCTAssertEqual(supervisor.supervisionSnapshot().state, .stopped)
+        XCTAssertFalse(supervisor.isRunning())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: reportURL.path))
+    }
+
+    func testStopDuringHealthWaitPreservesPreviousFailureReport() async throws {
+        let reportURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mtplx-cancelled-start-\(UUID().uuidString).log")
+        let previousReport = "previous real launch failure\n"
+        try Data(previousReport.utf8).write(to: reportURL)
+        let gate = BeforeRunGate()
+        await gate.arm()
+        let supervisor = DaemonSupervisor(
+            startFailureReportURL: reportURL,
+            initialHealthProbe: { _, _ in nil },
+            healthWaitProbe: { _, _ in
+                await gate.waitIfArmed()
+                return nil
+            }
+        )
+        let startTask = Task {
+            try await supervisor.start(
+                command: DaemonCommand(executableURL: URL(fileURLWithPath: "/bin/sleep"), arguments: ["30"]),
+                healthBaseURL: URL(string: "http://127.0.0.1:9")!
+            )
+        }
+        await gate.waitUntilEntered()
+        await supervisor.stop(graceSeconds: 0)
+        await gate.release()
+        do {
+            _ = try await startTask.value
+            XCTFail("A cancelled start must not succeed")
+        } catch {
+            XCTAssertEqual(error as? DaemonSupervisorError, .launchFailed("daemon launch was cancelled"))
+        }
+
+        XCTAssertEqual(supervisor.supervisionSnapshot().state, .stopped)
+        XCTAssertFalse(supervisor.isRunning())
+        XCTAssertEqual(try String(contentsOf: reportURL, encoding: .utf8), previousReport)
+    }
+
+    func testFailedStartsStillWriteTheLast200LogLines() async throws {
+        for failDuringHealthWait in [false, true] {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("mtplx-failed-start-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let reportURL = directory.appendingPathComponent(StartFailureReport.fileName)
+            let release = directory.appendingPathComponent("exit-now")
+            let signal = SupervisionSignal()
+            let logs = BoundedLogStore()
+            for line in 0..<250 {
+                await logs.append("daemon line \(line)", stream: .stderr)
+            }
+            let supervisor = DaemonSupervisor(
+                logStore: logs,
+                startFailureReportURL: reportURL,
+                initialHealthProbe: { _, _ in nil },
+                healthWaitProbe: { _, _ in
+                    XCTAssertTrue(FileManager.default.createFile(atPath: release.path, contents: Data()))
+                    let crashed = await signal.waitForCrash()
+                    XCTAssertTrue(crashed)
+                    return nil
+                },
+                beforePostRunLivenessCheck: {
+                    if !failDuringHealthWait {
+                        let crashed = await signal.waitForCrash()
+                        XCTAssertTrue(crashed)
+                    }
+                }
+            )
+            supervisor.setStatusObserver { snapshot in
+                Task { await signal.record(snapshot) }
+            }
+            let script = failDuringHealthWait
+                ? "while [ ! -e \(shellQuoted(release.path)) ]; do sleep 0.01; done; exit 17"
+                : "exit 17"
+            let reason = failDuringHealthWait
+                ? "daemon exited before /health became ready"
+                : "daemon exited during launch with status 17"
+            do {
+                _ = try await supervisor.start(
+                    command: DaemonCommand(executableURL: URL(fileURLWithPath: "/bin/sh"), arguments: ["-c", script]),
+                    healthBaseURL: URL(string: "http://127.0.0.1:9")!
+                )
+                XCTFail("The fixture daemon must fail its launch")
+            } catch DaemonSupervisorError.launchFailed(let detail) {
+                XCTAssertTrue(detail.hasPrefix(reason))
+            }
+
+            let report = try String(contentsOf: reportURL, encoding: .utf8)
+            XCTAssertTrue(report.contains("reason: \(reason)\n"))
+            XCTAssertTrue(report.contains("[stderr] daemon line 249\n"))
+            XCTAssertFalse(report.contains("[stderr] daemon line 0\n"))
+            XCTAssertEqual(report.split(separator: "\n").filter { $0.contains(" [") }.count, 200)
+        }
+    }
+
     func testStopDuringHealthWaitCannotPublishRunningOrKeepRecipe() async throws {
         let health = try adoptedHealth()
         let gate = HealthProbeGate()
@@ -557,7 +680,7 @@ final class DaemonSupervisorTests: XCTestCase {
 
     @MainActor
     func testPassiveCleanExitClearsActiveTransportAndConnectionState() async throws {
-        let store = MTPLXBackendStore()
+        let store = MTPLXBackendStore(settingsStore: isolatedSettingsStore())
         let handoffID = UUID()
         let handoffDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent(
@@ -698,6 +821,7 @@ final class DaemonSupervisorTests: XCTestCase {
     func testCrashDuringPostStartHandoffCannotResurrectMetrics() async throws {
         let supervisor = DaemonSupervisor()
         let store = MTPLXBackendStore(
+            settingsStore: isolatedSettingsStore(),
             supervisor: supervisor,
             beforePostStartRefresh: {
                 await supervisor.stop(graceSeconds: 0)
@@ -822,6 +946,7 @@ final class DaemonSupervisorTests: XCTestCase {
         let handoffGate = BeforeRunGate()
         await handoffGate.arm()
         let store = MTPLXBackendStore(
+            settingsStore: isolatedSettingsStore(),
             supervisor: supervisor,
             beforeClientHandoffLaunch: { target in
                 if target == .pi { await handoffGate.waitIfArmed() }
@@ -877,6 +1002,7 @@ final class DaemonSupervisorTests: XCTestCase {
         let handoffGate = BeforeRunGate()
         await handoffGate.arm()
         let store = MTPLXBackendStore(
+            settingsStore: isolatedSettingsStore(),
             supervisor: supervisor,
             beforeClientHandoffLaunch: { target in
                 if target == .hermes { await handoffGate.waitIfArmed() }
@@ -927,7 +1053,7 @@ final class DaemonSupervisorTests: XCTestCase {
         XCTAssertGreaterThan(current.lifecycleEpoch, olderLifecycle)
         XCTAssertEqual(current.state, .running)
 
-        let store = MTPLXBackendStore(supervisor: supervisor)
+        let store = MTPLXBackendStore(settingsStore: isolatedSettingsStore(), supervisor: supervisor)
         let pi = Process()
         pi.executableURL = URL(fileURLWithPath: "/bin/zsh")
         pi.arguments = ["-c", "exec -a pi /bin/sleep 30"]
@@ -998,6 +1124,7 @@ final class DaemonSupervisorTests: XCTestCase {
         let thermalGate = BeforeRunGate()
         await thermalGate.arm()
         let store = MTPLXBackendStore(
+            settingsStore: isolatedSettingsStore(),
             supervisor: supervisor,
             beforeThermalStatusRefresh: { await thermalGate.waitIfArmed() }
         )
@@ -1029,7 +1156,7 @@ final class DaemonSupervisorTests: XCTestCase {
 
     @MainActor
     func testStorePublishesAdoptedDaemonAsUnprotected() async {
-        let store = MTPLXBackendStore()
+        let store = MTPLXBackendStore(settingsStore: isolatedSettingsStore())
         store.applySupervisorSnapshot(
             DaemonSupervisionSnapshot(
                 revision: 1,
@@ -1046,7 +1173,7 @@ final class DaemonSupervisorTests: XCTestCase {
 
     @MainActor
     func testDisabledAbnormalExitCleansTransportButPreservesCrashState() async {
-        let store = MTPLXBackendStore()
+        let store = MTPLXBackendStore(settingsStore: isolatedSettingsStore())
         store.startMetricsStream()
         XCTAssertTrue(store.hasActiveDaemonTransportForTesting)
 
@@ -1158,7 +1285,7 @@ final class DaemonSupervisorTests: XCTestCase {
 
     @MainActor
     func testExhaustedAutomaticRecoveryCleansTransportButPreservesCircuitBreakerState() async {
-        let store = MTPLXBackendStore()
+        let store = MTPLXBackendStore(settingsStore: isolatedSettingsStore())
         store.startMetricsStream()
         XCTAssertTrue(store.hasActiveDaemonTransportForTesting)
 
@@ -2112,4 +2239,10 @@ extension DaemonSupervisorTests {
         }
         XCTAssertFalse(supervisor.isRunning())
     }
+}
+
+private func isolatedSettingsStore() -> MTPLXSettingsStore {
+    MTPLXSettingsStore(settingsURL: FileManager.default.temporaryDirectory
+        .appendingPathComponent("mtplx-supervisor-test-\(UUID().uuidString)")
+        .appendingPathComponent("settings.json"))
 }

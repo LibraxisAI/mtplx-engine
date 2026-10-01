@@ -1,0 +1,706 @@
+[
+  {
+    "ram_gib": 8,
+    "tier": "modern",
+    "raw": [
+      "qwen35-4b-optimized-speed",
+      "qwen35-4b-optimized-quality"
+    ],
+    "visible": [
+      "qwen35-4b-optimized-speed",
+      "qwen35-4b-optimized-quality"
+    ],
+    "default": "qwen35-4b-optimized-speed"
+  },
+  {
+    "ram_gib": 8,
+    "tier": "legacy",
+    "raw": [
+      "qwen35-9b-optimized-speed-fp16"
+    ],
+    "visible": [],
+    "default": null
+  },
+  {
+    "ram_gib": 16,
+    "tier": "modern",
+    "raw": [
+      "bonsai-2-27b-optimized-speed",
+      "mimo-v26-qwen-9b-optimized-speed",
+      "qwen35-9b-optimized-speed",
+      "qwen35-4b-optimized-speed",
+      "qwen35-4b-optimized-quality"
+    ],
+    "visible": [
+      "bonsai-2-27b-optimized-speed",
+      "mimo-v26-qwen-9b-optimized-speed",
+      "qwen35-9b-optimized-speed",
+      "qwen35-4b-optimized-speed",
+      "qwen35-4b-optimized-quality"
+    ],
+    "default": "bonsai-2-27b-optimized-speed"
+  },
+  {
+    "ram_gib": 16,
+    "tier": "legacy",
+    "raw": [
+      "qwen35-9b-optimized-speed-fp16"
+    ],
+    "visible": [
+      "qwen35-9b-optimized-speed-fp16"
+    ],
+    "default": "qwen35-9b-optimized-speed-fp16"
+  },
+  {
+    "ram_gib": 18,
+    "tier": "modern",
+    "raw": [
+      "bonsai-2-27b-optimized-speed",
+      "mimo-v26-qwen-9b-optimized-speed",
+      "qwen35-9b-optimized-speed",
+      "qwen35-4b-optimized-speed",
+      "qwen35-4b-optimized-quality"
+    ],
+    "visible": [
+      "bonsai-2-27b-optimized-speed",
+      "mimo-v26-qwen-9b-optimized-speed",
+      "qwen35-9b-optimized-speed",
+      "qwen35-4b-optimized-speed",
+      "qwen35-4b-optimized-quality"
+    ],
+    "default": "bonsai-2-27b-optimized-speed"
+  },
+  {
+    "ram_gib": 18,
+    "tier": "legacy",
+    "raw": [
+      "qwen35-9b-optimized-speed-fp16"
+    ],
+    "visible": [
+      "qwen35-9b-optimized-speed-fp16"
+    ],
+    "default": "qwen35-9b-optimized-speed-fp16"
+  },
+  {
+    "ram_gib": 24,
+    "tier": "modern",
+    "raw": [
+      "bonsai-2-27b-optimized-speed",
+      "mimo-v26-qwen-9b-optimized-speed",
+      "qwen35-9b-optimized-speed",
+      "qwen35-4b-optimized-speed",
+      "qwen35-4b-optimized-quality"
+    ],
+    "visible": [
+      "bonsai-2-27b-optimized-speed",
+      "mimo-v26-qwen-9b-optimized-speed",
+      "qwen35-9b-optimized-speed",
+      "qwen35-4b-optimized-speed",
+      "qwen35-4b-optimized-quality"
+    ],
+    "default": "bonsai-2-27b-optimized-speed"
+  },
+  {
+    "ram_gib": 24,
+    "tier": "legacy",
+    "raw": [
+      "qwen35-9b-optimized-speed-fp16"
+    ],
+    "visible": [
+      "qwen35-9b-optimized-speed-fp16"
+    ],
+    "default": "qwen35-9b-optimized-speed-fp16"
+  },
+  {
+    "ram_gib": 32,
+    "tier": "modern",
+    "raw": [
+      "qwen38-27b-optimized-speed",
+      "qwen38-27b-bare-speed",
+      "qwen38-27b-optimized-quality",
+      "optimized-speed-v2",
+      "optimized-speed",
+      "mimo-v26-qwen-9b-optimized-speed",
+      "qwen35-9b-optimized-speed",
+      "gemma4-optimized-speed",
+      "qwen36-35b-a3b-optimized-speed",
+      "optimized-quality",
+      "bonsai-2-27b-optimized-speed",
+      "qwen35-4b-optimized-speed",
+      "qwen35-4b-optimized-quality"
+    ],
+    "visible": [
+      "qwen38-27b-optimized-speed",
+      "qwen38-27b-bare-speed",
+      "optimized-speed-v2",
+      "optimized-speed",
+      "mimo-v26-qwen-9b-optimized-speed",
+      "qwen35-9b-optimized-speed",
+      "gemma4-optimized-speed",
+      "qwen36-35b-a3b-optimized-speed",
+      "optimized-quality",
+      "bonsai-2-27b-optimized-speed",
+      "qwen35-4b-optimized-speed",
+      "qwen35-4b-optimized-quality"
+    ],
+    "default": "qwen38-27b-optimized-speed"
+  },
+  {
+    "ram_gib": 32,
+    "tier": "legacy",
+    "raw": [
+      "qwen38-27b-optimized-speed-fp16",
+      "qwen38-27b-bare-speed-fp16",
+      "qwen38-27b-optimized-quality-fp16",
+      "qwen35-9b-optimized-speed-fp16",
+      "optimized-speed-fp16",
+      "gemma4-optimized-speed",
+      "qwen36-35b-a3b-optimized-speed-fp16",
+      "optimized-quality-fp16"
+    ],
+    "visible": [
+      "qwen38-27b-optimized-speed-fp16",
+      "qwen38-27b-bare-speed-fp16",
+      "qwen35-9b-optimized-speed-fp16",
+      "optimized-speed-fp16",
+      "gemma4-optimized-speed",
+      "qwen36-35b-a3b-optimized-speed-fp16",
+      "optimized-quality-fp16"
+    ],
+    "default": "qwen38-27b-optimized-speed-fp16"
+  },
+  {
+    "ram_gib": 36,
+    "tier": "modern",
+    "raw": [
+      "qwen38-27b-optimized-speed",
+      "qwen38-27b-bare-speed",
+      "qwen38-27b-optimized-quality",
+      "optimized-speed-v2",
+      "optimized-speed",
+      "mimo-v26-qwen-9b-optimized-speed",
+      "qwen35-9b-optimized-speed",
+      "gemma4-optimized-speed",
+      "qwen36-35b-a3b-optimized-speed",
+      "optimized-quality",
+      "bonsai-2-27b-optimized-speed",
+      "qwen35-4b-optimized-speed",
+      "qwen35-4b-optimized-quality"
+    ],
+    "visible": [
+      "qwen38-27b-optimized-speed",
+      "qwen38-27b-bare-speed",
+      "qwen38-27b-optimized-quality",
+      "optimized-speed-v2",
+      "optimized-speed",
+      "mimo-v26-qwen-9b-optimized-speed",
+      "qwen35-9b-optimized-speed",
+      "gemma4-optimized-speed",
+      "qwen36-35b-a3b-optimized-speed",
+      "optimized-quality",
+      "bonsai-2-27b-optimized-speed",
+      "qwen35-4b-optimized-speed",
+      "qwen35-4b-optimized-quality"
+    ],
+    "default": "qwen38-27b-optimized-speed"
+  },
+  {
+    "ram_gib": 36,
+    "tier": "legacy",
+    "raw": [
+      "qwen38-27b-optimized-speed-fp16",
+      "qwen38-27b-bare-speed-fp16",
+      "qwen38-27b-optimized-quality-fp16",
+      "qwen35-9b-optimized-speed-fp16",
+      "optimized-speed-fp16",
+      "gemma4-optimized-speed",
+      "qwen36-35b-a3b-optimized-speed-fp16",
+      "optimized-quality-fp16"
+    ],
+    "visible": [
+      "qwen38-27b-optimized-speed-fp16",
+      "qwen38-27b-bare-speed-fp16",
+      "qwen38-27b-optimized-quality-fp16",
+      "qwen35-9b-optimized-speed-fp16",
+      "optimized-speed-fp16",
+      "gemma4-optimized-speed",
+      "qwen36-35b-a3b-optimized-speed-fp16",
+      "optimized-quality-fp16"
+    ],
+    "default": "qwen38-27b-optimized-speed-fp16"
+  },
+  {
+    "ram_gib": 48,
+    "tier": "modern",
+    "raw": [
+      "qwen38-27b-optimized-speed",
+      "qwen38-27b-bare-speed",
+      "qwen38-27b-optimized-quality",
+      "optimized-speed-v2",
+      "optimized-speed",
+      "optimized-quality",
+      "qwen36-35b-a3b-optimized-speed",
+      "qwen36-35b-a3b-optimized-balance",
+      "gemma4-optimized-speed",
+      "mimo-v26-qwen-9b-optimized-speed",
+      "qwen35-9b-optimized-speed",
+      "bonsai-2-27b-optimized-speed",
+      "qwen35-4b-optimized-speed",
+      "qwen35-4b-optimized-quality"
+    ],
+    "visible": [
+      "qwen38-27b-optimized-speed",
+      "qwen38-27b-bare-speed",
+      "qwen38-27b-optimized-quality",
+      "optimized-speed-v2",
+      "optimized-speed",
+      "optimized-quality",
+      "qwen36-35b-a3b-optimized-speed",
+      "qwen36-35b-a3b-optimized-balance",
+      "gemma4-optimized-speed",
+      "mimo-v26-qwen-9b-optimized-speed",
+      "qwen35-9b-optimized-speed",
+      "bonsai-2-27b-optimized-speed",
+      "qwen35-4b-optimized-speed",
+      "qwen35-4b-optimized-quality"
+    ],
+    "default": "qwen38-27b-optimized-speed"
+  },
+  {
+    "ram_gib": 48,
+    "tier": "legacy",
+    "raw": [
+      "qwen38-27b-optimized-speed-fp16",
+      "qwen38-27b-bare-speed-fp16",
+      "qwen38-27b-optimized-quality-fp16",
+      "optimized-speed-fp16",
+      "optimized-quality-fp16",
+      "qwen36-35b-a3b-optimized-speed-fp16",
+      "qwen36-35b-a3b-optimized-balance-fp16",
+      "gemma4-optimized-speed",
+      "qwen35-9b-optimized-speed-fp16"
+    ],
+    "visible": [
+      "qwen38-27b-optimized-speed-fp16",
+      "qwen38-27b-bare-speed-fp16",
+      "qwen38-27b-optimized-quality-fp16",
+      "optimized-speed-fp16",
+      "optimized-quality-fp16",
+      "qwen36-35b-a3b-optimized-speed-fp16",
+      "qwen36-35b-a3b-optimized-balance-fp16",
+      "gemma4-optimized-speed",
+      "qwen35-9b-optimized-speed-fp16"
+    ],
+    "default": "qwen38-27b-optimized-speed-fp16"
+  },
+  {
+    "ram_gib": 64,
+    "tier": "modern",
+    "raw": [
+      "qwen38-27b-optimized-speed",
+      "qwen38-27b-bare-speed",
+      "qwen38-27b-optimized-quality",
+      "optimized-speed-v2",
+      "optimized-speed",
+      "optimized-quality",
+      "qwen36-35b-a3b-optimized-speed",
+      "qwen36-35b-a3b-optimized-balance",
+      "gemma4-optimized-speed",
+      "mimo-v26-qwen-9b-optimized-speed",
+      "qwen35-9b-optimized-speed",
+      "bonsai-2-27b-optimized-speed",
+      "qwen35-4b-optimized-speed",
+      "qwen35-4b-optimized-quality"
+    ],
+    "visible": [
+      "qwen38-27b-optimized-speed",
+      "qwen38-27b-bare-speed",
+      "qwen38-27b-optimized-quality",
+      "optimized-speed-v2",
+      "optimized-speed",
+      "optimized-quality",
+      "qwen36-35b-a3b-optimized-speed",
+      "qwen36-35b-a3b-optimized-balance",
+      "gemma4-optimized-speed",
+      "mimo-v26-qwen-9b-optimized-speed",
+      "qwen35-9b-optimized-speed",
+      "bonsai-2-27b-optimized-speed",
+      "qwen35-4b-optimized-speed",
+      "qwen35-4b-optimized-quality"
+    ],
+    "default": "qwen38-27b-optimized-speed"
+  },
+  {
+    "ram_gib": 64,
+    "tier": "legacy",
+    "raw": [
+      "qwen38-27b-optimized-speed-fp16",
+      "qwen38-27b-bare-speed-fp16",
+      "qwen38-27b-optimized-quality-fp16",
+      "optimized-speed-fp16",
+      "optimized-quality-fp16",
+      "qwen36-35b-a3b-optimized-speed-fp16",
+      "qwen36-35b-a3b-optimized-balance-fp16",
+      "gemma4-optimized-speed",
+      "qwen35-9b-optimized-speed-fp16"
+    ],
+    "visible": [
+      "qwen38-27b-optimized-speed-fp16",
+      "qwen38-27b-bare-speed-fp16",
+      "qwen38-27b-optimized-quality-fp16",
+      "optimized-speed-fp16",
+      "optimized-quality-fp16",
+      "qwen36-35b-a3b-optimized-speed-fp16",
+      "qwen36-35b-a3b-optimized-balance-fp16",
+      "gemma4-optimized-speed",
+      "qwen35-9b-optimized-speed-fp16"
+    ],
+    "default": "qwen38-27b-optimized-speed-fp16"
+  },
+  {
+    "ram_gib": 96,
+    "tier": "modern",
+    "raw": [
+      "qwen38-27b-optimized-speed",
+      "qwen38-27b-bare-speed",
+      "qwen38-27b-optimized-quality",
+      "flash-next-bare-speed",
+      "flash-next-optimized-quality",
+      "optimized-speed-v2",
+      "optimized-speed",
+      "optimized-quality",
+      "qwen36-35b-a3b-optimized-speed",
+      "qwen36-35b-a3b-optimized-balance",
+      "gemma4-optimized-speed",
+      "mimo-v26-qwen-9b-optimized-speed",
+      "qwen35-9b-optimized-speed",
+      "bonsai-2-27b-optimized-speed",
+      "qwen35-4b-optimized-speed",
+      "qwen35-4b-optimized-quality"
+    ],
+    "visible": [
+      "qwen38-27b-optimized-speed",
+      "qwen38-27b-bare-speed",
+      "qwen38-27b-optimized-quality",
+      "flash-next-bare-speed",
+      "optimized-speed-v2",
+      "optimized-speed",
+      "optimized-quality",
+      "qwen36-35b-a3b-optimized-speed",
+      "qwen36-35b-a3b-optimized-balance",
+      "gemma4-optimized-speed",
+      "mimo-v26-qwen-9b-optimized-speed",
+      "qwen35-9b-optimized-speed",
+      "bonsai-2-27b-optimized-speed",
+      "qwen35-4b-optimized-speed",
+      "qwen35-4b-optimized-quality"
+    ],
+    "default": "qwen38-27b-optimized-speed"
+  },
+  {
+    "ram_gib": 96,
+    "tier": "legacy",
+    "raw": [
+      "qwen38-27b-optimized-speed-fp16",
+      "qwen38-27b-bare-speed-fp16",
+      "qwen38-27b-optimized-quality-fp16",
+      "optimized-speed-fp16",
+      "optimized-quality-fp16",
+      "qwen36-35b-a3b-optimized-speed-fp16",
+      "qwen36-35b-a3b-optimized-balance-fp16",
+      "gemma4-optimized-speed",
+      "qwen35-9b-optimized-speed-fp16"
+    ],
+    "visible": [
+      "qwen38-27b-optimized-speed-fp16",
+      "qwen38-27b-bare-speed-fp16",
+      "qwen38-27b-optimized-quality-fp16",
+      "optimized-speed-fp16",
+      "optimized-quality-fp16",
+      "qwen36-35b-a3b-optimized-speed-fp16",
+      "qwen36-35b-a3b-optimized-balance-fp16",
+      "gemma4-optimized-speed",
+      "qwen35-9b-optimized-speed-fp16"
+    ],
+    "default": "qwen38-27b-optimized-speed-fp16"
+  },
+  {
+    "ram_gib": 128,
+    "tier": "modern",
+    "raw": [
+      "qwen38-27b-optimized-speed",
+      "qwen38-27b-bare-speed",
+      "qwen38-27b-optimized-quality",
+      "flash-next-bare-speed",
+      "flash-next-optimized-speed",
+      "flash-next-optimized-quality",
+      "optimized-speed-v2",
+      "optimized-speed",
+      "optimized-quality",
+      "qwen36-35b-a3b-optimized-speed",
+      "qwen36-35b-a3b-optimized-balance",
+      "gemma4-optimized-speed",
+      "mimo-v26-qwen-9b-optimized-speed",
+      "qwen35-9b-optimized-speed",
+      "bonsai-2-27b-optimized-speed",
+      "qwen35-4b-optimized-speed",
+      "qwen35-4b-optimized-quality"
+    ],
+    "visible": [
+      "qwen38-27b-optimized-speed",
+      "qwen38-27b-bare-speed",
+      "qwen38-27b-optimized-quality",
+      "flash-next-bare-speed",
+      "flash-next-optimized-speed",
+      "optimized-speed-v2",
+      "optimized-speed",
+      "optimized-quality",
+      "qwen36-35b-a3b-optimized-speed",
+      "qwen36-35b-a3b-optimized-balance",
+      "gemma4-optimized-speed",
+      "mimo-v26-qwen-9b-optimized-speed",
+      "qwen35-9b-optimized-speed",
+      "bonsai-2-27b-optimized-speed",
+      "qwen35-4b-optimized-speed",
+      "qwen35-4b-optimized-quality"
+    ],
+    "default": "qwen38-27b-optimized-speed"
+  },
+  {
+    "ram_gib": 128,
+    "tier": "legacy",
+    "raw": [
+      "qwen38-27b-optimized-speed-fp16",
+      "qwen38-27b-bare-speed-fp16",
+      "qwen38-27b-optimized-quality-fp16",
+      "optimized-speed-fp16",
+      "optimized-quality-fp16",
+      "qwen36-35b-a3b-optimized-speed-fp16",
+      "qwen36-35b-a3b-optimized-balance-fp16",
+      "gemma4-optimized-speed",
+      "qwen35-9b-optimized-speed-fp16"
+    ],
+    "visible": [
+      "qwen38-27b-optimized-speed-fp16",
+      "qwen38-27b-bare-speed-fp16",
+      "qwen38-27b-optimized-quality-fp16",
+      "optimized-speed-fp16",
+      "optimized-quality-fp16",
+      "qwen36-35b-a3b-optimized-speed-fp16",
+      "qwen36-35b-a3b-optimized-balance-fp16",
+      "gemma4-optimized-speed",
+      "qwen35-9b-optimized-speed-fp16"
+    ],
+    "default": "qwen38-27b-optimized-speed-fp16"
+  },
+  {
+    "ram_gib": 192,
+    "tier": "modern",
+    "raw": [
+      "qwen38-27b-optimized-speed",
+      "qwen38-27b-bare-speed",
+      "qwen38-27b-optimized-quality",
+      "flash-next-bare-speed",
+      "flash-next-optimized-speed",
+      "flash-next-optimized-quality",
+      "optimized-speed-v2",
+      "optimized-speed",
+      "optimized-quality",
+      "qwen36-35b-a3b-optimized-speed",
+      "qwen36-35b-a3b-optimized-balance",
+      "gemma4-optimized-speed",
+      "mimo-v26-qwen-9b-optimized-speed",
+      "qwen35-9b-optimized-speed",
+      "bonsai-2-27b-optimized-speed",
+      "qwen35-4b-optimized-speed",
+      "qwen35-4b-optimized-quality"
+    ],
+    "visible": [
+      "qwen38-27b-optimized-speed",
+      "qwen38-27b-bare-speed",
+      "qwen38-27b-optimized-quality",
+      "flash-next-bare-speed",
+      "flash-next-optimized-speed",
+      "flash-next-optimized-quality",
+      "optimized-speed-v2",
+      "optimized-speed",
+      "optimized-quality",
+      "qwen36-35b-a3b-optimized-speed",
+      "qwen36-35b-a3b-optimized-balance",
+      "gemma4-optimized-speed",
+      "mimo-v26-qwen-9b-optimized-speed",
+      "qwen35-9b-optimized-speed",
+      "bonsai-2-27b-optimized-speed",
+      "qwen35-4b-optimized-speed",
+      "qwen35-4b-optimized-quality"
+    ],
+    "default": "qwen38-27b-optimized-speed"
+  },
+  {
+    "ram_gib": 192,
+    "tier": "legacy",
+    "raw": [
+      "qwen38-27b-optimized-speed-fp16",
+      "qwen38-27b-bare-speed-fp16",
+      "qwen38-27b-optimized-quality-fp16",
+      "optimized-speed-fp16",
+      "optimized-quality-fp16",
+      "qwen36-35b-a3b-optimized-speed-fp16",
+      "qwen36-35b-a3b-optimized-balance-fp16",
+      "gemma4-optimized-speed",
+      "qwen35-9b-optimized-speed-fp16"
+    ],
+    "visible": [
+      "qwen38-27b-optimized-speed-fp16",
+      "qwen38-27b-bare-speed-fp16",
+      "qwen38-27b-optimized-quality-fp16",
+      "optimized-speed-fp16",
+      "optimized-quality-fp16",
+      "qwen36-35b-a3b-optimized-speed-fp16",
+      "qwen36-35b-a3b-optimized-balance-fp16",
+      "gemma4-optimized-speed",
+      "qwen35-9b-optimized-speed-fp16"
+    ],
+    "default": "qwen38-27b-optimized-speed-fp16"
+  },
+  {
+    "ram_gib": 256,
+    "tier": "modern",
+    "raw": [
+      "flash-next-optimized-speed",
+      "flash-next-optimized-quality",
+      "qwen38-27b-optimized-speed",
+      "qwen38-27b-bare-speed",
+      "qwen38-27b-optimized-quality",
+      "flash-next-bare-speed",
+      "optimized-speed-v2",
+      "optimized-speed",
+      "optimized-quality",
+      "qwen36-35b-a3b-optimized-speed",
+      "qwen36-35b-a3b-optimized-balance",
+      "gemma4-optimized-speed",
+      "mimo-v26-qwen-9b-optimized-speed",
+      "qwen35-9b-optimized-speed",
+      "bonsai-2-27b-optimized-speed",
+      "qwen35-4b-optimized-speed",
+      "qwen35-4b-optimized-quality"
+    ],
+    "visible": [
+      "flash-next-optimized-speed",
+      "flash-next-optimized-quality",
+      "qwen38-27b-optimized-speed",
+      "qwen38-27b-bare-speed",
+      "qwen38-27b-optimized-quality",
+      "flash-next-bare-speed",
+      "optimized-speed-v2",
+      "optimized-speed",
+      "optimized-quality",
+      "qwen36-35b-a3b-optimized-speed",
+      "qwen36-35b-a3b-optimized-balance",
+      "gemma4-optimized-speed",
+      "mimo-v26-qwen-9b-optimized-speed",
+      "qwen35-9b-optimized-speed",
+      "bonsai-2-27b-optimized-speed",
+      "qwen35-4b-optimized-speed",
+      "qwen35-4b-optimized-quality"
+    ],
+    "default": "flash-next-optimized-speed"
+  },
+  {
+    "ram_gib": 256,
+    "tier": "legacy",
+    "raw": [
+      "qwen38-27b-optimized-speed-fp16",
+      "qwen38-27b-bare-speed-fp16",
+      "qwen38-27b-optimized-quality-fp16",
+      "optimized-speed-fp16",
+      "optimized-quality-fp16",
+      "qwen36-35b-a3b-optimized-speed-fp16",
+      "qwen36-35b-a3b-optimized-balance-fp16",
+      "gemma4-optimized-speed",
+      "qwen35-9b-optimized-speed-fp16"
+    ],
+    "visible": [
+      "qwen38-27b-optimized-speed-fp16",
+      "qwen38-27b-bare-speed-fp16",
+      "qwen38-27b-optimized-quality-fp16",
+      "optimized-speed-fp16",
+      "optimized-quality-fp16",
+      "qwen36-35b-a3b-optimized-speed-fp16",
+      "qwen36-35b-a3b-optimized-balance-fp16",
+      "gemma4-optimized-speed",
+      "qwen35-9b-optimized-speed-fp16"
+    ],
+    "default": "qwen38-27b-optimized-speed-fp16"
+  },
+  {
+    "ram_gib": 512,
+    "tier": "modern",
+    "raw": [
+      "flash-next-optimized-speed",
+      "flash-next-optimized-quality",
+      "qwen38-27b-optimized-speed",
+      "qwen38-27b-bare-speed",
+      "qwen38-27b-optimized-quality",
+      "flash-next-bare-speed",
+      "optimized-speed-v2",
+      "optimized-speed",
+      "optimized-quality",
+      "qwen36-35b-a3b-optimized-speed",
+      "qwen36-35b-a3b-optimized-balance",
+      "gemma4-optimized-speed",
+      "mimo-v26-qwen-9b-optimized-speed",
+      "qwen35-9b-optimized-speed",
+      "bonsai-2-27b-optimized-speed",
+      "qwen35-4b-optimized-speed",
+      "qwen35-4b-optimized-quality"
+    ],
+    "visible": [
+      "flash-next-optimized-speed",
+      "flash-next-optimized-quality",
+      "qwen38-27b-optimized-speed",
+      "qwen38-27b-bare-speed",
+      "qwen38-27b-optimized-quality",
+      "flash-next-bare-speed",
+      "optimized-speed-v2",
+      "optimized-speed",
+      "optimized-quality",
+      "qwen36-35b-a3b-optimized-speed",
+      "qwen36-35b-a3b-optimized-balance",
+      "gemma4-optimized-speed",
+      "mimo-v26-qwen-9b-optimized-speed",
+      "qwen35-9b-optimized-speed",
+      "bonsai-2-27b-optimized-speed",
+      "qwen35-4b-optimized-speed",
+      "qwen35-4b-optimized-quality"
+    ],
+    "default": "flash-next-optimized-speed"
+  },
+  {
+    "ram_gib": 512,
+    "tier": "legacy",
+    "raw": [
+      "qwen38-27b-optimized-speed-fp16",
+      "qwen38-27b-bare-speed-fp16",
+      "qwen38-27b-optimized-quality-fp16",
+      "optimized-speed-fp16",
+      "optimized-quality-fp16",
+      "qwen36-35b-a3b-optimized-speed-fp16",
+      "qwen36-35b-a3b-optimized-balance-fp16",
+      "gemma4-optimized-speed",
+      "qwen35-9b-optimized-speed-fp16"
+    ],
+    "visible": [
+      "qwen38-27b-optimized-speed-fp16",
+      "qwen38-27b-bare-speed-fp16",
+      "qwen38-27b-optimized-quality-fp16",
+      "optimized-speed-fp16",
+      "optimized-quality-fp16",
+      "qwen36-35b-a3b-optimized-speed-fp16",
+      "qwen36-35b-a3b-optimized-balance-fp16",
+      "gemma4-optimized-speed",
+      "qwen35-9b-optimized-speed-fp16"
+    ],
+    "default": "qwen38-27b-optimized-speed-fp16"
+  }
+]

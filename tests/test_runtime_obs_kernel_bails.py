@@ -243,3 +243,69 @@ def test_nax_qlinear_fallback_counts_verify_shapes_only(monkeypatch) -> None:
         assert _delta(counts, before, "b4_m7") == 2
     finally:
         uninstall_nax_qlinear_patch()
+
+
+# ---------------------------------------------------------------------------
+# The positive receipt for the packed-GQA route (issue #506).
+# ---------------------------------------------------------------------------
+
+
+def test_gqa_packed_route_engagement_is_counted_by_shape(monkeypatch) -> None:
+    """Issue #506 read ``capacity_below_threshold: 96`` on a request at 11.6K
+    tokens and concluded the lane never dispatches. The bail counters cannot
+    say that: they are cumulative since boot, they tick in Python (so inside
+    the compiled verifier they count graph traces, and warm-up traces small
+    capacities), and nothing counted the calls the route accepted. This is
+    that missing half, keyed by window and capacity bucket."""
+    from mlx_lm.models.cache import KVCache
+
+    monkeypatch.delenv("MTPLX_SPLIT_FULL_ATTN", raising=False)
+    monkeypatch.delenv("MTPLX_VLLM_METAL_PAGED_ATTN", raising=False)
+    monkeypatch.delenv("MTPLX_SDPA_2PASS", raising=False)
+    monkeypatch.delenv("MTPLX_BLOCKWISE_ATTN", raising=False)
+    monkeypatch.setenv("MTPLX_GQA_PACKED_SDPA", "1")
+    # KVCache allocates 256 rows for a short window; 256 opens the route.
+    monkeypatch.setenv("MTPLX_GQA_PACKED_SDPA_THRESHOLD", "256")
+
+    seen: list[tuple[int, int]] = []
+
+    def fake_kernel(*, queries, keys, values, offset, scale):
+        # The routing receipt is under test, not the Metal kernel (its own
+        # suite covers shapes this tiny attention does not have).
+        seen.append((int(queries.shape[2]), int(keys.shape[2])))
+        return mx.zeros_like(queries)
+
+    # The route imports the kernel inside the branch, from its own module.
+    from mtplx.kernels import sdpa_gqa_packed
+
+    monkeypatch.setattr(sdpa_gqa_packed, "sdpa_gqa_packed_tail", fake_kernel)
+    # Keep the M5-only flash route out of the way on any chip.
+    monkeypatch.setenv("MTPLX_NAX_FLASH_ROUTE", "0")
+
+    model = _TinyModel()
+    configure_split_full_attention(model)
+    attn = model.model.layers[0].self_attn
+
+    engaged = attention_split.gqa_packed_route_engaged_counts
+    bails = attention_split.gqa_packed_route_bail_counts
+    engaged_before, bails_before = dict(engaged), dict(bails)
+
+    attn(mx.zeros((1, 3, 8), dtype=mx.float32), mask=None, cache=KVCache())
+    attn(mx.zeros((1, 4, 8), dtype=mx.float32), mask=None, cache=KVCache())
+
+    assert seen == [(3, 256), (4, 256)]
+    assert _delta(engaged, engaged_before, "q3_cap256") == 1
+    assert _delta(engaged, engaged_before, "q4_cap256") == 1
+    assert dict(bails) == bails_before
+
+
+def test_gqa_packed_engagement_buckets_capacity_to_a_power_of_two() -> None:
+    # An eager cache grows 256 rows at a time; exact capacities would mint a
+    # key per step over a long session.
+    engaged = attention_split.gqa_packed_route_engaged_counts
+    before = dict(engaged)
+    attention_split._count_gqa_packed_route_engaged(4, 11_776)
+    attention_split._count_gqa_packed_route_engaged(4, 16_383)
+    attention_split._count_gqa_packed_route_engaged(4, 16_384)
+    assert _delta(engaged, before, "q4_cap8192") == 2
+    assert _delta(engaged, before, "q4_cap16384") == 1

@@ -216,31 +216,26 @@ def test_kv_quant_policy_27b_keeps_the_validated_modes() -> None:
     assert policy.to_dict()["disabled_reason"] is None
 
 
-def test_flash_next_pack_stamp_owns_the_boot_sampler(tmp_path) -> None:
-    """qwen4_exp launch sampler comes from the artifact's mtplx_runtime.json.
+def test_config_model_type_boot_sampler_is_the_family_law(tmp_path) -> None:
+    """The qwen4_exp daemon boot sampler is the family law, whatever the stamp.
 
     After the app stopped forwarding the coding-target 0.6 pin (2026-08-28),
-    the zero-flag `mtplx serve` boot path is the ONLY thing standing between
-    an OpenCode Flash-Next launch and the generic 0.6 parser default — the
-    stamp reader must keep resolving the pack's official 1.0/0.95/20.
+    a zero-flag daemon boot is the only thing standing between a Flash-Next
+    launch and the generic 0.6 parser default. The daemon resolves the family
+    sampler `mtplx serve` injects and /health reports, so a stamped pack, a
+    pack without the stamp (the parser default used to stand) and a stale
+    stamp all boot at 1.0/0.95/20. The folder name carries no family marker:
+    config.json's model_type is what names the family here.
     """
     import json
 
     from mtplx.server.openai import _model_declared_sampler_defaults
 
-    model = tmp_path / "flash-next"
+    family_law = {"temperature": 1.0, "top_p": 0.95, "top_k": 20}
+    model = tmp_path / "pack"
     model.mkdir()
     (model / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
-    (model / "mtplx_runtime.json").write_text(
-        json.dumps({"sampler": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}})
-    )
-    assert _model_declared_sampler_defaults(str(model)) == {
-        "temperature": 1.0,
-        "top_p": 0.95,
-        "top_k": 20,
-    }
-
-    # A pack without the sampler stamp falls back to None (parser default
-    # stands) instead of crashing the boot.
-    (model / "mtplx_runtime.json").write_text(json.dumps({}))
-    assert _model_declared_sampler_defaults(str(model)) is None
+    stale = {"temperature": 0.6, "top_p": 0.95, "top_k": 20}
+    for runtime in ({"sampler": family_law}, {}, {"sampler": stale}):
+        (model / "mtplx_runtime.json").write_text(json.dumps(runtime))
+        assert _model_declared_sampler_defaults(str(model)) == family_law, runtime

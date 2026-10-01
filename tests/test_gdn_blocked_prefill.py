@@ -113,3 +113,51 @@ def test_patch_routes_prefill_and_leaves_decode_stock(monkeypatch):
         assert _max_abs(s_new, s_ref) <= 0.05
     finally:
         uninstall_gdn_blocked_prefill_patch()
+
+
+def test_engagement_is_counted_both_ways_without_a_debug_switch(monkeypatch):
+    # PX.2 (2026-09-18): every serve-level A/B of this kernel before
+    # 2026-07-31 was null because the patch never routed and only the debug
+    # env could show it. The wrapper now keeps plain counters and reports a
+    # prefill-sized stock call to the demotion ledger. Graphs stay lazy: the
+    # counting happens at call time, nothing is evaluated here.
+    from mtplx import demotions
+    from mtplx.kernels import gdn_blocked_prefill as module
+
+    monkeypatch.setenv("MTPLX_GDN_BLOCKED_PREFILL", "1")
+    monkeypatch.delenv("MTPLX_GDN_BLOCKED_PREFILL_DEBUG", raising=False)
+    demotions.reset()
+    before = dict(module.ROUTE_COUNTS)
+    report = install_gdn_blocked_prefill_patch()
+    try:
+        assert report["installed"]
+        T = 32
+        q, k, v, _g, _beta, state = _fixture(T, mx.bfloat16, seed=3)
+        a = mx.random.normal((B, T, HV))
+        b = mx.random.normal((B, T, HV))
+        A_log = mx.random.normal((HV,)) * 0.1
+        dt_bias = mx.random.normal((HV,)) * 0.1
+        gd.gated_delta_update(q, k, v, a, b, A_log, dt_bias, state=state)
+        assert module.ROUTE_COUNTS["routed"] == before["routed"] + 1
+        assert demotions.counts()["gdn_blocked_prefill_not_engaged"] == 0
+        # The same prefill-sized call with the kernel declined runs stock and
+        # is reported.
+        gd.gated_delta_update(
+            q, k, v, a, b, A_log, dt_bias, state=state, use_kernel=False
+        )
+        assert (
+            module.ROUTE_COUNTS["stock_prefill_sized"]
+            == before["stock_prefill_sized"] + 1
+        )
+        snap = demotions.snapshot()
+        assert snap["counts"]["gdn_blocked_prefill_not_engaged"] == 1
+        assert "stock path" in snap["reasons"]["gdn_blocked_prefill_not_engaged"]
+        # A decode-sized call is not prefill work and is never counted.
+        q1, k1, v1, _g1, _b1, s1 = _fixture(1, mx.bfloat16, seed=4)
+        gd.gated_delta_update(
+            q1, k1, v1, a[:, :1], b[:, :1], A_log, dt_bias, state=s1
+        )
+        assert demotions.counts()["gdn_blocked_prefill_not_engaged"] == 1
+    finally:
+        uninstall_gdn_blocked_prefill_patch()
+        demotions.reset()

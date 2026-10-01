@@ -411,3 +411,92 @@ def test_mtpk_disarmed_stream_matches_committed_tokens(monkeypatch):
     wire = [token for call in calls for token in call]
     assert len(out.tokens) == 60  # no trim when disarmed
     assert wire == list(out.tokens)
+
+
+# ---------------------------------------------------------------------------
+# Long-cycle stop: a period above max_block_tokens ends the response without
+# a trim, so the wire and the final tokens stay identical.
+# ---------------------------------------------------------------------------
+
+LONG_PERIOD = 20
+# Walk 1..39, then the cycle from index 39; the exact run starts with the
+# second copy (index 59) and three copies are whole at 39 + 3 * 20 tokens.
+LONG_CYCLE_FIRE_LEN = 99
+
+
+def _next_token_long_cycle(token: int) -> int:
+    nxt = int(token) + 1
+    if nxt >= LOOP_START + LONG_PERIOD:
+        return LOOP_START
+    return nxt
+
+
+def _set_long_cycle_env(monkeypatch) -> None:
+    _set_repetition_env(monkeypatch)  # the short-block stop covers <= 8
+    monkeypatch.setenv("MTPLX_REPETITION_STOP_MAX_CYCLE_TOKENS", "64")
+    monkeypatch.setenv("MTPLX_REPETITION_STOP_MIN_CYCLE_COPIES", "3")
+    monkeypatch.setenv("MTPLX_REPETITION_STOP_MIN_CYCLE_SPAN_TOKENS", "48")
+
+
+def _assert_long_cycle_receipt(out) -> None:
+    stats = out.stats
+    assert out.finish_reason == "stop"
+    assert stats.repetition_stop_triggered is True
+    assert stats.repetition_stop_reason == "long_cycle"
+    assert stats.repetition_stop_block_tokens == LONG_PERIOD
+    assert stats.repetition_stop_repeats == 3
+    assert stats.repetition_stop_trimmed_tokens == 0
+    assert stats.repetition_stop_raw_tokens == len(out.tokens)
+    fired = [event["repetition_stop"] for event in stats.events if "repetition_stop" in event]
+    assert fired == [
+        {
+            "reason": "long_cycle",
+            "block_tokens": LONG_PERIOD,
+            "repeats": 3,
+            "trimmed_tokens": 0,
+        }
+    ]
+
+
+def test_ar_long_cycle_stops_without_trim_and_reports_it(monkeypatch):
+    _set_long_cycle_env(monkeypatch)
+    calls, callback = _collecting_callback()
+    out = generate_ar(
+        _runtime(_ScriptedModel(_next_token_long_cycle)),
+        [0],
+        max_tokens=400,
+        sampler=GREEDY,
+        seed=7,
+        stop_token_ids=set(),
+        token_callback=callback,
+        repetition_stop=True,
+    )
+    assert len(out.tokens) == LONG_CYCLE_FIRE_LEN
+    assert out.tokens[39:59] == list(range(LOOP_START, LOOP_START + LONG_PERIOD))
+    _assert_long_cycle_receipt(out)
+    wire = [token for call in calls for token in call]
+    assert wire == list(out.tokens)
+
+
+def test_mtpk_long_cycle_stops_without_trim_and_reports_it(monkeypatch):
+    _set_long_cycle_env(monkeypatch)
+    calls, callback = _collecting_callback()
+    out = generate_mtpk(
+        _runtime(_ScriptedMTPModel(_next_token_long_cycle)),
+        [0],
+        max_tokens=400,
+        sampler=GREEDY,
+        speculative_depth=2,
+        seed=7,
+        mtp_history_policy="committed",
+        verify_strategy="batched",
+        stop_token_ids=set(),
+        token_callback=callback,
+        repetition_stop=True,
+    )
+    # The check runs at the top of each round, which commits up to three.
+    assert LONG_CYCLE_FIRE_LEN <= len(out.tokens) <= LONG_CYCLE_FIRE_LEN + 2
+    _assert_long_cycle_receipt(out)
+    assert out.stats.finish_stop_origin == "repetition_stop"
+    wire = [token for call in calls for token in call]
+    assert wire == list(out.tokens)

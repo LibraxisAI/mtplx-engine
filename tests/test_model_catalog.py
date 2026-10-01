@@ -12,7 +12,7 @@ from mtplx.app_settings import (
 )
 from mtplx.default_models import select_default_model
 from mtplx.model_catalog import (
-    DISK_MULTIPLIER,
+    DOWNLOAD_HEADROOM_GIB,
     INTEL_TIER,
     LEGACY_TIER,
     MEMORY_SAFETY_FACTOR,
@@ -45,16 +45,10 @@ def _no_installed_qwen38(monkeypatch):
     monkeypatch.setattr(default_models_module, "_QWEN38_OPTIMIZED_SPEED_FP16_LOCAL_CANDIDATES", ())
 
 
-def test_catalog_has_twenty_three_unique_entries():
-    # 23 = the 16-entry 2026-08-14 scaffold + the Qwen3.8 Optimized
-    # Speed/Quality pair forged on drop day + the three Qwen3.8 FP16
-    # precision siblings for M1/M2 Macs (2026-08-15) + the Qwen3.8
-    # Flash-Next Bare/Optimized Speed pair (2026-08-27, big-Mac native).
+def test_catalog_has_twenty_six_unique_entries():
     ids = [model.id for model in OFFICIAL_CATALOG]
-    assert len(ids) == 23
-    assert len(set(ids)) == 23
-    hf_ids = [model.hf_model_id for model in OFFICIAL_CATALOG]
-    assert len(set(hf_ids)) == 23
+    assert len(ids) == len(set(ids)) == 26
+    assert len({model.hf_model_id for model in OFFICIAL_CATALOG}) == 26
 
 
 def test_qwen38_fp16_siblings_mirror_their_parents():
@@ -92,6 +86,9 @@ def test_catalog_matches_swift_official_catalog():
             re.findall(r"recommendedFor: \[([^\]]*)\]", catalog_block),
         )
     )
+    swift_details = re.findall(r'localizedDetailKey: "([^"\n]+)"', catalog_block)
+    assert swift_details == [model.detail for model in OFFICIAL_CATALOG]
+    assert all("recommended" not in model.detail.lower() for model in OFFICIAL_CATALOG)
     swift_tier_names = {".modernApple": "modern", ".legacyApple": "legacy"}
     assert len(swift_entries) == len(OFFICIAL_CATALOG)
     for python_model, (swift_id, swift_hf, swift_size, swift_peak, swift_tiers) in zip(
@@ -134,6 +131,8 @@ def test_recommended_ids_mirror_app_ram_tiers():
         "qwen35-9b-optimized-speed-fp16"
     ]
     assert recommended_catalog_ids(memory_gib=24, chip_tier=MODERN_TIER) == [
+        "bonsai-2-27b-optimized-speed",
+        "mimo-v26-qwen-9b-optimized-speed",
         "qwen35-9b-optimized-speed",
         "qwen35-4b-optimized-speed",
         "qwen35-4b-optimized-quality",
@@ -150,28 +149,27 @@ def test_recommended_ids_mirror_app_ram_tiers():
         *trio38,
         "optimized-speed-v2",
         "optimized-speed",
+        "mimo-v26-qwen-9b-optimized-speed",
         "qwen35-9b-optimized-speed",
         "gemma4-optimized-speed",
         "qwen36-35b-a3b-optimized-speed",
         "optimized-quality",
+        "bonsai-2-27b-optimized-speed",
         "qwen35-4b-optimized-speed",
         "qwen35-4b-optimized-quality",
     ]
     assert recommended_catalog_ids(memory_gib=32, chip_tier=MODERN_TIER)[:3] == trio38
     assert recommended_catalog_ids(memory_gib=64, chip_tier=MODERN_TIER) == [
         *trio38,
-        # Flash-Next rides behind the trio in the id order everywhere >=48;
-        # the peak-memory filter (78/87 GiB) cuts it from recommended_models
-        # below ~96 GB, same mechanism that drops Quality from the 32-47 band.
-        "flash-next-bare-speed",
-        "flash-next-optimized-speed",
         "optimized-speed-v2",
         "optimized-speed",
         "optimized-quality",
         "qwen36-35b-a3b-optimized-speed",
         "qwen36-35b-a3b-optimized-balance",
         "gemma4-optimized-speed",
+        "mimo-v26-qwen-9b-optimized-speed",
         "qwen35-9b-optimized-speed",
+        "bonsai-2-27b-optimized-speed",
         "qwen35-4b-optimized-speed",
         "qwen35-4b-optimized-quality",
     ]
@@ -204,13 +202,16 @@ def test_recommended_ids_mirror_app_ram_tiers():
         *trio38,
         "flash-next-bare-speed",
         "flash-next-optimized-speed",
+        "flash-next-optimized-quality",
         "optimized-speed-v2",
         "optimized-speed",
         "optimized-quality",
         "qwen36-35b-a3b-optimized-speed",
         "qwen36-35b-a3b-optimized-balance",
         "gemma4-optimized-speed",
+        "mimo-v26-qwen-9b-optimized-speed",
         "qwen35-9b-optimized-speed",
+        "bonsai-2-27b-optimized-speed",
     ]
     assert recommended_catalog_ids(
         memory_gib=None, chip_tier=LEGACY_TIER
@@ -225,6 +226,8 @@ def test_recommended_models_filter_by_peak_memory():
     ]
     models = recommended_models(memory_gib=24, chip_tier=MODERN_TIER)
     assert [model.id for model in models] == [
+        "bonsai-2-27b-optimized-speed",
+        "mimo-v26-qwen-9b-optimized-speed",
         "qwen35-9b-optimized-speed",
         "qwen35-4b-optimized-speed",
         "qwen35-4b-optimized-quality",
@@ -271,7 +274,7 @@ def test_feasibility_verdicts_mirror_app_rules():
     )
     assert no_disk.verdict == "insufficient_disk"
     assert no_disk.needs_gib == pytest.approx(
-        speed.download_gib * DISK_MULTIPLIER
+        speed.download_gib + DOWNLOAD_HEADROOM_GIB
     )
 
     intel = evaluate_feasibility(
@@ -371,6 +374,36 @@ def test_scan_installed_models_handles_missing_cache(tmp_path):
     assert scan_installed_models(tmp_path / "does-not-exist") == []
 
 
+def test_scan_installed_models_retains_duplicate_root_identity(tmp_path):
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    name = "acme--custom-model"
+    first = _write_complete_model(primary / name)
+    second = _write_complete_model(secondary / name)
+
+    installed = scan_installed_models(primary, search_dirs=[secondary])
+
+    assert [model.path for model in installed] == [first, second]
+    assert [model.root for model in installed] == [
+        primary.resolve(),
+        secondary.resolve(),
+    ]
+    assert [model.root_index for model in installed] == [0, 1]
+    assert [model.is_primary for model in installed] == [True, False]
+
+
+def test_scan_installed_models_dedupes_physical_aliases(tmp_path):
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    model = _write_complete_model(primary / "acme--custom-model")
+    secondary.mkdir()
+    (secondary / "acme--custom-model").symlink_to(model, target_is_directory=True)
+
+    installed = scan_installed_models(primary, search_dirs=[secondary])
+
+    assert [row.path for row in installed] == [model]
+
+
 def test_read_app_settings_parses_snake_case_fields(tmp_path):
     settings_file = tmp_path / "settings.json"
     settings_file.write_text(
@@ -418,22 +451,54 @@ def test_read_app_settings_degrades_to_none(tmp_path):
     assert settings.onboarding_completed is False
 
 
-def test_select_default_model_routes_small_macs_to_9b(monkeypatch):
+def test_select_default_model_routes_small_macs_to_packs_that_fit(monkeypatch):
     monkeypatch.delenv("MTPLX_DEFAULT_MODEL_VARIANT", raising=False)
 
+    # 24 GiB: Bonsai leads the smaller-Mac tier.
     small_modern = select_default_model(
+        hardware={
+            "chip": "Apple M4",
+            "apple_silicon_generation": "m4",
+            "memory_gib": 24.0,
+        }
+    )
+    assert small_modern.model == "Youssofal/Ternary-Bonsai-2-27B-MTPLX-Optimized-Speed"
+    assert small_modern.hf_model == "Youssofal/Ternary-Bonsai-2-27B-MTPLX-Optimized-Speed"
+    assert small_modern.variant == "speed"
+    assert "Bonsai 2 27B" in small_modern.reason
+    assert small_modern.display_name == "Bonsai 2 27B Optimized Speed"
+    assert small_modern.memory_gib == 24.0
+
+    # 16 GiB: the picker's smaller-Mac tier leads with Bonsai, so the CLI
+    # default matches it (the 4B pair leads only below 16 GiB).
+    sixteen_modern = select_default_model(
         hardware={
             "chip": "Apple M4",
             "apple_silicon_generation": "m4",
             "memory_gib": 16.0,
         }
     )
-    assert small_modern.model == QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID
-    assert small_modern.hf_model == QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID
-    assert small_modern.variant == "speed"
-    assert "9B" in small_modern.reason
-    assert small_modern.display_name == "Qwen3.5 9B Optimized Speed"
-    assert small_modern.memory_gib == 16.0
+    assert sixteen_modern.model == "Youssofal/Ternary-Bonsai-2-27B-MTPLX-Optimized-Speed"
+    assert "Bonsai" in sixteen_modern.reason
+    assert recommended_models(memory_gib=16.0, chip_tier=MODERN_TIER)[0].hf_model_id == (
+        sixteen_modern.model
+    )
+
+    # 8 GiB: the 9B's 10 GiB peak does not fit, so the 4B leads, exactly as
+    # in the picker (the 9B used to be handed to every Mac under 32 GiB).
+    tiny_modern = select_default_model(
+        hardware={
+            "chip": "Apple M4",
+            "apple_silicon_generation": "m4",
+            "memory_gib": 8.0,
+        }
+    )
+    assert tiny_modern.model == "Youssofal/Qwen3.5-4B-MTPLX-Optimized-Speed"
+    assert "4B" in tiny_modern.reason
+    assert tiny_modern.display_name == "Qwen3.5 4B Optimized Speed"
+    assert recommended_models(memory_gib=8.0, chip_tier=MODERN_TIER)[0].hf_model_id == (
+        tiny_modern.model
+    )
 
     small_legacy = select_default_model(
         hardware={
@@ -478,6 +543,9 @@ def test_select_default_model_uses_public_v2_without_local_qwen38(monkeypatch):
 
 
 def test_select_default_model_without_memory_keeps_generation_policy(monkeypatch):
+    """Unreadable memory keeps the generation's precision lane but can no
+    longer pick the 27B: with nothing to say what fits, the smallest pack is
+    chosen and the reason says so."""
     monkeypatch.delenv("MTPLX_DEFAULT_MODEL_VARIANT", raising=False)
     monkeypatch.setenv("MTPLX_OPTIMIZED_SPEED_MODEL", "off")
 
@@ -487,5 +555,53 @@ def test_select_default_model_without_memory_keeps_generation_policy(monkeypatch
             "apple_silicon_generation": "m4",
         }
     )
-    assert selection.model == DEFAULT_HF_MODEL_ID
+    assert selection.variant == "speed"
+    assert selection.model == "Youssofal/Qwen3.5-4B-MTPLX-Optimized-Speed"
     assert selection.memory_gib is None
+    assert "memory could not be read" in selection.reason
+
+
+# ---- README model table stays true to the catalog (issues #238, #408) -----
+
+_README_TABLE_ROW = re.compile(
+    r"^\|\s*`(?P<repo>Qwen[\w.\-]+|Gemma[\w.\-]+|Ternary-Bonsai[\w.\-]+)`\s*\|"
+    r"(?P<fits>[^|]*)\|(?P<purpose>[^|]*)\|(?P<preset>[^|]*)\|\s*$"
+)
+_README_PEAK = re.compile(r"peaks at (?P<peak>[\d.]+) GiB")
+
+
+def _readme_model_rows() -> list[re.Match[str]]:
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(
+        encoding="utf-8"
+    )
+    return [
+        match
+        for line in readme.splitlines()
+        if (match := _README_TABLE_ROW.match(line)) is not None
+    ]
+
+
+def test_readme_model_table_names_real_catalog_packs():
+    """Every repo the README recommends has to exist in the shipped catalog.
+
+    The table is a promise about what a user can download; a renamed or
+    retired pack must not survive in it silently.
+    """
+    rows = _readme_model_rows()
+    assert len(rows) >= 11, "the README model table lost rows"
+    catalog_repos = {model.hf_model_id for model in OFFICIAL_CATALOG}
+    for row in rows:
+        repo = f"Youssofal/{row.group('repo')}"
+        assert repo in catalog_repos, f"README names a pack the catalog does not ship: {repo}"
+
+
+def test_readme_model_table_quotes_the_catalog_peak_memory():
+    """The "fits" column is the number the app checks a Mac against."""
+    peaks = {model.hf_model_id: model.peak_memory_gib for model in OFFICIAL_CATALOG}
+    for row in _readme_model_rows():
+        repo = f"Youssofal/{row.group('repo')}"
+        stated = _README_PEAK.search(row.group("fits"))
+        assert stated is not None, f"README row for {repo} states no peak"
+        assert abs(float(stated.group("peak")) - peaks[repo]) <= 0.05, (
+            f"README peak for {repo} drifted from the catalog"
+        )

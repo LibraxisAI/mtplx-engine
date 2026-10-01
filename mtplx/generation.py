@@ -34,11 +34,13 @@ from .a3b_whole_moe import validate_a3b_whole_moe_request
 from .adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
 from .adaptive_dtemp import build_adaptive_dtemp_controller
 from .attention_context import attention_phase, exact_verify, model_forward_kind
+from .demotions import mark as _demotion_mark, note as _note_demotion, since as _demotions_since
 from .deepseek_v4_adaptive_width import (
     validate_installed_deepseek_v4_adaptive_width_policy,
 )
 from .progress_heartbeat import tick as _owner_progress_tick
 from .cache_state import (
+    CacheSnapshot,
     detach_array_leaf,
     detach_cache_state,
     owned_recurrent_state_stats,
@@ -51,6 +53,19 @@ from .cache_state import (
     tail_owned_attention_kv_stats,
     trim_verified_window_to_prefix,
 )
+from .qwen4_draft_k20_prescatter import (
+    DraftK20PrescatterIneligible,
+    claim_draft_route as _qwen4_draft_k20_prescatter_claim,
+    greedy_chain_step as _qwen4_draft_k20_prescatter_greedy_step,
+    is_enabled as _qwen4_draft_k20_prescatter_enabled,
+    read_draft as _qwen4_draft_k20_prescatter_read,
+    release_draft_route as _qwen4_draft_k20_prescatter_release,
+)
+from . import qwen4_draft_device_chain as _qwen4_sampled_chain
+from .qwen4_block_verify import (
+    build_verifier as _qwen4_build_block_verifier,
+    is_enabled as _qwen4_block_verify_enabled,
+)
 from .forkev_telemetry import ForkEVRecorder
 from .fast_sampling import (
     MAX_DEVICE_TOP_K_ORDER,
@@ -59,17 +74,22 @@ from .fast_sampling import (
     batched_sparse_distributions_from_mlx_logits,
     sample_token_ids_from_mlx_logits,
     sparse_distribution_from_mlx_logits,
+    sparse_distribution_from_mlx_logits_relaxed_ties,
     sparse_distributions_from_mlx_logits,
 )
 from .gdn_capture import resolve_gdn_capture_backend
 from .graphbank import (
     CompiledVerifyBank,
     SpecDecodeGraphBank,
+    _fixed_m4_initial_growth_reserve,
     cache_array_tree,
     compiled_verify_mode,
+    ensure_eager_window_capacity,
+    fixed_m4_lane_retired_reason as _fixed_m4_lane_retired_reason,
     paged_offsets_context_ok as _paged_offsets_context_ok,
     promote_kv_cache_offsets,
     set_paged_offsets_context_ok,
+    stamp_rope_delta,
 )
 from .native_mlp import set_native_mlp_context
 from .loop_guard import LoopGuard, loop_guard_config_from_env
@@ -83,6 +103,7 @@ from .qsa_mtp_precompute import (
 )
 from .runtime import MTPLXRuntime
 from .sampling import (
+    non_finite_logits_error,
     SamplerConfig,
     SparseDistribution,
     acceptance_probability as compute_acceptance_probability,
@@ -91,7 +112,12 @@ from .sampling import (
     sample_from_distribution,
 )
 from .session_bank import _boundary_true_restore_enabled
-from .runtime_options import block_prefix_restore_enabled, env_bool
+from .runtime_options import (
+    block_prefix_restore_enabled,
+    env_bool,
+    qwen4_opdiet_enabled,
+)
+from .route_tape import RouteTape, counter_deltas
 
 Mode = Literal["ar", "mtp1", "mtpk", "mtpa"]
 VerifyStrategy = Literal[
@@ -289,6 +315,54 @@ def _env_falsey(name: str) -> bool:
     }
 
 
+# MTPLX_QWEN4_DRAFT_K20_PRESCATTER -- read ONCE at import (in
+# ``mtplx.qwen4_draft_k20_prescatter``), default OFF.  When off this constant
+# is False, no plan is claimed, `_draft_k20_prescatter_plan` stays None, and
+# the one draft-read site below is behind `is not None`, so the retained stock
+# lane runs the code it ran before this module existed.
+#
+# When on (and the request is eligible -- the claim RAISES rather than falling
+# back) each draft step builds its K20 support from the FR-Spec head's 65,536
+# compact row instead of the 248,320 scattered one: no `put_along_axis`, a
+# 65,536-lane `argpartition` and `logsumexp` instead of 248,320-lane ones, and
+# the same `(ids, probs)` support because the ranked id table is strictly
+# ascending.  See that module's docstring for the exactness argument.
+_QWEN4_DRAFT_K20_PRESCATTER = _qwen4_draft_k20_prescatter_enabled()
+
+# MTPLX_QWEN4_BLOCK_VERIFY -- read at import (in ``mtplx.qwen4_block_verify``)
+# and re-copied by ``refresh_env_flags`` below once the server has stamped the
+# model family's runtime env, default OFF.  When off this constant is False,
+# no verifier is built, and the stock accept loop evaluates exactly the
+# expressions it evaluated before -- same acceptance probability, same
+# residual, same uniforms, same order.  When on, the loop runs block
+# verification (Sun et al. 2024, arXiv:2403.10444) instead of the per-token
+# Leviathan-Chen law: the reach budget is carried across depths instead of
+# clipping each factor, water-filled across the depth d+1 draft support, and
+# a rejection corrects from the deficit residual.  Both laws are exact
+# samplers of the same target distribution (tests/test_block_verify_exact_law.py
+# enumerates both); BV accepts deeper more often (+1.85% tokens/window
+# measured offline on 381 real windows) and draws exactly the same number of
+# uniforms.  See ``mtplx/qwen4_block_verify.py``.
+_QWEN4_BLOCK_VERIFY = _qwen4_block_verify_enabled()
+
+
+def refresh_env_flags() -> dict[str, bool]:
+    """Re-copy the import-frozen gates from their owning modules.
+
+    ``mtplx.runtime_options.refresh_env_flags`` re-reads the environment in
+    the owning modules and then calls this, so the two constants above track
+    the model family's runtime env the server stamped after this module was
+    imported. Runs before any model load; never on the hot path.
+    """
+
+    global _QWEN4_DRAFT_K20_PRESCATTER, _QWEN4_BLOCK_VERIFY
+    _QWEN4_DRAFT_K20_PRESCATTER = _qwen4_draft_k20_prescatter_enabled()
+    _QWEN4_BLOCK_VERIFY = _qwen4_block_verify_enabled()
+    return {
+        "MTPLX_QWEN4_DRAFT_K20_PRESCATTER": bool(_QWEN4_DRAFT_K20_PRESCATTER),
+        "MTPLX_QWEN4_BLOCK_VERIFY": bool(_QWEN4_BLOCK_VERIFY),
+    }
+
 def _family_capture_commit_enabled() -> bool:
     """qwen4_exp layer-owned capture-commit (``MTPLX_FAMILY_CAPTURE_COMMIT``).
 
@@ -297,6 +371,773 @@ def _family_capture_commit_enabled() -> bool:
     rollback + trunk re-forward fallback (~27ms per rejected round measured
     2026-08-27). Default off while live receipts accumulate."""
     return env_bool("MTPLX_FAMILY_CAPTURE_COMMIT", default=False)
+
+
+def _qwen4_fixed_m4_compiled_verify_requested(
+    rt: Any,
+    *,
+    verify_strategy: str,
+    compiled_mode: str,
+    max_tokens: int,
+    cached_tokens: int,
+    prompt_tokens: int,
+    speculative_depth: int = 3,
+    session_bank: Any | None = None,
+    prompt_ids: list[int] | None = None,
+    receipt: dict | None = None,
+) -> bool:
+    """Construction gate for the shape-specialized physical-M4 verifier.
+
+    ``prompt_ids`` is only ever handed to the session bank, as the entry the
+    memory gate's reclaim must not evict: pass the ids the bank KEYS this
+    prompt by (the surrogate view for an image request,
+    ``vision.splice.vision_bank_key_ids``), not the model-input ids.
+
+    On a runtime that has the lane, ``receipt`` is filled on every path.
+    """
+
+    del cached_tokens
+
+    if not bool(getattr(rt, "qwen4_fixed_m4_compiled_verify", False)):
+        return False
+    if receipt is not None:
+        receipt.update(requested_depth=int(speculative_depth), engaged=False)
+    not_requested = (
+        "verify_strategy_not_batched"
+        if verify_strategy != "batched"
+        else "compiled_verify_off"
+        if compiled_mode == "off"
+        else "no_decode_budget"
+        if int(max_tokens) <= 0
+        # The installed replay has no eager-authoritative double run; parity2
+        # (compiled authoritative, every round compared) is its parity mode.
+        else "compiled_verify_parity_mode"
+        if compiled_mode == "parity"
+        else None
+    )
+    if not_requested is not None:
+        if receipt is not None:
+            receipt["reason"] = not_requested
+        return False
+    _retired = _fixed_m4_lane_retired_reason()
+    if _retired is not None:
+        # A kernel this GPU refused retired the lane for the process
+        # (graphbank first-dispatch guard): plain eager batched verify.
+        if receipt is not None:
+            receipt["reason"] = "dispatch_retired"
+        _note_demotion("fixed_m4_lane_skipped", _FIXED_M4_RETIRED_SKIP_REASON)
+        return False
+    if int(speculative_depth) < 3:
+        # This bank has only a four-row compiled forward. D1/D2 otherwise
+        # pay the O(context) copy and memory twice, then run eager anyway.
+        if receipt is not None:
+            receipt["reason"] = "depth_below_compiled_window"
+        _note_demotion(
+            "fixed_m4_lane_skipped",
+            "draft depth below 3: only verify width 4 has a compiled route",
+        )
+        return False
+    fits = _qwen4_fixed_m4_lane_fits(
+        rt, prompt_tokens=int(prompt_tokens), session_bank=session_bank,
+        prompt_ids=prompt_ids, receipt=receipt,
+    )
+    if receipt is not None:
+        receipt.update(engaged=fits, reason="admitted" if fits else "memory_gate")
+    return fits
+
+
+# Why an image request is kept off the compiled verify lane, by the reason the
+# request record carries. One constant line each: the demotion ledger formats
+# nothing.
+_VISION_COMPILED_VERIFY_REFUSALS: dict[str, str] = {
+    "vision_dense_kill_switch": (
+        "MTPLX_DENSE_VISION_COMPILED_VERIFY=0: dense image requests keep the eager "
+        "verifier; Flash-Next image requests are not affected"
+    ),
+    "vision_kill_switch": (
+        "MTPLX_QWEN4_VISION_COMPILED_VERIFY=0: image requests keep the eager "
+        "verifier, as they did before the compiled image route"
+    ),
+    "vision_dense_mrope": (
+        "a dense-path image request at the Flash-Next fixed-M4 door: that "
+        "lane is the QSA family's; the dense families take the compiled "
+        "verify bank through their own admission "
+        "(_dense_vision_compiled_verify_admission)"
+    ),
+    "vision_qsa_disabled": (
+        "MTPLX_QWEN4_VISION_QSA=0 is a diagnostic only the eager verifier "
+        "serves (it reads the request context, which the compiled verify lane "
+        "never does), so this image request keeps the eager verifier"
+    ),
+    "vision_state_rebase": (
+        "MTPLX_STATE_REBASE_EVERY replaces the cache under an installed verify "
+        "bank, so this image request keeps the eager verifier"
+    ),
+    "vision_table_length_mismatch": (
+        "the image position table does not cover the prompt row for row, so "
+        "this image request keeps the eager verifier"
+    ),
+    "vision_tail_block_in_image": (
+        "the prompt ends less than one indexer block after an image: the "
+        "first block completed in decode starts on an image row, whose "
+        "position is not the sequence index plus the image delta, so this "
+        "request keeps the eager verifier (chat templates never produce this "
+        "shape; a raw prompt can)"
+    ),
+}
+
+
+_VISION_GENERIC_BANK_EAGER_REASON = (
+    "only the fixed-M4 verify lane hands its cache bank the image position "
+    "delta; this image request's verify strategy would have used another "
+    "compiled route, so it keeps the eager verifier"
+)
+
+
+def _vision_rope_request(vision_splice: Any | None) -> bool:
+    """True when this request's forwards rope through the request context.
+
+    The exact condition under which ``_vision_rope_scope_for`` opens a
+    ``vision_rope`` scope, decided by the same predicate the session bank key
+    is salted on (``mtplx.vision.splice.mrope_rope_state``): an image request
+    of a family with an M-RoPE contract (qwen4_exp) whose table was built.
+    Such a request may only reach a fixed-capacity QSA bank through the
+    admission below, which hands the bank the delta; every other compiled
+    route stays off it.
+    """
+
+    if vision_splice is None or _dense_mrope_state_of(vision_splice) is not None:
+        return False
+    from mtplx.vision.splice import mrope_rope_state
+
+    # The one predicate the scope and the session bank key are decided on.
+    return mrope_rope_state(vision_splice) is not None
+
+
+def _qwen4_indexer_compress_ratio(rt: Any) -> int:
+    """Tokens per pooled indexer block of the served model (0 when unreadable)."""
+
+    model = getattr(rt, "model", None)
+    text = getattr(model, "language_model", model)
+    args = getattr(text, "args", None)
+    if args is None:
+        args = getattr(getattr(text, "model", None), "args", None)
+    return max(0, int(getattr(args, "indexer_compress_ratio", 0) or 0))
+
+
+def _vision_image_count(vision_splice: Any, prompt_ids: Sequence[int]) -> int:
+    for name in ("pad_counts", "image_grids", "image_digests"):
+        value = getattr(vision_splice, name, None)
+        if value:
+            return len(value)
+    pad_id = int(vision_splice.image_pad_token_id)
+    return sum(
+        1
+        for index, token in enumerate(prompt_ids)
+        if token == pad_id and (index == 0 or prompt_ids[index - 1] != pad_id)
+    )
+
+
+def _qwen4_vision_compiled_verify_admission(
+    rt: Any, vision_splice: Any | None, prompt_ids: Sequence[int]
+) -> dict[str, object]:
+    """Can the compiled verify lane carry this request's rotary positions?
+
+    Returns ``positions`` (``text`` | ``vision_sequential`` | ``vision_delta``),
+    ``rope_delta`` (the int the verify bank must own, or None for the text
+    trace), ``images`` and ``refusal`` (a key of
+    ``_VISION_COMPILED_VERIFY_REFUSALS``, or None).
+
+    Past the last image every position of the request's table is the sequence
+    index plus one delta on all three axes, so a fixed bank that rotates at
+    ``offset + delta`` is the eager route bit for bit. One shape breaks that:
+    a pooled indexer key rotates at its block's FIRST token, and the first
+    block completed in decode starts at ``(len(prompt) // ratio) * ratio``,
+    inside the prompt. If that row is an image row its position is a grid
+    position, not index plus delta, so the request stays eager.
+    """
+
+    if vision_splice is None:
+        return {"positions": "text", "rope_delta": None, "images": 0, "refusal": None}
+    images = _vision_image_count(vision_splice, prompt_ids)
+
+    def verdict(positions: str, rope_delta: int | None, refusal: str | None):
+        return {
+            "positions": positions,
+            "rope_delta": rope_delta,
+            "images": images,
+            "refusal": refusal,
+        }
+
+    from mtplx.vision.splice import mrope_rope_state
+
+    # (table, delta) exactly when the request's forwards rope through the
+    # request scope: the predicate the scope and the bank key are decided on.
+    roped = mrope_rope_state(vision_splice)
+    table = roped[0] if roped is not None else None
+    delta = roped[1] if roped is not None else 0
+    dense = _dense_mrope_state_of(vision_splice) is not None
+    positions = "vision_delta" if dense or roped is not None else "vision_sequential"
+    carried = delta if roped is not None and not dense else None
+    if not env_bool("MTPLX_QWEN4_VISION_COMPILED_VERIFY", default=True):
+        # The kill switch is the previous behaviour: no image request at all.
+        return verdict(positions, carried, "vision_kill_switch")
+    if dense:
+        return verdict(positions, None, "vision_dense_mrope")
+    if _env_int("MTPLX_STATE_REBASE_EVERY", 0) > 0:
+        # Rebasing replaces the cache even when the image uses sequential
+        # positions, leaving an installed verifier bound to the old entries.
+        return verdict(positions, carried, "vision_state_rebase")
+    if positions == "vision_sequential":
+        # No table and no delta: the request was prefilled at plain sequence
+        # positions and decodes at them. That is the text trace.
+        return verdict(positions, None, None)
+    from mtplx.models.qwen4_exp import vision_qsa_enabled
+
+    if not vision_qsa_enabled():
+        return verdict(positions, carried, "vision_qsa_disabled")
+    if table is not None:
+        if int(table.shape[1]) != len(prompt_ids):
+            return verdict(positions, carried, "vision_table_length_mismatch")
+        ratio = _qwen4_indexer_compress_ratio(rt)
+        pad_id = int(vision_splice.image_pad_token_id)
+        last_pad = next(
+            (
+                index
+                for index in range(len(prompt_ids) - 1, -1, -1)
+                if prompt_ids[index] == pad_id
+            ),
+            -1,
+        )
+        if ratio <= 0 or last_pad >= (len(prompt_ids) // ratio) * ratio:
+            return verdict(positions, carried, "vision_tail_block_in_image")
+    return verdict(positions, carried, None)
+
+
+def _qwen4_fixed_m4_admission(
+    rt: Any,
+    *,
+    vision_splice: Any | None,
+    prompt_ids: Sequence[int],
+    bank_key_ids: Sequence[int],
+    verify_strategy: str,
+    compiled_mode: str,
+    max_tokens: int,
+    cached_tokens: int,
+    speculative_depth: int,
+    session_bank: Any | None,
+    receipt: dict,
+) -> tuple[bool, int | None]:
+    """Admit one request to the compiled fixed-M4 verify lane.
+
+    Returns ``(admitted, rope_delta)``. ``rope_delta`` is the rotary delta the
+    verify bank must own for an image request and None for the text trace
+    (text requests, and image requests at plain sequence positions).
+
+    The position check runs first: it is host arithmetic, while the memory
+    gate behind it may evict idle bank entries, which a request that stays
+    eager anyway should not cost. A runtime without the lane records nothing.
+    """
+
+    if not bool(getattr(rt, "qwen4_fixed_m4_compiled_verify", False)):
+        return False, None
+    vision = _qwen4_vision_compiled_verify_admission(rt, vision_splice, prompt_ids)
+    receipt.update(
+        positions=vision["positions"],
+        rope_delta=vision["rope_delta"],
+        images=vision["images"],
+    )
+    refusal = vision["refusal"]
+    if refusal is not None:
+        receipt.update(
+            requested_depth=int(speculative_depth), engaged=False, reason=refusal
+        )
+        _note_demotion(
+            "vision_request_eager_verify", _VISION_COMPILED_VERIFY_REFUSALS[refusal]
+        )
+        return False, None
+    admitted = _qwen4_fixed_m4_compiled_verify_requested(
+        rt,
+        verify_strategy=verify_strategy,
+        compiled_mode=compiled_mode,
+        max_tokens=max_tokens,
+        cached_tokens=cached_tokens,
+        prompt_tokens=len(prompt_ids),
+        speculative_depth=speculative_depth,
+        session_bank=session_bank,
+        # The session's own entry is keyed by these ids; an image entry is
+        # keyed by surrogates, so the model-input ids would protect nothing.
+        prompt_ids=list(bank_key_ids),
+        receipt=receipt,
+    )
+    return admitted, (vision["rope_delta"] if admitted else None)
+
+
+# The prefill admission line (server _PREFILL_ADMISSION_PRESSURE_FRACTION).
+_QWEN4_FIXED_M4_PRESSURE_FRACTION = 0.97
+
+
+def _qwen4_fixed_m4_promotion_bytes_per_token(rt: Any) -> int:
+    """Bytes the fixed-M4 promotion re-materializes per context token.
+
+    graphbank.from_qsa_cache pads every QSA layer's keys, values, raw
+    indexer keys and pooled keys into fixed banks: per layer
+    2 x kv_heads x head_dim x bf16 + idx_dim x bf16 + idx_dim x bf16 / ratio
+    (28,416 on the Flash-Next geometry: 12 x (2,048 + 256 + 64)). 0 when
+    the served model does not expose that geometry.
+    """
+
+    model = getattr(rt, "model", None)
+    text = getattr(model, "language_model", model)
+    args = getattr(text, "args", None)
+    if args is None:
+        args = getattr(getattr(text, "model", None), "args", None)
+    layer_types = list(getattr(args, "layer_types", None) or ())
+    n_qsa = sum(1 for kind in layer_types if kind != "linear_attention")
+    kv_heads = int(getattr(args, "num_key_value_heads", 0) or 0)
+    head_dim = int(getattr(args, "head_dim", 0) or 0)
+    idx_dim = int(getattr(args, "indexer_head_dim", 0) or 128)
+    ratio = max(1, int(getattr(args, "indexer_compress_ratio", 0) or 4))
+    if n_qsa <= 0 or kv_heads <= 0 or head_dim <= 0:
+        return 0
+    return n_qsa * (2 * kv_heads * head_dim * 2 + idx_dim * 2 + (idx_dim * 2) // ratio)
+
+
+def _mlx_live_memory_bytes() -> int:
+    """Active plus cached allocator bytes, the admission shed's live term."""
+
+    return int(mx.get_active_memory()) + int(mx.get_cache_memory())
+
+
+def _mlx_release_allocator_cache() -> int:
+    """Return the allocator's cached (free but held) bytes to the system.
+
+    The cache is reclaimable by definition; a gate that counts it as live
+    memory refuses work the machine can hold (2026-09-03 W3: after a 100k
+    prefill on a 128 GB M5 Max the cache sat at the 96 GiB cap and the
+    compiled fixed-M4 lane skipped with "live 103.0 GB + promotion 2.9 GB
+    over the 100.0 GB line" while active memory was far lower). Returns the
+    bytes released; 0 when nothing was cached or MLX is unavailable.
+    """
+
+    try:
+        before = int(mx.get_cache_memory())
+        if before <= 0:
+            return 0
+        mx.clear_cache()
+        return max(0, before - int(mx.get_cache_memory()))
+    except Exception:
+        return 0
+
+
+def _metal_memory_limit_bytes(rt: Any) -> int:
+    """The allocator ceiling the serve path pinned at startup.
+
+    The server stamps its applied Metal memory limit on the runtime
+    (state.metal_memory_caps["memory_limit_bytes"], the number the prefill
+    admission shed measures against); entry points that pinned no caps fall
+    back to the memory plan's mirror of that default. 0 when unknown.
+    """
+
+    stamped = getattr(rt, "metal_memory_limit_bytes", None)
+    if isinstance(stamped, int) and stamped > 0:
+        return int(stamped)
+    from .memory_plan import detect_total_ram_bytes, usable_engine_bytes
+
+    total = detect_total_ram_bytes()
+    return usable_engine_bytes(total) if total else 0
+
+
+#: Allocator bytes a Flash-Next prefill needs above what is live when it starts
+#: and above its own KV growth, at 4,096-row chunks with the block-sparse lane
+#: armed from 16K as the lane stamps it.  128 GB M5 Max, cold prompts,
+#: 2026-09-18: process peak 98.8 GB at 64K and 100.0 GB at 128K from 88.3 GB
+#: live, with 1.9 and 3.7 GB of KV growth, so 8.0 to 8.6 GB.  The 2,048-row plan
+#: needs about 1.6 GB less.  Charged linearly in the width.  Since 2026-09-20
+#: this flat figure is only the fallback for a runtime whose geometry cannot
+#: be read: the three things it is made of are charged one by one below.
+_WIDE_PREFILL_TRANSIENT_BYTES_PER_4096_ROWS = 8 * 2**30
+#: What one prefill forward holds at once, per row: the expert gather and its
+#: intermediates, the widened streams, the GDN tensors.  Read off Friday's
+#: chunk trace as process peak minus active memory on the FIRST wide chunk of
+#: a request, where nothing else has grown yet: 1.3 GB at 2,972 rows and
+#: 1.8 GB at 4,096, so 0.44 MB a row.  Charged at 0.5 MiB.
+_WIDE_PREFILL_FORWARD_BYTES_PER_ROW = 512 * 1024
+#: Growth that is neither KV nor width: eight boundary snapshots (115 MB each
+#: on Flash-Next: 36 conv tails and float32 delta states) and allocator slack.
+_WIDE_PREFILL_FIXED_BYTES = 2**30
+#: Below the sparse crossover the eager indexer holds, per row and key: a
+#: float32 score for each of its 4 heads on every 4-token block, the reduced
+#: score, the argpartition ids and the bool mask.
+_WIDE_PREFILL_DENSE_INDEXER_BYTES_PER_ROW_KEY = 7
+#: The line the fixed-M4 lane's own live gate holds (its PRESSURE_FRACTION).
+_WIDE_PREFILL_PRESSURE_FRACTION = 0.97
+_WIDE_PREFILL_REFUSED_REASON = (
+    "live memory plus this prompt's KV growth plus the wide forward's "
+    "transient is over 0.97 of the Metal limit; the stderr line "
+    "[qwen4-prefill] carries the arithmetic"
+)
+
+
+def _wide_prefill_pressure_fraction() -> float:
+    raw = os.environ.get("MTPLX_QWEN4_PREFILL_WIDE_PRESSURE")
+    try:
+        value = float(raw) if raw else _WIDE_PREFILL_PRESSURE_FRACTION
+    except ValueError:
+        value = _WIDE_PREFILL_PRESSURE_FRACTION
+    return min(1.0, max(0.5, value))
+
+
+def _prefill_chunk_env_is_pinned() -> bool:
+    """Whether an operator moved the legacy chunk knobs off their defaults.
+
+    Every profile stamps ``MTPLX_PREFILL_CHUNK_SIZE=auto`` with 2,048 for both
+    layouts, so the keys being present says nothing.  A number in the single
+    knob, or a layout width other than 2,048, is somebody's decision.
+    """
+
+    raw = (os.environ.get("MTPLX_PREFILL_CHUNK_SIZE") or "auto").strip().lower()
+    if raw != "auto":
+        return True
+    for name in ("MTPLX_PREFILL_CHUNK_SIZE_DENSE", "MTPLX_PREFILL_CHUNK_SIZE_REPAGE"):
+        value = (os.environ.get(name) or "2048").strip()
+        if value != "2048":
+            return True
+    return False
+
+
+def _wide_prefill_flat_bill() -> bool:
+    """``MTPLX_QWEN4_PREFILL_WIDE_BILL=flat`` restores Friday's charge of a
+    flat 8 GiB per 4,096 rows on top of the KV growth (the rollback for the
+    itemized bill)."""
+
+    raw = (os.environ.get("MTPLX_QWEN4_PREFILL_WIDE_BILL") or "").strip().lower()
+    return raw == "flat"
+
+
+def _qwen4_prefill_geometry(rt: Any) -> dict[str, int] | None:
+    """The few model dimensions the wide-chunk memory bill is made of."""
+
+    model = getattr(rt, "model", None)
+    text = getattr(model, "language_model", model)
+    args = getattr(text, "args", None)
+    if args is None:
+        args = getattr(getattr(text, "model", None), "args", None)
+    layer_types = list(getattr(args, "layer_types", None) or ())
+    heads = int(getattr(args, "num_attention_heads", 0) or 0)
+    if not layer_types or heads <= 0:
+        return None
+    n_gdn = sum(1 for kind in layer_types if kind == "linear_attention")
+    n_qsa = len(layer_types) - n_gdn
+    conv_dim = 2 * int(getattr(args, "linear_num_key_heads", 0) or 0) * int(
+        getattr(args, "linear_key_head_dim", 0) or 0
+    ) + int(getattr(args, "linear_num_value_heads", 0) or 0) * int(
+        getattr(args, "linear_value_head_dim", 0) or 0
+    )
+    stream = int(getattr(args, "hidden_size", 0) or 0) * int(
+        getattr(args, "hc_count", 0) or 1
+    )
+    ple_layers = len(list(getattr(args, "ple_layer_ids", None) or ()))
+    if n_qsa <= 0 or conv_dim <= 0:
+        return None
+    return {
+        "heads": heads,
+        "n_qsa": n_qsa,
+        "hidden": int(getattr(args, "hidden_size", 0) or 0),
+        # bf16 bytes of pre-conv stream one row keeps alive across all the
+        # recurrent layers when the chunk eval does not name their states.
+        "pinned_bytes_per_row": 2 * (n_gdn * conv_dim + ple_layers * stream),
+    }
+
+
+def _qwen4_prefill_midloop_armed() -> bool:
+    try:
+        from mtplx.models.qwen4_exp import prefill_midloop_eval_setting
+
+        return int(prefill_midloop_eval_setting()) > 0
+    except Exception:
+        return False
+
+
+def _qwen4_dense_attention_keys(rows: int, prompt_tokens: int) -> int:
+    """The longest key length a DENSE forward of ``rows`` rows can see.
+
+    The sparse lane serves a forward whose earliest query has the crossover's
+    worth of history, so a dense forward has less than that and sees fewer
+    than ``crossover + rows`` keys.  A Mac whose sparse lane is off stays dense
+    at every length.
+    """
+
+    prompt_tokens = max(0, int(prompt_tokens))
+    try:
+        from mtplx.models.qwen4_exp import _qsa_prefill_enabled, _qsa_prefill_flash_floor
+
+        if not _qsa_prefill_enabled():
+            return prompt_tokens
+        return min(prompt_tokens, int(_qsa_prefill_flash_floor(int(rows))) + int(rows))
+    except Exception:
+        return prompt_tokens
+
+
+def _qwen4_wide_prefill_need(
+    rt: Any, *, rows: int, prompt_tokens: int, per_token: int
+) -> dict[str, int]:
+    """The bill for prefilling ``prompt_tokens`` in ``rows``-row forwards.
+
+    Friday's flat 8 GiB was three things, none of which grows with the prompt:
+    the pre-conv streams the recurrent layers keep alive to the end of a
+    forward (3.1 GB at 4,096 rows; not charged while the model hands finished
+    layers to the GPU mid-loop, MTPLX_QWEN4_PREFILL_MIDLOOP_EVAL), the score
+    matrix stock attention materializes below the sparse crossover (24 heads
+    x rows x keys in bf16: 3.2 GB at 4,096 rows and 16K keys), and the
+    forward's own intermediates (1.8 GB).  Each is charged for what it is, so
+    a lower crossover or a narrower rung is billed less and a Mac without the
+    sparse lane is billed the whole dense matrix.
+
+    The score matrix and the expert intermediates belong to different blocks
+    of a layer and the dense forwards run while the KV is still short, so the
+    bill is the larger of two moments, not their sum: the last dense forward
+    (its KV so far, the score matrix, half the forward's own transient for
+    what may still be in flight) and the last forward of the prompt (all of
+    the KV, the forward's transient).  Friday's forced 128K trace is the
+    receipt: the process peak was set in the 12K to 16K chunk, 4.4 GB over
+    active memory, and did not rise again while the KV grew by 3.3 GB more.
+    """
+
+    rows = int(rows)
+    prompt_tokens = max(0, int(prompt_tokens))
+    geometry = None if _wide_prefill_flat_bill() else _qwen4_prefill_geometry(rt)
+    per_token = max(0, int(per_token))
+    if geometry is None:
+        kv = prompt_tokens * per_token
+        transient = (_WIDE_PREFILL_TRANSIENT_BYTES_PER_4096_ROWS * rows) // 4096
+        return {"kv_bytes": kv, "transient_bytes": transient, "need_bytes": kv + transient}
+    if bool(getattr(rt, "mtp_enabled", False)):
+        # The draft head's own cache (one more layer of the same geometry)
+        # and the committed history's hidden row.  128K cold on a 128 GB M5
+        # Max, 2026-09-20: active memory grew 33.7 KB a token between 12K and
+        # 115K where the trunk's own geometry says 28.4; this charges 35.9.
+        per_token += per_token // max(1, geometry["n_qsa"]) + 2 * geometry["hidden"]
+    kv = prompt_tokens * per_token
+    forward = _WIDE_PREFILL_FORWARD_BYTES_PER_ROW * rows
+    keys = _qwen4_dense_attention_keys(rows, prompt_tokens)
+    dense = rows * keys * (
+        2 * geometry["heads"] + _WIDE_PREFILL_DENSE_INDEXER_BYTES_PER_ROW_KEY
+    )
+    at_last_dense_forward = keys * per_token + dense + forward // 2
+    at_last_forward = kv + forward
+    # Naming the recurrent states in the chunk eval frees the pre-conv streams
+    # BETWEEN chunks; inside a forward they all live to the end of the tape
+    # unless the model hands finished layers to the GPU mid-loop (128K cold,
+    # 4,096 rows, states named, one eval per forward: process peak 4.8 GB over
+    # active memory, which is these 3.1 GB plus the forward's own 1.8).
+    pinned = 0 if _qwen4_prefill_midloop_armed() else geometry["pinned_bytes_per_row"] * rows
+    need = max(at_last_dense_forward, at_last_forward) + pinned + _WIDE_PREFILL_FIXED_BYTES
+    return {
+        "kv_bytes": int(kv),
+        "forward_bytes": int(forward),
+        "dense_attention_bytes": int(dense),
+        "dense_attention_keys": int(keys),
+        "pinned_stream_bytes": int(pinned),
+        "fixed_bytes": int(_WIDE_PREFILL_FIXED_BYTES),
+        "transient_bytes": int(need - kv),
+        "need_bytes": int(need),
+    }
+
+
+def _wide_prefill_rungs(wide: int) -> list[int]:
+    """Widths to try, widest first: the stamped width, then the powers of two
+    below it down to 4,096.  2,048 is the refusal, not a rung."""
+
+    rungs = [int(wide)]
+    step = 1 << (int(wide) - 1).bit_length()
+    while step > 4096:
+        step //= 2
+        if step < wide:
+            rungs.append(step)
+    return rungs
+
+
+def qwen4_wide_prefill_chunk_tokens(
+    rt: Any, *, prompt_tokens: int, receipt: dict | None = None
+) -> int | None:
+    """The wider prefill chunk this request may use, or None for the default.
+
+    ``MTPLX_QWEN4_PREFILL_WIDE_CHUNK`` names the width (the Flash-Next speed
+    lane stamps 4096 on tensor-unit GPUs; unset or 0 means off).  Routed
+    experts cost 5.6 microseconds per token per layer at 2,048 rows and 3.5 at
+    4,096 on an M5 Max, so a cold prompt runs its wide chunks at about 1,820
+    tok/s instead of 1,760, and the block-sparse attention lane that arms with
+    them holds 1,125 tok/s from 16K of history where the masked dense lane has
+    fallen to 700.
+
+    Per request and never sticky: a width is granted only while live
+    allocator bytes, the prompt's own KV growth and that width's itemized
+    transient (``_qwen4_wide_prefill_need``) stay under 0.97 of the Metal
+    limit (``MTPLX_QWEN4_PREFILL_WIDE_PRESSURE``).  The stamped width is
+    tried first, then the powers of two below it down to 4,096, so a stamp
+    of 8,192 degrades to 4,096 before it degrades to a refusal.  A refusal
+    is the 2,048-row plan, which is what shipped through 2.11.3, so the gate
+    can only ever give memory back.  An operator who moves the
+    ``MTPLX_PREFILL_CHUNK_SIZE`` knobs off their profile defaults is obeyed
+    here, and ``--prefill-chunk-tokens`` never reaches this function.
+    """
+
+    wide = _env_int("MTPLX_QWEN4_PREFILL_WIDE_CHUNK", 0)
+    if wide <= 2048 or _prefill_chunk_env_is_pinned():
+        return None
+    prompt_tokens = max(0, int(prompt_tokens))
+    if prompt_tokens <= 2048:
+        return None
+    limit = _metal_memory_limit_bytes(rt)
+    if limit <= 0:
+        return wide
+    per_token = _qwen4_fixed_m4_promotion_bytes_per_token(rt)
+    line = int(limit * _wide_prefill_pressure_fraction())
+    live = _mlx_live_memory_bytes()
+    released = False
+    granted: int | None = None
+    bill: dict[str, int] = {}
+    # A rung the prompt cannot fill buys nothing over the next one down.
+    rungs = [rung for rung in _wide_prefill_rungs(wide) if rung < 2 * prompt_tokens]
+    for rung in rungs or [wide]:
+        bill = _qwen4_wide_prefill_need(
+            rt, rows=rung, prompt_tokens=prompt_tokens, per_token=per_token
+        )
+        if live + bill["need_bytes"] > line and not released:
+            # The allocator cache is free memory the allocator is holding.
+            _mlx_release_allocator_cache()
+            live = _mlx_live_memory_bytes()
+            released = True
+        if live + bill["need_bytes"] <= line:
+            granted = rung
+            break
+    if receipt is not None:
+        receipt.update(
+            wide_chunk_tokens=wide,
+            granted=granted is not None,
+            granted_chunk_tokens=int(granted or 0),
+            live_bytes=int(live),
+            threshold_bytes=int(line),
+            **bill,
+        )
+    if granted is None:
+        _note_demotion("qwen4_wide_prefill_chunk_refused", _WIDE_PREFILL_REFUSED_REASON)
+        try:
+            print(
+                f"[qwen4-prefill] {wide}-row chunk not granted for this request, "
+                f"2,048-row plan: prompt {prompt_tokens} tokens, live "
+                f"{live / 1e9:.1f} GB + need {bill['need_bytes'] / 1e9:.1f} GB "
+                f"(KV {bill['kv_bytes'] / 1e9:.1f}, transient "
+                f"{bill['transient_bytes'] / 1e9:.1f}) over the "
+                f"{line / 1e9:.1f} GB line",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception:
+            pass
+    return granted
+
+
+_FIXED_M4_RETIRED_SKIP_REASON = (
+    "the compiled verifier failed to dispatch on this GPU earlier in this "
+    "process and was retired; see the fixed_m4_dispatch_retired reason"
+)
+_COPY_ROUND_EAGER_REASON = (
+    "copy-block rounds on the batched lane run the eager forward (width 9 to "
+    "25 has no compiled route)"
+)
+
+
+def _announce_qwen4_fixed_m4_skip(reason: str) -> None:
+    _note_demotion("fixed_m4_lane_skipped", reason)
+    try:
+        print(
+            "[qwen4-fixed-M4] lane skipped for this request, plain eager "
+            f"batched verify: {reason}",
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception:
+        pass
+
+
+def _qwen4_fixed_m4_lane_fits(
+    rt: Any, *, prompt_tokens: int, session_bank: Any | None = None,
+    prompt_ids: list[int] | None = None, receipt: dict | None = None,
+) -> bool:
+    """Per-request memory gate for the strict fixed-M4 lane.
+
+    The promotion copies every QSA layer's state into padded banks (about
+    28,416 bytes per context token, again at each growth boundary), an
+    adder plain main never pays. Receipt 2026-09-02, 250k on a 128 GB
+    machine: the lane's 7.1 GB promotion adder pushed the request into a
+    507 while plain main ran. A skipped request constructs no bank and is
+    byte-for-byte the plain eager batched path.
+
+    MTPLX_QWEN4_FIXED_M4_MAX_CONTEXT is an operator belt in prompt tokens;
+    0 or unset leaves the live gate alone in charge: live allocator bytes
+    plus the promotion adder (prompt plus the initial growth reserve, at the
+    geometry's bytes per token) must stay under 0.97 of the Metal limit.
+    """
+
+    prompt_tokens = max(0, int(prompt_tokens))
+    ceiling = _env_int("MTPLX_QWEN4_FIXED_M4_MAX_CONTEXT", 0)
+    if ceiling > 0 and prompt_tokens > ceiling:
+        _announce_qwen4_fixed_m4_skip(
+            f"prompt {prompt_tokens} tokens over "
+            f"MTPLX_QWEN4_FIXED_M4_MAX_CONTEXT={ceiling}"
+        )
+        return False
+    per_token = _qwen4_fixed_m4_promotion_bytes_per_token(rt)
+    if per_token <= 0:
+        _announce_qwen4_fixed_m4_skip("promotion geometry unavailable on this runtime")
+        return False
+    limit = _metal_memory_limit_bytes(rt)
+    if limit <= 0:
+        return True
+    need = (prompt_tokens + _fixed_m4_initial_growth_reserve()) * per_token
+    live = _mlx_live_memory_bytes()
+    line = int(limit * _QWEN4_FIXED_M4_PRESSURE_FRACTION)
+    if receipt is not None:
+        receipt.update(live_bytes_before=live, promotion_bytes=need, threshold_bytes=line)
+    if live + need <= line:
+        return True
+    # The allocator cache is free memory the allocator is holding; only
+    # when it stands between this request and the lane is it released, so
+    # the common case pays nothing and the promotion's own allocations
+    # reuse the space the prefill scratch left behind.
+    released = _mlx_release_allocator_cache()
+    if released > 0:
+        live = _mlx_live_memory_bytes()
+        if live + need <= line:
+            return True
+    # Idle bank snapshots compete with the faster verifier. Reuse the same
+    # protected eviction order as prefill admission, then measure allocator
+    # bytes again: evicted logical bytes are not necessarily physical savings.
+    reclaim = getattr(session_bank, "shrink_for_admission", None)
+    if callable(reclaim) and prompt_ids:
+        bank_before = int(session_bank.total_nbytes)
+        deficit = max(0, live + need - line)
+        chain, terminal = reclaim(
+            max(0, bank_before - deficit), protect_tokens=prompt_ids,
+            reason="fixed_m4_admission",
+        )
+        _mlx_release_allocator_cache()
+        live = _mlx_live_memory_bytes()
+        if receipt is not None:
+            receipt.update(bank_bytes_before=bank_before,
+                           bank_bytes_after=int(session_bank.total_nbytes),
+                           chain_entries_evicted=chain, terminal_entries_evicted=terminal,
+                           live_bytes_after=live)
+        if live + need <= line:
+            return True
+    _announce_qwen4_fixed_m4_skip(
+        f"prompt {prompt_tokens} tokens: live {live / 1e9:.1f} GB + promotion "
+        f"{need / 1e9:.1f} GB over the {line / 1e9:.1f} GB line"
+        + (f" (allocator cache released: {released / 1e9:.1f} GB)" if released else "")
+    )
+    return False
 
 
 def _defer_repair_eval() -> bool:
@@ -434,6 +1275,336 @@ def _resolve_mtp_history_policy(requested_policy: str, prompt_tokens: int) -> st
         _env_int("MTPLX_MTP_HISTORY_LAST_WINDOW_THRESHOLD", 16384),
     )
     return "last_window" if int(prompt_tokens) >= threshold else "committed"
+
+
+#: Per-chunk prefill timings for the most recent chunked prompt prefill.
+#: Written on BOTH A/B arms (the scope below is entered unconditionally) and
+#: read by the PR #391 harness abba_driver.py.  Bounded and replaced wholesale at
+#: each scope entry, so it can never grow across a session.
+_PREFILL_CHUNK_RECORDS: list[dict[str, float]] = []
+_PREFILL_CHUNK_RECORD_CAP = 512
+
+
+def prefill_chunk_records() -> list[dict[str, float]]:
+    """Per-chunk wall and PLE-gather time for the last chunked prefill."""
+
+    return [dict(record) for record in _PREFILL_CHUNK_RECORDS]
+
+
+def _record_prefill_chunk(**fields: float) -> None:
+    if len(_PREFILL_CHUNK_RECORDS) < _PREFILL_CHUNK_RECORD_CAP:
+        _PREFILL_CHUNK_RECORDS.append(fields)
+
+
+def _prefill_chunk_trace_enabled() -> bool:
+    """``MTPLX_PREFILL_CHUNK_TRACE=1``: a measuring instrument, off by default."""
+
+    return _env_truthy("MTPLX_PREFILL_CHUNK_TRACE")
+
+
+def _annotate_prefill_chunk(**fields: float) -> None:
+    """Add the after-forward costs of the chunk just recorded (trace only)."""
+
+    if _PREFILL_CHUNK_RECORDS:
+        _PREFILL_CHUNK_RECORDS[-1].update(fields)
+
+
+def _prefill_chunk_memory_fields() -> dict[str, float]:
+    try:
+        return {
+            "active_gb": round(mx.get_active_memory() / 1e9, 3),
+            "cache_gb": round(mx.get_cache_memory() / 1e9, 3),
+            "peak_gb": round(mx.get_peak_memory() / 1e9, 3),
+        }
+    except Exception:
+        return {}
+
+
+def _emit_prefill_chunk_trace(label: str, **totals: float) -> None:
+    """One stderr line per chunked prefill: every chunk's split and the totals."""
+
+    try:
+        print(
+            "prefill_chunk_trace="
+            + json.dumps(
+                {
+                    "lane": label,
+                    "totals": {k: round(float(v), 4) for k, v in totals.items()},
+                    "chunks": [
+                        {k: round(float(v), 4) for k, v in record.items()}
+                        for record in _PREFILL_CHUNK_RECORDS
+                    ],
+                }
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception:
+        pass
+
+
+def _ple_stage_seconds() -> float:
+    """Cumulative host time inside the PLE n-gram stage gather, or 0.0."""
+
+    try:
+        from mtplx.models.qwen4_exp import ple_stage_seconds
+
+        return float(ple_stage_seconds())
+    except Exception:
+        return 0.0
+
+
+def _resolve_ple_lookahead_hook(rt, attribute: str = "ple_prefill_lookahead"):
+    """Find the object that owns ``ple_prefill_lookahead``.
+
+    The PLE stage lives on the INNER text model, two wrappers below the
+    runtime: ``rt.model`` -> ``language_model`` (the house shape) -> ``model``.
+    Walking only the first level is what made the 2026-09-01 candidate arm
+    inert: ``TextModel`` has no such attribute, the scope yielded None, and the
+    arm measured the control while wearing the candidate's label.  Search the
+    chain instead of hard-coding one depth, and let the caller decide what a
+    miss means.
+    """
+
+    seen = []
+    node = getattr(rt, "model", None)
+    for _ in range(4):
+        if node is None or any(node is other for other in seen):
+            break
+        seen.append(node)
+        hook = getattr(node, attribute, None)
+        if callable(hook):
+            return hook
+        node = getattr(node, "language_model", None) or getattr(
+            node, "model", None
+        )
+    return None
+
+
+def _reject_unwired_ple_lookahead(loop: str) -> None:
+    """Fail fast when an armed PLE lookahead meets an unwired prefill loop."""
+
+    from mtplx.ple_prefill_lookahead import reject_unwired_prefill_loop
+
+    reject_unwired_prefill_loop(loop)
+
+
+@contextlib.contextmanager
+def _ple_prefill_lookahead_scope(rt, body, spans):
+    """Arm the model's PLE prefill lookahead for this chunked prefill.
+
+    Entered on BOTH arms, so it also owns the per-chunk timing records.  With
+    MTPLX_QWEN4_PLE_PREFILL_LOOKAHEAD unset this yields a no-op scope and the
+    prefill loop below behaves exactly as before.
+
+    When the flag IS armed, an unresolvable hook raises HERE rather than
+    fourteen seconds later with an empty receipt.
+    """
+
+    _PREFILL_CHUNK_RECORDS.clear()
+    hook = _resolve_ple_lookahead_hook(rt)
+    if hook is None or not body:
+        from mtplx.ple_prefill_lookahead import enabled as _lookahead_enabled
+
+        if hook is None and body and _lookahead_enabled():
+            from mtplx.ple_prefill_lookahead import inertness_verdict
+
+            inertness_verdict(
+                "no_lookahead_hook",
+                "MTPLX_QWEN4_PLE_PREFILL_LOOKAHEAD=1 but nothing under "
+                f"{type(getattr(rt, 'model', None)).__name__} exposes "
+                "ple_prefill_lookahead; this architecture cannot serve the lane",
+            )
+        yield None
+        return
+    from mtplx.ple_prefill_lookahead import prefill_lookahead_scope
+
+    with prefill_lookahead_scope(hook(body, list(spans))) as lookahead:
+        yield lookahead
+
+
+def _predicted_first_prefill_span(
+    prompt_ids,
+    *,
+    stable_prefix_len=None,
+    session_bank=None,
+    vision_splice=None,
+    rt=None,
+):
+    """The span ``_prefill_committed_mtp_history_streaming`` will open with.
+
+    Predicted from the prompt alone, at request arrival, because that is the
+    only place where there is still host work left to hide the gather behind.
+    It is derived from the SAME two helpers the prefill loop chooses between,
+    never a restatement of their arithmetic, and it declines rather than
+    guesses:
+
+    * the plain chunk grid is what runs whenever boundary capture is off, and
+      ``gdn_boundary_sink is None`` settles that without a cache (the extra
+      ``_cache_has_recurrent_entries`` term can only turn capture OFF);
+    * when capture is possible, the tail grid may cut the first chunk too --
+      it does on a single-chunk prompt -- so both plans are built and the span
+      is returned only if they agree on chunk 1.
+
+    A wrong prediction is not an exactness risk (the payload is accepted only
+    after its token ids compare equal to the ones `stage` was called with), but
+    it is wasted worker time, so it is worth being exact here.
+    """
+
+    body_len = len(prompt_ids) - 1
+    if body_len <= 0:
+        return None
+    if not _sustained_prefill_enabled():
+        # The non-streaming prefill takes a different loop entirely and the
+        # lane is not wired to it.
+        return None
+    plain = _iter_prefill_chunk_spans(body_len)
+    if not plain:
+        return None
+    may_capture = (
+        session_bank is not None
+        and vision_splice is None
+        and _gdn_boundary_capture_enabled()
+    )
+    if not may_capture:
+        return plain[0]
+    if (
+        rt is not None
+        and _resolve_inforward_boundary_hooks(rt, vision_splice=vision_splice)
+        is not None
+    ):
+        # Boundaries recorded inside the forwards: the loop runs the plain
+        # grid whatever the tail looks like.
+        return plain[0]
+    cold_edges: tuple[int, ...] = ()
+    if stable_prefix_len is not None and 0 < int(stable_prefix_len) < body_len:
+        cold_edges = (int(stable_prefix_len),)
+    grid = _prefill_spans_with_tail_grid(
+        body_len,
+        tail_interval=_gdn_boundary_tail_interval(),
+        mandatory_edges=cold_edges,
+    )
+    if grid and tuple(grid[0]) == tuple(plain[0]):
+        return plain[0]
+    return None
+
+
+def _bank_may_preempt_first_span(session_bank, prompt_ids, span) -> bool:
+    """Whether a session-bank restore can move the prefill past ``span``'s start.
+
+    Every restore lane (exact, near-prefix, block-prefix) begins by matching
+    at least the block-restore minimum of the prompt against a RAM entry, so
+    a RAM entry sharing that much prefix is the necessary condition for the
+    prefill to start anywhere but token 0.  Cheap by construction (one slice
+    compare per entry, no cold-tier scan) and duck-typed: banks without the
+    probe are treated as unable to preempt, which keeps the pre-2026-09-03
+    behaviour for them.
+    """
+
+    if session_bank is None or not prompt_ids:
+        return False
+    probe = getattr(session_bank, "shares_ram_prefix", None)
+    if not callable(probe):
+        return False
+    block_min_match = max(
+        1, _env_int("MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS", 512)
+    )
+    span_end = int(span[1]) if span is not None else block_min_match
+    try:
+        return bool(
+            probe(prompt_ids, min_tokens=min(block_min_match, max(1, span_end)))
+        )
+    except Exception:
+        return False
+
+
+def _with_ple_first_gather_early(fn):
+    """Start the first prefill chunk's PLE gather at request arrival.
+
+    A decorator rather than a ``with`` inside the body because
+    ``restore_or_prefill_prompt_state`` returns from a dozen places (every
+    session-bank restore lane is one), and every one of them must release the
+    worker.  Off by default; with MTPLX_QWEN4_PLE_FIRST_GATHER_EARLY unset this
+    is one contextvar set and a ``None`` yield.
+    """
+
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        rt = args[0] if args else kwargs.get("rt")
+        prompt_ids = args[1] if len(args) > 1 else kwargs.get("prompt_ids")
+        with _ple_first_gather_early_scope(
+            rt,
+            prompt_ids,
+            stable_prefix_len=kwargs.get("stable_prefix_len"),
+            session_bank=kwargs.get("session_bank"),
+            vision_splice=kwargs.get("vision_splice"),
+        ):
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
+@contextlib.contextmanager
+def _ple_first_gather_early_scope(
+    rt, prompt_ids, *, stable_prefix_len=None, session_bank=None, vision_splice=None
+):
+    """Arm the model's first-chunk PLE gather for this request."""
+
+    from mtplx.ple_prefill_lookahead import (
+        early_enabled as _early_enabled,
+        first_gather_early_scope,
+    )
+
+    if not _early_enabled() or not prompt_ids:
+        with first_gather_early_scope(
+            None, None if prompt_ids else "empty_prompt"
+        ):
+            yield None
+        return
+    hook = _resolve_ple_lookahead_hook(rt, "ple_first_gather_early")
+    if hook is None:
+        from mtplx.ple_prefill_lookahead import inertness_verdict
+
+        inertness_verdict(
+            "no_first_gather_hook",
+            "MTPLX_QWEN4_PLE_FIRST_GATHER_EARLY=1 but nothing under "
+            f"{type(getattr(rt, 'model', None)).__name__} exposes "
+            "ple_first_gather_early; this architecture cannot serve the lane",
+        )
+        with first_gather_early_scope(None, "no_first_gather_hook"):
+            yield None
+        return
+    span = _predicted_first_prefill_span(
+        prompt_ids,
+        stable_prefix_len=stable_prefix_len,
+        session_bank=session_bank,
+        vision_splice=vision_splice,
+        rt=rt,
+    )
+    if span is None:
+        with first_gather_early_scope(None, "unpredictable_first_span"):
+            yield None
+        return
+    if _bank_may_preempt_first_span(session_bank, prompt_ids, span):
+        # The span is predicted from the prompt alone, but the prefill it
+        # feeds starts where the session bank's restore leaves off.  A RAM
+        # entry sharing the block-restore minimum of prefix means the first
+        # chunk is already KV and the prefill -- if any -- begins past it:
+        # gathering span 0's rows now is 32,768 preads of pure waste, the
+        # chained rest-of-prompt page warm is a 650k-row storm on the
+        # sidecar pool for the whole decode, and both compete with the
+        # decode's own gathers for the page cache under memory pressure.
+        # That was every warm turn of every agent session before 2026-09-03.
+        with first_gather_early_scope(None, "bank_prefix_may_serve_first_span"):
+            yield None
+        return
+    early = hook(list(prompt_ids)[:-1], span)
+    with first_gather_early_scope(
+        early, None if early is not None else "model_declined_span"
+    ):
+        yield early
 
 
 def _runtime_count(rt: MTPLXRuntime, key: str, amount: int = 1) -> None:
@@ -926,7 +2097,7 @@ def _sustained_prefill_layout() -> str:
     return "contiguous_then_repage"
 
 
-_DENSE_AUTO_ANNOUNCED = False
+_DENSE_AUTO_ANNOUNCED: Any = False
 
 
 def _memory_budget_env_bytes() -> int:
@@ -966,12 +2137,15 @@ def _dense_decode_max_context() -> int:
         os.environ.get("MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT") or ""
     ).strip().lower()
     if raw == "auto":
-        # Dense KV bytes per token of context. 65536 = Qwen3.8-27B truth
-        # (16 full-attn layers x K+V x 4 kv heads x D256 x bf16); model
-        # repos with other geometry set the env alongside their config.
-        bytes_per_token = max(
-            1, _env_int("MTPLX_DENSE_KV_BYTES_PER_TOKEN", 65536)
-        )
+        # Dense KV bytes per token of context: the operator's env, else the
+        # value the loader derived from the served model's config.json
+        # (runtime.load exports it; Flash-Next is 24,576), else 65536, the
+        # Qwen3.8-27B truth (16 full-attn layers x K+V x 4 kv heads x D256
+        # x bf16). Before 2.12.0 nothing set the env, so every model was
+        # budgeted with the 27B's geometry.
+        operator_bytes = _env_int("MTPLX_DENSE_KV_BYTES_PER_TOKEN", 0)
+        derived_bytes = _env_int("MTPLX_DENSE_KV_BYTES_PER_TOKEN_DERIVED", 0)
+        bytes_per_token = max(1, operator_bytes or derived_bytes or 65536)
         ram_fraction = max(
             1, min(50, _env_int("MTPLX_DENSE_DECODE_RAM_PERCENT", 15))
         )
@@ -990,21 +2164,31 @@ def _dense_decode_max_context() -> int:
         window = _env_int("MTPLX_CONTEXT_WINDOW_TOKENS", 0)
         if window > 0:
             budget_tokens = min(budget_tokens, window)
-        resolved = max(131072, budget_tokens)
-        # Announce once: a new model that forgot to ship its
-        # MTPLX_DENSE_KV_BYTES_PER_TOKEN gets its budget computed on the
-        # 65536 Qwen3.8 default — this line is how a wrong-geometry day-0
-        # shows itself in the serve log instead of as a silent OOM or a
-        # silently conservative ceiling.
+        # The speed floor (never slower than the shipped 131072 literal)
+        # holds while its dense slab is affordable: a quarter of RAM. Every
+        # seat from 32 GB up keeps it on the 27B geometry (8 GiB slab);
+        # a 16 or 24 GB seat loses it, so an overcommitted explicit window
+        # there no longer pins an 8 GiB dense slab the machine cannot hold.
+        floor_tokens = min(131072, int(total_ram * 25 / 100) // bytes_per_token)
+        resolved = max(floor_tokens, budget_tokens)
+        # Announce once, with the source of the geometry: a model whose
+        # config.json does not describe its attention falls back to the
+        # 65536 Qwen3.8 default, and this line is how a wrong-geometry
+        # day-0 shows itself in the serve log instead of as a silent OOM or
+        # a silently conservative ceiling.
+        # Keyed by the geometry source: the server asks once before the
+        # model load (no derived geometry yet) and again after it, and the
+        # second answer is the one the process serves with.
         global _DENSE_AUTO_ANNOUNCED
-        if not _DENSE_AUTO_ANNOUNCED:
-            _DENSE_AUTO_ANNOUNCED = True
+        announce_key = (bytes_per_token, operator_bytes > 0, derived_bytes > 0)
+        if _DENSE_AUTO_ANNOUNCED != announce_key:
+            _DENSE_AUTO_ANNOUNCED = announce_key
             try:
                 print(
                     "[mtplx] dense-decode ceiling auto: "
                     f"{resolved} tokens ({ram_fraction}% RAM over "
                     f"{bytes_per_token} B/token"
-                    f"{'' if os.environ.get('MTPLX_DENSE_KV_BYTES_PER_TOKEN') else ' — MODEL DEFAULT, set MTPLX_DENSE_KV_BYTES_PER_TOKEN for non-Qwen3.8 geometry'})",
+                    f"{', operator env' if operator_bytes > 0 else ', from the model config' if derived_bytes > 0 else ' — MODEL DEFAULT, set MTPLX_DENSE_KV_BYTES_PER_TOKEN for non-Qwen3.8 geometry'})",
                     flush=True,
                 )
             except Exception:
@@ -1420,7 +2604,26 @@ class _DecodeTrace:
                             ),
                             "verify_calls": totals.get("verify_calls"),
                             "verify_time_s": totals.get("verify_time_s"),
+                            "verify_forward_time_s": totals.get("verify_forward_time_s"),
+                            "verify_logits_eval_time_s": totals.get("verify_logits_eval_time_s"),
+                            "verify_hidden_eval_time_s": totals.get("verify_hidden_eval_time_s"),
+                            "verify_target_distribution_time_s": totals.get("verify_target_distribution_time_s"),
+                            "verify_eval_unattributed_time_s": totals.get("verify_eval_unattributed_time_s"),
                             "draft_time_s": totals.get("draft_time_s"),
+                            "accept_time_s": totals.get("accept_time_s"),
+                            "commit_time_s": totals.get("commit_time_s"),
+                            "repair_time_s": totals.get("repair_time_s"),
+                            "snapshot_time_s": totals.get("snapshot_time_s"),
+                            "bonus_time_s": totals.get("bonus_time_s"),
+                            "capture_commit_time_s": totals.get("capture_commit_time_s"),
+                            "verify_route": totals.get("verify_route"),
+                            "compiled_verify_calls": totals.get("compiled_verify_calls"),
+                            "eager_verify_calls": totals.get("eager_verify_calls"),
+                            # Host allocator counters only: no mx.eval or GPU
+                            # synchronization on this existing ~1 Hz hook.
+                            "active_memory_bytes": mx.get_active_memory(),
+                            "cache_memory_bytes": mx.get_cache_memory(),
+                            "peak_memory_bytes": mx.get_peak_memory(),
                         }
                     )
                 except Exception:
@@ -2126,6 +3329,13 @@ class GenerationStats:
     speculative_depth: int = 0
     requested_speculative_depth: int = 0
     long_context_mtp_depth_policy: dict[str, object] = field(default_factory=dict)
+    fixed_m4_admission: dict[str, object] = field(default_factory=dict)
+    # The dense families' sibling of fixed_m4_admission: whether the compiled
+    # verify bank carried this request's positions, and why not otherwise.
+    compiled_verify_admission: dict[str, object] = field(default_factory=dict)
+    # Demotions recorded while this request ran (mtplx/demotions.py):
+    # kind -> count. Exact on the serial scheduler.
+    demotions: dict[str, int] = field(default_factory=dict)
     accepted_by_depth: list[int] = field(default_factory=list)
     drafted_by_depth: list[int] = field(default_factory=list)
     accept_probability_sum_by_depth: list[float] = field(default_factory=list)
@@ -2157,9 +3367,16 @@ class GenerationStats:
     context_copy_accepted_blocks: int = 0
     context_copy_accepted_tokens: int = 0
     context_copy_suspensions: int = 0
+    context_copy_capacity_growths: int = 0
     context_copy_suspended: bool = False
     context_copy_backoff_tokens: int = 0
     context_copy_disabled_reason: str | None = None
+    # MTPLX_QWEN4_SAMPLED_DRAFT_CHAIN: rounds drafted with one eval, rounds whose
+    # device prediction the host did not confirm (finished serially), and why
+    # the lane stood aside when it did ("installed" when it ran).
+    sampled_draft_chain_rounds: int = 0
+    sampled_draft_chain_cuts: int = 0
+    sampled_draft_chain_status: str = "off"
     # Grammar-constrained decoding (response_format). constraint_completed is
     # None when no constraint was active, False when generation ended before
     # the grammar reached a complete document (truncation is never passed off
@@ -2176,6 +3393,8 @@ class GenerationStats:
     adapter_ensemble_q: dict[str, object] = field(default_factory=dict)
     mtp_topk_reranker: dict[str, object] = field(default_factory=dict)
     draft_core: dict[str, object] = field(default_factory=dict)
+    #: MTPLX_QWEN4_DRAFT_K20_PRESCATTER receipt: ``{installed, rows, ...}``.
+    draft_k20_prescatter: dict[str, object] = field(default_factory=dict)
     owned_recurrent_state: dict[str, object] = field(default_factory=dict)
     owned_attn_kv: dict[str, object] = field(default_factory=dict)
     repetition_stop_triggered: bool = False
@@ -2220,6 +3439,12 @@ class RepetitionStopConfig:
     min_repeats: int = 4
     min_block_tokens: int = 1
     max_block_tokens: int = 96
+    # Long-cycle stop (_LongCycleStop): exact loops whose period is above
+    # max_block_tokens and at most max_cycle_tokens fire at
+    # min_cycle_copies whole copies spanning min_cycle_span_tokens or more.
+    max_cycle_tokens: int = 8192
+    min_cycle_copies: int = 3
+    min_cycle_span_tokens: int = 512
 
 
 @dataclass(frozen=True)
@@ -2227,7 +3452,12 @@ class RepetitionStopResult:
     trim_start: int
     block_tokens: int
     repeats: int
+    # Length of the suffix the stop removes (trim_start == len - this).
+    # The long-cycle stop removes nothing and reports 0 here; its period and
+    # copies are block_tokens and repeats.
     repeated_tokens: int
+    # "exact_repeated_token_suffix" (short-block stop) or "long_cycle".
+    reason: str = "exact_repeated_token_suffix"
 
 
 def _repetition_stop_config(enabled: bool) -> RepetitionStopConfig:
@@ -2244,6 +3474,14 @@ def _repetition_stop_config(enabled: bool) -> RepetitionStopConfig:
         min_block_tokens,
         _env_int("MTPLX_REPETITION_STOP_MAX_BLOCK_TOKENS", 96),
     )
+    # A value at or below max_block_tokens leaves the long-cycle stop no
+    # period to cover and turns it off on its own.
+    max_cycle_tokens = _env_int("MTPLX_REPETITION_STOP_MAX_CYCLE_TOKENS", 8192)
+    min_cycle_copies = max(2, _env_int("MTPLX_REPETITION_STOP_MIN_CYCLE_COPIES", 3))
+    min_cycle_span_tokens = max(
+        1,
+        _env_int("MTPLX_REPETITION_STOP_MIN_CYCLE_SPAN_TOKENS", 512),
+    )
     return RepetitionStopConfig(
         enabled=True,
         min_tokens=min_tokens,
@@ -2251,6 +3489,9 @@ def _repetition_stop_config(enabled: bool) -> RepetitionStopConfig:
         min_repeats=min_repeats,
         min_block_tokens=min_block_tokens,
         max_block_tokens=max_block_tokens,
+        max_cycle_tokens=max_cycle_tokens,
+        min_cycle_copies=min_cycle_copies,
+        min_cycle_span_tokens=min_cycle_span_tokens,
     )
 
 
@@ -2466,6 +3707,12 @@ class GenerationFinalState:
     mtp_history_window_tokens: int = 0
     mtp_history_position_base: int = 0
     extra_state: dict[str, Any] | None = None
+    # Optional pre-decode state for backends whose rolling cache cannot safely
+    # reconstruct an earlier prompt boundary from the generated tail.
+    prompt_boundary_cache: list[Any] | None = None
+    prompt_boundary_logits: Any | None = None
+    prompt_boundary_hidden: Any | None = None
+    prompt_boundary_extra_state: dict[str, Any] | None = None
 
 
 def _finish_reason_from_tokens(
@@ -2533,13 +3780,173 @@ def _detect_repeated_token_suffix(
     return best
 
 
+# Long-cycle stop (2.12.0). The short-block scan above re-slices every block
+# size on every commit, so its cost grows with the longest period it covers
+# (per commit on a 16.9k-token output: 0.018 ms at 96 tokens, 0.28 ms at 512,
+# 3.2 ms at 2,048), and loops longer than 96 tokens went unseen: on
+# 2026-09-22 a 4-bit MiMo 9B build repeated a 1,323-token cycle 72 times
+# (100,912 tokens, no answer) and a 129-token cycle 94 times. This detector
+# does constant work per committed token (0.4 to 1.6 microseconds a commit,
+# AR or three-token MTP rounds).
+_LONG_CYCLE_WINDOW = 32
+_LONG_CYCLE_HASH_BASE = 1_000_003
+_LONG_CYCLE_HASH_MOD = (1 << 61) - 1
+
+
+class _LongCycleStop:
+    """Per-request exact-loop detector for periods above max_block_tokens.
+
+    A rolling hash of the last _LONG_CYCLE_WINDOW committed tokens indexes
+    where each window last ended. A window seen again P tokens later proposes
+    period P, and each proposed period keeps an exact run counter
+    (token[t] == token[t - P]) that the first mismatch drops. The stop fires
+    when a run holds min_cycle_copies whole copies spanning at least
+    min_cycle_span_tokens, and never before min_tokens (the stop's arming
+    point). Hashes only propose; token comparisons decide, so a collision
+    costs a few comparisons and can never fire.
+
+    It trims nothing: its copies run to thousands of tokens that are already
+    on the wire (the F35 holdback covers only the short-block window), so the
+    response keeps them and the stream and non-stream results stay equal.
+
+    State is bounded by max_cycle_tokens: a ring of the last
+    max_cycle_tokens + 1 window hashes expires index entries as they fall out
+    of range (about 1.2 MB at the 8,192 default).
+    """
+
+    __slots__ = (
+        "_arm_at",
+        "_drop",
+        "_extra_copies",
+        "_hash",
+        "_last",
+        "_min_period",
+        "_min_span",
+        "_ring",
+        "_runs",
+        "_seen",
+        "_width",
+    )
+
+    def __init__(self, config: RepetitionStopConfig) -> None:
+        self._min_period = int(config.max_block_tokens) + 1
+        self._extra_copies = int(config.min_cycle_copies) - 1
+        self._min_span = int(config.min_cycle_span_tokens)
+        self._arm_at = max(1, int(config.min_tokens)) - 1
+        self._width = int(config.max_cycle_tokens) + 1
+        self._drop = pow(
+            _LONG_CYCLE_HASH_BASE, _LONG_CYCLE_WINDOW, _LONG_CYCLE_HASH_MOD
+        )
+        self._reset()
+
+    def _reset(self) -> None:
+        self._seen = 0
+        self._hash = 0
+        # Window hash -> the position where that window last ended.
+        self._last: dict[int, int] = {}
+        # Slot q % width holds the hash of the window that ended at q.
+        self._ring = [0] * self._width
+        # Proposed period -> tokens its run still needs before it fires.
+        self._runs: dict[int, int] = {}
+
+    def _need(self, period: int) -> int:
+        # A run of r tokens at period P ends in (r + P) // P whole copies
+        # spanning r + P tokens.
+        return max(self._extra_copies * period, self._min_span - period)
+
+    def observe(self, tokens: list[int]) -> RepetitionStopResult | None:
+        """Consume every token committed since the last call."""
+        total = len(tokens)
+        if total < self._seen:
+            # The decode loops only grow the list until they stop; a rewind
+            # invalidates the rolling state, so rebuild it from the start.
+            self._reset()
+        start = self._seen
+        if total == start:
+            return None
+        window = _LONG_CYCLE_WINDOW
+        base = _LONG_CYCLE_HASH_BASE
+        mod = _LONG_CYCLE_HASH_MOD
+        drop = self._drop
+        h = self._hash
+        last = self._last
+        ring = self._ring
+        width = self._width
+        runs = self._runs
+        min_period = self._min_period
+        arm_at = self._arm_at
+        fired = 0
+        t = start
+        for t in range(start, total):
+            # int(): a numpy scalar in the list would overflow the hash math.
+            token = int(tokens[t])
+            if runs:
+                for period in list(runs):
+                    if tokens[t - period] != token:
+                        del runs[period]
+                        continue
+                    left = runs[period] - 1
+                    runs[period] = left
+                    if left <= 0 and t >= arm_at and not fired:
+                        fired = period
+            if t >= window:
+                h = (h * base + token - int(tokens[t - window]) * drop) % mod
+            else:
+                h = (h * base + token) % mod
+            if t >= window - 1:
+                slot = t % width
+                stale = ring[slot]
+                if last.get(stale) == t - width:
+                    del last[stale]
+                ring[slot] = h
+                prev = last.get(h)
+                last[h] = t
+                if prev is not None and not fired:
+                    period = t - prev
+                    if period >= min_period and period not in runs:
+                        need = self._need(period)
+                        limit = min(need, prev + 1)
+                        run = 0
+                        while run < limit and tokens[t - run] == tokens[prev - run]:
+                            run += 1
+                        # Fewer than a window of matches is a hash collision.
+                        if run >= window:
+                            runs[period] = need - run
+                            if need <= run and t >= arm_at:
+                                fired = period
+            if fired:
+                break
+        self._hash = h
+        self._seen = t + 1
+        if not fired:
+            return None
+        run = self._need(fired) - runs[fired]
+        return RepetitionStopResult(
+            trim_start=total,
+            block_tokens=fired,
+            repeats=(run + fired) // fired,
+            repeated_tokens=0,
+            reason="long_cycle",
+        )
+
+
+def _long_cycle_stop(config: RepetitionStopConfig) -> _LongCycleStop | None:
+    """Per-request long-cycle detector; None when there is nothing to cover."""
+    if not config.enabled or config.max_cycle_tokens <= config.max_block_tokens:
+        return None
+    return _LongCycleStop(config)
+
+
 def _trim_repeated_suffix(
     tokens: list[int],
     config: RepetitionStopConfig,
+    long_cycle: _LongCycleStop | None = None,
 ) -> RepetitionStopResult | None:
     result = _detect_repeated_token_suffix(tokens, config)
     if result is None:
-        return None
+        # The long-cycle stop keeps its own cursor, so callers that check
+        # once per speculative round still hand it every committed token.
+        return long_cycle.observe(tokens) if long_cycle is not None else None
     del tokens[result.trim_start :]
     return result
 
@@ -2560,6 +3967,7 @@ def _prefill_restored_prompt_suffix(
     gdn_boundary_sink: list[tuple[int, Any, Any]] | None = None,
     vision_splice: Any | None = None,
     stable_prefix_len: int | None = None,
+    plan_ids: Sequence[int] | None = None,
 ) -> tuple[Any, Any, float, float]:
     """Extend a restored SessionBank prefix without one giant suffix forward.
 
@@ -2581,6 +3989,50 @@ def _prefill_restored_prompt_suffix(
     cached_tokens = max(0, int(cached_tokens))
     suffix_total = int(len(suffix))
     suffix_done = 0
+
+    def _lookahead_plan(
+        spans_rel: Sequence[tuple[int, int]],
+    ) -> tuple[Sequence[int], list[tuple[int, int]]]:
+        """(plan ids, spans) for this suffix's chunk grid, in PROMPT coords.
+
+        A restored suffix is the same chunked prefill as a fresh prompt's,
+        over a shorter span: the same two grid helpers, one ``stage()`` per
+        chunk, in chunk order.  The one difference that matters to the PLE
+        lookahead is where a chunk's n-gram history comes from -- the owner
+        reads it off the RESTORED state cache, so the worker has to rebuild it
+        from the whole prompt, not from the suffix alone.  Hence absolute
+        spans over ``plan_ids``, which both callers already hold.
+
+        The prompt is compared against the suffix rather than assumed: a plan
+        whose tail is not what the chunks carry would make every
+        ``span_index_of`` miss, and an armed lane reads a required span it
+        never served as inertness.
+        """
+
+        from mtplx.ple_prefill_lookahead import enabled as _lookahead_enabled
+
+        rel = [(int(start), int(end)) for start, end in spans_rel]
+        if not _lookahead_enabled():
+            # Unarmed: the scope is a no-op that only needs a non-empty plan
+            # to know the prefill is not empty.  Walking the whole prompt here
+            # would be host work on the control arm's TTFT path.
+            return suffix, rel
+        if (
+            plan_ids is not None
+            and len(plan_ids) == cached_tokens + len(suffix)
+            and list(plan_ids[cached_tokens:]) == list(suffix)
+        ):
+            return plan_ids, [
+                (cached_tokens + start, cached_tokens + end) for start, end in rel
+            ]
+        # No prompt handed down, or one that is not this suffix's: the suffix
+        # alone is a correct plan for every chunk but the first, whose n-gram
+        # history reaches back into the restored prefix.  That chunk's rows
+        # then fail the row-equality check in `_take_prefill_lookahead` and it
+        # pays the ordinary gather -- counted (`miss_row_mismatch`), exact,
+        # never silent.
+        return suffix, rel
+
     # A committed history needs a draft head to append to. Requiring
     # rt.mtp_enabled here is the chokepoint that keeps the hidden-only chunk
     # branch (and every append_history call) off target-only AR runtimes, whose
@@ -2592,6 +4044,17 @@ def _prefill_restored_prompt_suffix(
         and _mtp_history_uses_committed_cache(mtp_history_policy)
         and restored.mtp_history_cache is not None
     )
+    if use_committed_mtp:
+        _dense_mrope = _dense_mrope_state_of(vision_splice)
+        if _dense_mrope is not None and _mtp_cache_offset(
+            restored.mtp_history_cache
+        ) != int(restored.entry.prefix_len) - 1:
+            # A full draft history holds one row per prefix token but the
+            # last. A shorter one was reset in an earlier turn: its rows were
+            # stored with the stock rope, so the rows appended now must match.
+            _dense_mrope_release_draft_head(
+                _dense_mrope, _DRAFT_HEAD_MISALIGNED_RESTORE_REASON
+            )
     # Vision suffixes: the caller pre-advanced the cursor past pads inside
     # the restored prefix; trunk chunks consume the remaining rows
     # sequentially, history windows read the same rows cursor-free.
@@ -2717,7 +4180,15 @@ def _prefill_restored_prompt_suffix(
         fused_array = mx.array([suffix])
         fused_embeddings = _suffix_chunk_embeddings(fused_array)
         started = time.perf_counter()
-        with attention_phase("prefill"):
+        # One fused forward is one `stage()`: nothing to look ahead TO, which
+        # is the lane's own `single_span` decline -- counted in the W84
+        # receipt by the scope, never a raise.
+        with (
+            _ple_prefill_lookahead_scope(
+                rt, *_lookahead_plan([(0, len(suffix))])
+            ),
+            attention_phase("prefill"),
+        ):
             suffix_logits, suffix_hidden = _forward_ar_optional_hidden(
                 rt,
                 fused_array,
@@ -2759,26 +4230,49 @@ def _prefill_restored_prompt_suffix(
         gdn_boundary_sink is not None
         and _cache_has_recurrent_entries(restored.cache)
     )
-    if len(suffix) > 1:
-        body = suffix[:-1]
+    body = suffix[:-1]
+    body_array = None
+    spans: list[tuple[int, int]] = []
+    _inforward_hooks = (
+        _resolve_inforward_boundary_hooks(rt, vision_splice=vision_splice)
+        if capture_boundaries
+        else None
+    )
+    _inforward_edges: tuple[int, ...] = ()
+    if body:
         body_array = mx.array([body])
-        spans = (
-            _prefill_spans_with_tail_grid(
-                len(body),
-                tail_interval=_gdn_boundary_tail_interval(),
-                mandatory_edges=(
-                    (_stable_edge_rel,) if _stable_edge_rel is not None else ()
-                ),
-            )
-            if capture_boundaries
-            else _iter_prefill_chunk_spans(len(body))
+        spans, _inforward_edges = _prefill_boundary_plan(
+            len(body),
+            capture_boundaries=capture_boundaries,
+            inforward=_inforward_hooks is not None,
+            tail_interval=_gdn_boundary_tail_interval(),
+            mandatory_edges=(
+                (_stable_edge_rel,) if _stable_edge_rel is not None else ()
+            ),
         )
+    # PLE n-gram prefill lookahead (MTPLX_QWEN4_PLE_PREFILL_LOOKAHEAD, off by
+    # default), wired to the warm loop exactly as to the cold one: chunk k+1's
+    # 32,768 sidecar rows are hashed and page-warmed on a worker thread while
+    # chunk k's forward owns the GPU.  The final single-token pass below stays
+    # OUTSIDE the scope, as it does on the cold path.  A one-token suffix has
+    # no chunk loop at all -- the final pass IS its prefill -- so the scope is
+    # opened on that single span and declines itself as `single_span`, which
+    # is the lane's by-design decline, counted, never a raise.
+    with _ple_prefill_lookahead_scope(
+        rt, *_lookahead_plan(spans or [(0, len(suffix))])
+    ):
         for start, end in spans:
             _check_postcommit_abort(abort_check)
             chunk_array = body_array[:, start:end]
             chunk_embeddings = _suffix_chunk_embeddings(chunk_array)
             started = time.perf_counter()
-            with attention_phase("prefill"):
+            chunk_gather_before = _ple_stage_seconds()
+            with (
+                attention_phase("prefill"),
+                _inforward_capture_scope(
+                    _inforward_hooks, _inforward_edges, start, end
+                ) as _capture_rows,
+            ):
                 if use_committed_mtp:
                     logits_chunk, hidden_chunk = rt.forward_ar(
                         chunk_array,
@@ -2796,23 +4290,43 @@ def _prefill_restored_prompt_suffix(
                         restored.cache,
                         input_embeddings=chunk_embeddings,
                     )
-            if hidden_chunk is None:
-                if logits_chunk is None:
-                    _eval_cache_roots(restored.cache)
-                else:
-                    _eval(logits_chunk)
-            elif logits_chunk is None:
-                _eval(hidden_chunk)
-            else:
-                _eval(logits_chunk, hidden_chunk)
+            _captured = (
+                _inforward_hooks[1](restored.cache) if _capture_rows else {}
+            )
+            _eval_prefill_chunk(logits_chunk, hidden_chunk, restored.cache, _captured)
             chunk_elapsed = time.perf_counter() - started
             target_forward_time += chunk_elapsed
+            # The same two numbers the cold loop records, for the same reason:
+            # the PLE gather is a host stall INSIDE the chunk's wall, so a
+            # reader can separate "the GPU was slow" from "the host was late"
+            # on a warm restore too.  Without it the driver's per-chunk
+            # receipt was empty for every request the session bank served.
+            _record_prefill_chunk(
+                start=float(cached_tokens + start),
+                end=float(cached_tokens + end),
+                wall_s=chunk_elapsed,
+                ple_gather_s=_ple_stage_seconds() - chunk_gather_before,
+                group_chunks=1.0,
+            )
             _runtime_count(rt, "restored_suffix_prefill_chunks")
             _runtime_count(rt, "prefill_chunks")
             suffix_done = min(suffix_total, end)
             emit_chunk(end - start, chunk_elapsed, started)
             _check_postcommit_abort(abort_check)
 
+            # Boundaries recorded INSIDE this forward come first: their
+            # positions are below the span end captured next.
+            _bank_inforward_boundaries(
+                rt,
+                gdn_boundary_sink,
+                restored.cache,
+                _captured,
+                _capture_rows,
+                span_start=start,
+                position_base=cached_tokens,
+                hidden_chunk=hidden_chunk,
+            )
+            del _captured
             if capture_boundaries:
                 # Warm prefills must capture boundaries exactly like cold
                 # ones (absolute positions; hidden of the chunk's last token
@@ -3139,24 +4653,23 @@ def _restore_near_prefix_prompt_state(
             _near_debug("missing_committed_mtp_history")
             continue
         if getattr(entry, "has_recurrent", False):
-            gap_from_entry = int(getattr(entry, "prefix_len", 0) or 0) - matched
-            if gap_from_entry > max_gap:
-                # Boundary-true restores land at the newest recurrent boundary
-                # at/below `matched`, not at `matched` itself. A candidate is
-                # only worth taking when that achievable point still beats the
-                # exact-prefix alternative — otherwise a boundary-quantized
-                # restore silently LOSES tokens vs the plain exact restore
-                # (observed: block candidate matched=2560 restoring at 2354
-                # while an exact 2383-entry existed).
-                probe = getattr(entry, "recurrent_boundary_at_or_below", None)
-                achievable = 0
-                if callable(probe):
-                    boundary_probe = probe(matched)
-                    if boundary_probe is not None:
-                        achievable = int(boundary_probe[0])
-                if achievable <= int(min_restore_tokens):
-                    _near_debug(f"boundary_not_better:{achievable}")
-                    continue
+            # Every partial restore of a recurrent entry lands at the newest
+            # recurrent boundary at/below `matched`, not at `matched` itself
+            # (the GDN state cannot be trimmed; tiny gaps included since
+            # 2026-09-08). A candidate is only worth taking when that
+            # achievable point still beats the exact-prefix alternative --
+            # otherwise a boundary-quantized restore silently LOSES tokens vs
+            # the plain exact restore (observed: block candidate matched=2560
+            # restoring at 2354 while an exact 2383-entry existed).
+            probe = getattr(entry, "recurrent_boundary_at_or_below", None)
+            achievable = 0
+            if callable(probe):
+                boundary_probe = probe(matched)
+                if boundary_probe is not None:
+                    achievable = int(boundary_probe[0])
+            if achievable <= int(min_restore_tokens):
+                _near_debug(f"boundary_not_better:{achievable}")
+                continue
 
         prefix_restore = None
         cache_restore_time_s = 0.0
@@ -3413,6 +4926,10 @@ def _restore_near_prefix_prompt_state(
                 gdn_boundary_sink=suffix_boundary_sink,
                 stable_prefix_len=stable_prefix_len,
                 vision_splice=vision_splice,
+                # The whole prompt, so the PLE lookahead's worker rebuilds
+                # each suffix chunk's n-gram history from the same tokens the
+                # restored state cache holds.
+                plan_ids=prompt_ids,
             )
         )
         entry.hits += 1
@@ -3588,6 +5105,103 @@ def _capture_gdn_boundary(
         pass
 
 
+def _gdn_boundary_tail_layout() -> str:
+    """``geometric`` (default) or ``dense`` (the layout through 2.11.3).
+
+    The dense layout cut the WHOLE final chunk into ``tail_interval`` pieces:
+    eight 256-row forwards behind every cold prompt at the default chunk, and
+    the entire prompt when the chunk is wider than the prompt.  Measured on
+    Flash-Next (M5 Max, 2026-09-18): a 256-row forward runs at about 750
+    tok/s against 1,720 for a 2,048-row one, so a 4K prompt spent 2.6 s of
+    its 3.7 s in that tail, and widening the chunk made prefill slower.  The
+    boundary list keeps at most MTPLX_GDN_BOUNDARY_MAX records with one per
+    power-of-two distance from the newest, so most of what the dense grid
+    captured was thinned away again.
+    """
+
+    raw = (os.environ.get("MTPLX_GDN_BOUNDARY_TAIL_LAYOUT") or "").strip().lower()
+    return "dense" if raw == "dense" else "geometric"
+
+
+def _gdn_boundary_tail_min_rung() -> int:
+    """Narrowest span the tail ladder may create behind the nearest boundary.
+
+    Measured on Flash-Next (M5 Max, 2026-09-18, 4K context): a 2,048-row
+    forward runs at 1,763 tok/s, 1,024 rows at 1,508, 512 at 1,199 and 256 at
+    842, so every rung narrower than 1,024 rows costs a cold prompt about
+    0.15 s and buys a restore point only a mid-tail edit can use.  The rung
+    nearest the prompt end (the one an agent turn restores from) is exempt.
+    """
+
+    raw = os.environ.get("MTPLX_GDN_BOUNDARY_TAIL_MIN_RUNG", "1024")
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return 1024
+
+
+def _gdn_boundary_tail_backoff() -> int:
+    """How far before the prompt end the nearest boundary sits (0 = old grid).
+
+    The next turn of an agent session diverges from this prompt a few tokens
+    before its end (the generation prompt is re-rendered as the assistant
+    turn), so the closer this boundary is, the less the warm turn re-prefills:
+    64 tokens instead of up to 256 on the interval grid.  It also shortens the
+    one narrow forward every cold prompt still pays (64 rows cost about
+    0.15 s on Flash-Next, 220 to 256 rows about 0.30 s).
+    """
+
+    raw = os.environ.get("MTPLX_GDN_BOUNDARY_TAIL_BACKOFF", "64")
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 64
+
+
+def _geometric_tail_edges(
+    start: int,
+    end: int,
+    tail_interval: int,
+    min_rung: int | None = None,
+    backoff: int | None = None,
+) -> list[int]:
+    """Boundary positions inside the final chunk ``[start, end)``, ascending.
+
+    ``top`` is the nearest boundary to the prompt end: ``end - backoff``, or,
+    with a backoff of 0 or a chunk too short for it, the last point of the
+    chunk's own ``interval`` grid below ``end`` (the dense layout's final
+    boundary).  It is never further from the prompt end than the dense
+    grid's.  Behind it the
+    edges sit at ``top - (2**k - 1) * rung``, ``rung`` being the minimum rung
+    width rounded up to the interval grid: their distances from the prompt
+    end fall one into each power-of-two bucket that
+    ``_thin_gdn_boundary_records`` keeps.  The deepest edge is dropped while
+    the span in front of it would be narrower than the one behind it, so
+    widths only shrink toward the prompt end and the wide part of the chunk
+    stays wide.
+    """
+
+    if min_rung is None:
+        min_rung = _gdn_boundary_tail_min_rung()
+    if backoff is None:
+        backoff = _gdn_boundary_tail_backoff()
+    rung = -(-max(int(min_rung), tail_interval) // tail_interval) * tail_interval
+    top = start + ((end - 1 - start) // tail_interval) * tail_interval
+    if top - start < tail_interval:
+        return []
+    if 0 < backoff < end - top and end - backoff - start >= tail_interval:
+        top = end - backoff
+    edges = [top]
+    reach = rung
+    while top - reach - start >= rung:
+        edges.append(top - reach)
+        reach = 2 * reach + rung
+    edges.sort()
+    while len(edges) >= 2 and edges[0] - start < edges[1] - edges[0]:
+        edges.pop(0)
+    return edges
+
+
 def _prefill_spans_with_tail_grid(
     token_count: int,
     *,
@@ -3602,11 +5216,299 @@ def _prefill_spans_with_tail_grid(
     if end - start <= tail_interval:
         return _split_spans_at(spans, mandatory_edges)
     refined = spans[:-1]
+    if _gdn_boundary_tail_layout() == "dense":
+        cursor = start
+        while cursor < end:
+            refined.append((cursor, min(end, cursor + tail_interval)))
+            cursor += tail_interval
+        return _split_spans_at(refined, mandatory_edges)
     cursor = start
-    while cursor < end:
-        refined.append((cursor, min(end, cursor + tail_interval)))
-        cursor += tail_interval
+    for edge in _geometric_tail_edges(start, end, tail_interval):
+        refined.append((cursor, edge))
+        cursor = edge
+    refined.append((cursor, end))
     return _split_spans_at(refined, mandatory_edges)
+
+
+def _gdn_boundary_inforward_enabled() -> bool:
+    """Record tail boundaries INSIDE the last wide forward instead of ending a
+    forward at each of them.  On by default; ``MTPLX_GDN_BOUNDARY_INFORWARD=0``
+    restores the ladder.
+
+    On Flash-Next every forward of 64 rows or more reads nearly all 512
+    experts of every layer once, about 0.1 s whatever its width (M5 Max,
+    2026-09-18: 64 rows 0.17 to 0.26 s, 1,024 rows 0.69 to 1.28 s), and the
+    tail ladder puts two of them behind every cold prompt and one behind every
+    warm agent turn.  Through the daemon (M5 Max, 2026-09-22, off/on/on/off)
+    a cold 4,061-token prompt prefills in 2.79 to 2.81 s against 3.06 to
+    3.10 s.  The boundary POSITIONS are the ladder's, so restores,
+    retention and the bank see the same records; what changes is the chunk
+    layout of the last chunk, which is the rounding class every chunk-layout
+    change is in (the recurrent state at p now comes from the wide forward's
+    own arithmetic, exactly as the KV rows before p do).
+    """
+
+    return not _env_falsey("MTPLX_GDN_BOUNDARY_INFORWARD")
+
+
+def _resolve_inforward_boundary_hooks(rt: Any, *, vision_splice: Any = None):
+    """``(scope, take)`` when this request may capture in-forward, else None.
+
+    The two hooks live on the family's text model (found the way the PLE
+    lookahead is).  A family without them keeps the ladder.  Image requests
+    keep the ladder too: their restore rules are keyed on the image span and
+    were proven against forwards that END at the boundary.
+    """
+
+    if vision_splice is not None or not _gdn_boundary_inforward_enabled():
+        return None
+    scope = _resolve_ple_lookahead_hook(rt, "boundary_capture_scope")
+    take = _resolve_ple_lookahead_hook(rt, "take_boundary_captures")
+    if scope is None or take is None:
+        return None
+    return scope, take
+
+
+def _prefill_boundary_plan(
+    token_count: int,
+    *,
+    capture_boundaries: bool,
+    inforward: bool,
+    tail_interval: int,
+    mandatory_edges: tuple[int, ...] = (),
+    chunk_size: int | None = None,
+) -> tuple[list[tuple[int, int]], tuple[int, ...]]:
+    """``(spans to forward, boundary positions to record inside them)``.
+
+    One owner for the three prefill loops.  Without boundary capture it is
+    the plain chunk grid.  With it, the boundary positions are ALWAYS the
+    span ends of the tail ladder (geometric or dense, plus the mandatory
+    edges); the only question is whether the forwards are cut there
+    (``inforward`` false: the ladder itself, no interior positions) or stay
+    the plain chunks with those positions recorded inside them.
+    """
+
+    if not capture_boundaries:
+        return list(_iter_prefill_chunk_spans(token_count, chunk_size=chunk_size)), ()
+    ladder = _prefill_spans_with_tail_grid(
+        token_count,
+        tail_interval=tail_interval,
+        mandatory_edges=mandatory_edges,
+        chunk_size=chunk_size,
+    )
+    if not inforward:
+        return ladder, ()
+    plain = list(_iter_prefill_chunk_spans(token_count, chunk_size=chunk_size))
+    plain_ends = {int(end) for _start, end in plain}
+    interior = tuple(
+        sorted(int(end) for _start, end in ladder if int(end) not in plain_ends)
+    )
+    return plain, interior
+
+
+def _prefill_eval_recurrent_state_enabled() -> bool:
+    """``MTPLX_PREFILL_EVAL_RECURRENT_STATE=0`` restores the old eval set."""
+
+    return not _env_falsey("MTPLX_PREFILL_EVAL_RECURRENT_STATE")
+
+
+def _recurrent_state_leaves(cache: list[Any] | None) -> list[mx.array]:
+    """The recurrent entries' state arrays, to be named in the chunk's eval.
+
+    A GDN layer leaves ``cache[0] = contiguous(pre_conv_stream[:, -3:, :])``
+    behind.  The prefill loops evaluated only the chunk's hidden states, so
+    that 3-row copy stayed LAZY and kept its parent alive: the whole chunk's
+    pre-conv stream, ``[1, rows + 3, conv_dim]``.  On Flash-Next that is
+    84 MB per GDN layer at 4,096 rows, 3.1 GB over 36 layers and the PLE
+    window (1.5 GB at 2,048 rows, 6.2 GB at 8,192), held until the NEXT
+    chunk's graph reaches that layer, so nearly all of it sits under the next
+    chunk's first attention layer and under the MTP-history pass.  Naming the
+    states in the same eval runs the copies while their parents are being
+    freed anyway.  Same graph, same kernels, a larger eval set: bit-identical.
+    """
+
+    if not cache or not _prefill_eval_recurrent_state_enabled():
+        return []
+    from .cache_state import _is_trimmable
+
+    leaves: list[mx.array] = []
+    for entry in cache:
+        if entry is None or _is_trimmable(entry):
+            continue
+        # The recurrent containers (mlx-lm's ArraysCache and the owned
+        # variant) hold their leaves in a plain ``cache`` list.  Anything
+        # else that refuses to trim is left alone: reading an unknown
+        # container's ``state`` property can itself be work.
+        slots = getattr(entry, "cache", None)
+        if isinstance(slots, list):
+            leaves.extend(leaf for leaf in slots if isinstance(leaf, mx.array))
+    return leaves
+
+
+def _boundary_snapshot_from_capture(
+    cache: list[Any], states: list[Any]
+) -> CacheSnapshot | None:
+    """A boundary snapshot laid out exactly like ``snapshot_untrimmable_cache``.
+
+    ``states`` is one in-forward capture: a state list per recurrent entry,
+    None for the entries that roll back by trimming.  None when the capture
+    does not cover every recurrent entry, so a partial capture can never
+    become a boundary.
+    """
+
+    from .cache_state import _clone_tree, _is_trimmable
+
+    if len(states) != len(cache):
+        return None
+    snapshot_states: list[Any] = []
+    meta_states: list[Any] = []
+    for entry, state in zip(cache, states):
+        if _is_trimmable(entry):
+            snapshot_states.append(None)
+            meta_states.append(None)
+            continue
+        if state is None:
+            return None
+        snapshot_states.append(list(state))
+        meta_states.append(_clone_tree(getattr(entry, "meta_state", None)))
+    return CacheSnapshot(states=tuple(snapshot_states), meta_states=tuple(meta_states))
+
+
+def _append_gdn_boundary_record(
+    sink: list[tuple[int, Any, Any]],
+    tokens_done: int,
+    snapshot: CacheSnapshot,
+    hidden_leaf: Any | None,
+) -> None:
+    """Append one boundary record and keep the geometric retention."""
+
+    sink.append((int(tokens_done), snapshot, hidden_leaf))
+    cap = _gdn_boundary_max_count()
+    if len(sink) > cap:
+        sink[:] = _thin_gdn_boundary_records(sink, cap)
+
+
+def _record_inforward_gdn_boundary(
+    sink: list[tuple[int, Any, Any]],
+    cache: list[Any],
+    states: list[Any],
+    *,
+    position: int,
+    row: int,
+    hidden_chunk: Any | None,
+) -> bool:
+    """Bank ONE in-forward capture; False when it does not cover every
+    recurrent entry.
+
+    The boundary at row ``row`` of the forward sits at prompt position
+    ``position`` and its hidden state is the chunk's row ``row - 1``: the same
+    leaf the ladder takes from the last row of a forward that ends there.
+    """
+
+    snapshot = _boundary_snapshot_from_capture(cache, states)
+    if snapshot is None:
+        return False
+    hidden_leaf = None
+    if hidden_chunk is not None:
+        hidden_leaf = detach_array_leaf(
+            hidden_chunk[:, row - 1 : row, :], mode="contiguous_eval"
+        )
+    _append_gdn_boundary_record(sink, position, snapshot, hidden_leaf)
+    return True
+
+
+@contextlib.contextmanager
+def _inforward_capture_scope(
+    hooks: Any, edges: tuple[int, ...], start: int, end: int
+):
+    """Arm the model for the boundary positions strictly inside ``[start, end)``.
+
+    Yields the row offsets asked for (empty when nothing is armed, which is
+    every forward of every request while the switch is off).
+    """
+
+    rows = (
+        tuple(int(edge) - int(start) for edge in edges if start < edge < end)
+        if hooks is not None
+        else ()
+    )
+    if not rows:
+        yield ()
+        return
+    with hooks[0](rows):
+        yield rows
+
+
+def _eval_prefill_chunk(
+    logits_chunk: Any, hidden_chunk: Any, cache: Any, captured: dict | None = None
+) -> None:
+    """The one blocking eval of a prefill chunk's trunk forward.
+
+    Roots: whatever the forward returned, the in-forward boundary captures
+    (they are slices of streams this eval is about to free), and the
+    recurrent entries' states (see ``_recurrent_state_leaves``).  A cache-only
+    forward returns nothing, so the whole cache is the root set, as before.
+    """
+
+    roots = [value for value in (logits_chunk, hidden_chunk) if value is not None]
+    extra = _tree_mx_arrays(captured) if captured else []
+    if roots:
+        _eval(*roots, *extra, *_recurrent_state_leaves(cache), _caller_depth=2)
+        return
+    if extra:
+        _eval(*extra, _caller_depth=2)
+    _eval_cache_roots(cache)
+
+
+def _bank_inforward_boundaries(
+    rt: Any,
+    sink: list[tuple[int, Any, Any]] | None,
+    cache: list[Any],
+    captured: dict,
+    rows: tuple[int, ...],
+    *,
+    span_start: int,
+    position_base: int,
+    hidden_chunk: Any | None,
+) -> int:
+    """Bank one forward's captures; a miss is counted and named, never silent.
+
+    Like ``_capture_gdn_boundary`` this never breaks the prefill that is
+    running: a boundary is an accelerator for a LATER turn.  Unlike it, a
+    failure lands on the demotion ledger (``/health``, the request log,
+    ``mtplx doctor``) with its reason, because a lost boundary is a slower
+    warm turn somebody will ask about.
+    """
+
+    if not rows or sink is None:
+        return 0
+    reason = "the model returned no complete capture for a requested row"
+    banked = 0
+    # Ascending, so the sink stays in position order and the geometric
+    # retention sees the records in the order the ladder appends them.
+    for row in sorted(int(row) for row in rows):
+        states = (captured or {}).get(row)
+        if states is None:
+            continue
+        try:
+            if _record_inforward_gdn_boundary(
+                sink,
+                cache,
+                states,
+                position=int(position_base) + int(span_start) + row,
+                row=row,
+                hidden_chunk=hidden_chunk,
+            ):
+                banked += 1
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+    if banked:
+        _runtime_count(rt, "prefill_inforward_boundary_captures", banked)
+    if banked < len(rows):
+        _note_demotion(
+            "inforward_boundary_capture_missed", reason, count=len(rows) - banked
+        )
+    return banked
 
 
 def _inherited_gdn_boundaries(entry: Any, restore_point: int) -> list:
@@ -3740,6 +5642,156 @@ def _debug_prefix_divergence(rt: MTPLXRuntime, prompt_ids: list[int], session_ba
         print(f"[mtplx] prefix-diverge diagnostic failed: {exc}", file=sys.stderr)
 
 
+def _dense_mrope_state_of(vision_splice: Any | None):
+    """The dense-path image position state a splice carries, or None.
+
+    None for text requests (no import, no work), for every family but the
+    dense Qwen3.5 / Qwen3.8 packs, and for requests that fell back to
+    sequential positions.
+    """
+    if vision_splice is None or getattr(vision_splice, "dense_mrope", None) is None:
+        return None
+    from .dense_mrope import state_of
+
+    return state_of(vision_splice)
+
+
+_DRAFT_HEAD_WINDOWED_REASON = (
+    "the draft head's history is windowed or on an explicit position mode, so "
+    "its rows are not the prompt rows the image position table indexes"
+)
+_DRAFT_HEAD_MISALIGNED_RESTORE_REASON = (
+    "the restored draft-head history is shorter than the restored prompt "
+    "prefix (a history reset in an earlier turn), so its rows keep the stock "
+    "positions they were stored with"
+)
+_DENSE_MROPE_DRAFT_REFUSED_REASON = (
+    "this image request was kept off the compiled verify route (see "
+    "vision_request_eager_verify), so its draft head keeps the stock route "
+    "too: only an admitted request hands its compiled draft core the image "
+    "delta"
+)
+
+
+def _dense_mrope_capable(rt: Any) -> bool:
+    """Whether the served model carries the dense image position adapter."""
+
+    from .dense_mrope import INSTALL_ATTR, DenseMRopeInstall
+
+    install = getattr(getattr(rt, "model", None), INSTALL_ATTR, None)
+    return isinstance(install, DenseMRopeInstall) and bool(install.installed)
+
+
+def _dense_vision_compiled_verify_admission(
+    vision_splice: Any | None, prompt_ids: Sequence[int], *, dense_model: bool = True
+) -> dict[str, object]:
+    """Can the compiled verify bank carry this dense-path request's positions?
+
+    The dense sibling of ``_qwen4_vision_compiled_verify_admission``, with the
+    same vocabulary: ``positions`` (``text`` | ``vision_sequential`` |
+    ``vision_delta``), ``rope_delta`` (the request's delta, recorded whether
+    or not it is admitted), ``images`` and ``refusal`` (a key of
+    ``_VISION_COMPILED_VERIFY_REFUSALS``, or None). Host arithmetic only.
+
+    Past the last image every position of the request's table is the
+    sequence index plus one delta on all three axes, and a decode forward
+    never writes a prompt row, so a bank whose containers rotate at
+    ``offset + delta`` is the eager route bit for bit for every row it can
+    write. The dense family has no pooled indexer keys, so the Flash-Next
+    tail-block rule has no counterpart here. The draft head's first decode
+    row is the LAST prompt row; a prompt ending on an image row would put a
+    grid position there, but the prefill refuses that shape on every route
+    (the final prompt token is forwarded without embeddings and may never be
+    an image pad), so no rule is needed for it.
+
+    The refusals that keep EVERY image request eager come before the
+    sequential-positions answer, so a request whose table could not be
+    built is kept eager by the same switches as one whose table was.
+    """
+
+    if vision_splice is None:
+        return {"positions": "text", "rope_delta": None, "images": 0, "refusal": None}
+    state = _dense_mrope_state_of(vision_splice)
+    verdict: dict[str, object] = {
+        "positions": "vision_delta" if state is not None else "vision_sequential",
+        "rope_delta": None if state is None else int(state.delta),
+        "images": _vision_image_count(vision_splice, prompt_ids),
+        "refusal": None,
+    }
+    if not env_bool("MTPLX_QWEN4_VISION_COMPILED_VERIFY", default=True):
+        # One kill switch for both families: the behaviour before the
+        # compiled image routes, for every image request.
+        verdict["refusal"] = "vision_kill_switch"
+    elif _env_int("MTPLX_STATE_REBASE_EVERY", 0) > 0:
+        verdict["refusal"] = "vision_state_rebase"
+    elif dense_model and not env_bool("MTPLX_DENSE_VISION_COMPILED_VERIFY", default=True):
+        # The dense route ships on, like Flash-Next's: every compiled image
+        # round is bit-exact with the eager verifier from the same cache
+        # (762 rounds, 09-21). Its free-running reply can differ from a
+        # separately run eager arm through SDPA over padded buffers, the same
+        # rounding class the compiled text lane has always carried. This is
+        # the family-specific opt-out for that.
+        verdict["refusal"] = "vision_dense_kill_switch"
+    # No table (the request was prefilled at plain sequence positions and
+    # decodes at them): the text trace, unless a switch above said no.
+    return verdict
+
+
+def _dense_draft_rope_delta(state: Any | None) -> int | None:
+    """The delta a compiled draft core's promoted history cache owns.
+
+    The request's delta while the draft head is row-aligned with the prompt:
+    every row the core writes then sits past the last image row, at the
+    sequence index plus the delta. None otherwise, because the eager draft
+    route ropes a released draft head at its raw offset (a fresh, windowed
+    or reset history holds no prompt rows).
+    """
+
+    if state is None or not state.mtp_aligned:
+        return None
+    return int(state.delta)
+
+
+def _dense_mrope_release_draft_head(state: Any | None, reason: str | None) -> None:
+    """Put the draft head of an armed request back on the stock rope.
+
+    The adapter indexes the position table with the draft cache's own offset,
+    which is the prompt index only while that cache holds one row per
+    committed token from the start. ``reason`` None means the stock rope is
+    exactly equivalent (every row left in the cache is past the prompt, where
+    image positions are the sequence index plus one constant), so nothing is
+    counted; otherwise the request is counted once.
+    """
+    if state is None or not state.mtp_aligned:
+        return
+    state.mtp_aligned = False
+    if reason is not None:
+        _note_demotion("vision_draft_head_sequential_positions", reason)
+
+
+def _with_dense_mrope_request(fn):
+    """Arm the dense-path image positions for a whole generation.
+
+    Prefill, verify, repair, bonus, commit and copy rounds, and the draft
+    head all rope through the same per-layer adapter, so one scope around the
+    request covers every forward it runs. Text requests, and families whose
+    splice carries no dense state, call straight through.
+    """
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        state = _dense_mrope_state_of(kwargs.get("vision_splice"))
+        if state is None:
+            return fn(*args, **kwargs)
+        from .dense_mrope import dense_mrope_scope
+
+        with dense_mrope_scope(state):
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
 def _vision_rope_scope_for(vision_splice: Any | None):
     """Context manager arming M-RoPE for forwards of a vision request.
 
@@ -3748,14 +5800,64 @@ def _vision_rope_scope_for(vision_splice: Any | None):
     read it via vision_rope_state() inside attention and self-slice by cache
     offset, so no per-forward plumbing is needed. Text requests and families
     without a table get a nullcontext — zero behavior change.
+
+    The dense Qwen3.5 / Qwen3.8 path carries its own host-side state on the
+    splice (mtplx.dense_mrope) and arms that instead; a splice holds one or
+    the other, never both.
     """
-    table = getattr(vision_splice, "mrope_table", None) if vision_splice else None
-    delta = int(getattr(vision_splice, "mrope_delta", 0) or 0) if vision_splice else 0
-    if table is None and delta == 0:
+    if vision_splice is None:
+        # Text request: nothing to read, and the vision package stays
+        # unimported.
+        return contextlib.nullcontext()
+    dense_mrope = _dense_mrope_state_of(vision_splice)
+    if dense_mrope is not None:
+        from .dense_mrope import dense_mrope_scope
+
+        return dense_mrope_scope(dense_mrope)
+    from mtplx.vision.splice import mrope_rope_state
+
+    # The one predicate the session bank key is salted on as well, so a
+    # request that ropes through this scope can never share a key with one
+    # that does not.
+    state = mrope_rope_state(vision_splice)
+    if state is None:
         return contextlib.nullcontext()
     from .attention_context import vision_rope
 
-    return vision_rope(table, delta)
+    return vision_rope(*state)
+
+
+def _decode_trunk_scope(vision_splice: Any | None):
+    """The scope of ONE trunk (target model) forward inside the decode loop.
+
+    Every trunk forward of the loop writes K rows and pooled indexer keys into
+    the live cache, and the session bank stores that cache: the main verify, a
+    copy round and its single-row repair, the repair forward, the lazy bonus
+    commit and the final pending commit. For an image request all of them must
+    rope at sequence index + M-RoPE delta, so the position scope travels with
+    the verify attention phase instead of being opened by hand at one site.
+    Builds 2.10.1 to 2.11.3 opened it around the main verify only; the other
+    forwards roped at the raw cache index, |delta| positions away from every
+    other row of the conversation (about 990 with one 1,024-token image).
+
+    Draft-head forwards and history appends never enter this scope: they run
+    through rt.draft_mtp and _append_mtp_history, outside the verify phase,
+    and keep the rope they had. They cannot break exactness (the verify
+    decides every token); their positions are a separate, measured change.
+
+    A text request gets the very context manager this loop entered before,
+    the verify phase, so nothing about its forwards changes.
+    """
+
+    if vision_splice is None:
+        return attention_phase("decode_verify")
+    return _decode_trunk_scope_with_positions(vision_splice)
+
+
+@contextmanager
+def _decode_trunk_scope_with_positions(vision_splice: Any):
+    with attention_phase("decode_verify"), _vision_rope_scope_for(vision_splice):
+        yield
 
 
 def _with_vision_rope(fn):
@@ -3776,6 +5878,7 @@ def _with_vision_rope(fn):
     return wrapper
 
 
+@_with_ple_first_gather_early
 @_with_vision_rope
 def restore_or_prefill_prompt_state(
     rt: MTPLXRuntime,
@@ -3860,6 +5963,18 @@ def restore_or_prefill_prompt_state(
     mtp_history_window_tokens = (
         _mtp_history_last_window_tokens() if mtp_history_policy == "last_window" else 0
     )
+    _dense_mrope = _dense_mrope_state_of(vision_splice)
+    if _dense_mrope is not None:
+        # The table was built for the ids the splice was built for; refuse a
+        # prompt whose image tokens moved since (a suffix appended after the
+        # last image is fine, those rows rope at index + delta).
+        _dense_mrope.check_prompt(prompt_ids, int(vision_splice.image_pad_token_id))
+        if mtp_history_policy == "cycle":
+            # Per-cycle draft caches hold rows past the prompt only, where
+            # the stock rope is exactly the image-request rope.
+            _dense_mrope_release_draft_head(_dense_mrope, None)
+        elif mtp_history_policy != "committed" or mtp_position_mode != "cache":
+            _dense_mrope_release_draft_head(_dense_mrope, _DRAFT_HEAD_WINDOWED_REASON)
     # Dashboard prefill instrumentation. We fire `phase: "started"` before
     # any restore/prefill work runs (so the UI can flip into prefill mode
     # immediately), `phase: "chunk"` from inside the chunked path after
@@ -4228,6 +6343,8 @@ def restore_or_prefill_prompt_state(
                     gdn_boundary_sink=suffix_boundary_sink,
                     vision_splice=vision_splice,
                     stable_prefix_len=stable_prefix_len,
+                    # The whole prompt: see the near-prefix caller above.
+                    plan_ids=prompt_ids,
                 )
             )
             return _emit_prefill_complete(PromptState(
@@ -4568,45 +6685,91 @@ def _sample_from_logits(
                 config.frequency_penalty,
                 penalty_overlay=penalty_overlay,
             )
-        _eval(logits)
-        return int(mx.argmax(logits, axis=-1).item()), None
+        # argmax of a NaN row is token 0 (``!``); two tiny reductions in the
+        # same eval keep the greedy lane as loud as the sampled one. -inf on
+        # its own is legitimate (grammar masks, penalties); NaN anywhere or a
+        # non-finite maximum (+inf, or every token masked) is the fault.
+        chosen = mx.argmax(logits, axis=-1)
+        bad = mx.logical_or(mx.any(mx.isnan(logits)), mx.isinf(mx.max(logits)))
+        _eval(chosen, bad)
+        if bool(bad.item()):
+            row = np.asarray(logits.astype(mx.float32))
+            raise non_finite_logits_error(row, "greedy argmax")
+        return int(chosen.item()), None
     probs = _distribution_from_mlx_logits(
         logits, config, token_counts=token_counts, penalty_overlay=penalty_overlay
     )
     return sample_from_distribution(probs, rng), probs
 
 
-def _mx_lazy_sample(row: mx.array, config: SamplerConfig, key: mx.array) -> mx.array:
-    """Device-side shaped sampling (temp -> top-k -> top-p -> categorical)
-    returning a LAZY scalar token array — the pipelined-AR lane's sampler.
+def _mx_lazy_shape(
+    row: mx.array, config: SamplerConfig
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Shape one logits row on device: ``(ids, log_weights, bad)``.
 
-    Shaping is distribution-identical to the CPU sampler; the randomness
-    stream is mx.random keyed from the request seed instead of the numpy
-    generator, so runs stay deterministic per seed but the streams differ.
-    Callers gate on temperature > 0 and 1 < top_k < vocab.
+    ``ids`` are the top-k token ids ranked by value, ``log_weights`` their
+    temperature-scaled logits with the entries outside the nucleus set to
+    -inf (a categorical over ``log_weights`` is the shaped distribution),
+    and ``bad`` a lazy scalar that is true when the row carries NaN or +inf
+    (or is all -inf).
+
+    Shaping is distribution-identical to the CPU sampler
+    (``sampling.apply_top_p_top_k``): the nucleus keeps the ranked top-k
+    entries whose cumulative mass BEFORE them, measured on the softmax over
+    the FULL vocabulary, is below top_p, and the survivors are renormalised
+    for the draw. Until 2026-09-08 the nucleus was measured on the softmax of
+    the k survivors alone; that renormalisation made the mass cross top_p
+    one to five tokens earlier than every other lane at the family's
+    1.0/0.95/20 settings (three audits: 4-5% total variation per token), so
+    Flash-Next AR was sharper than Flash-Next MTP and not a clean control.
 
     The top-k selection runs on the model dtype (half the bytes over the
-    248k vocab); only the k survivors are cast to fp32 for temperature,
-    top-p and the draw — bf16 argpartition ranks by value exactly.
+    248k vocab); only the k survivors are cast to fp32 for temperature and
+    top-p — bf16 argpartition ranks by value exactly. The full row is read
+    once more for the fp32 log-normaliser and the finiteness flag; both are
+    single reductions on a row the model just wrote.
     """
     k = int(config.top_k or 0)
+    inv_temperature = 1.0 / max(float(config.temperature), 1e-6)
     top_idx = mx.argpartition(-row, kth=k - 1)[:k]
-    logits = mx.take(row, top_idx).astype(mx.float32) * (
-        1.0 / max(float(config.temperature), 1e-6)
-    )
-    top_vals = logits
+    top_vals = mx.take(row, top_idx).astype(mx.float32) * inv_temperature
+    order = mx.argsort(-top_vals)
+    ids = mx.take(top_idx, order)
+    log_weights = mx.take(top_vals, order)
+    bad = mx.logical_or(mx.any(mx.isnan(row)), mx.isinf(mx.max(row)))
     top_p = float(config.top_p or 1.0)
     if 0.0 < top_p < 1.0:
-        order = mx.argsort(-top_vals)
-        sv = mx.take(top_vals, order)
-        sp = mx.softmax(sv)
-        # nucleus keep-rule incl. the first probability that crosses top_p
+        # nucleus keep-rule incl. the first probability that crosses top_p,
+        # on the FULL-vocabulary softmax (the reference law), not the k-slice
+        log_total = mx.logsumexp(row.astype(mx.float32) * inv_temperature)
+        sp = mx.exp(log_weights - log_total)
         keep_n = mx.maximum(mx.sum((mx.cumsum(sp) - sp) < top_p), 1)
-        sv = mx.where(mx.arange(k) < keep_n, sv, mx.array(float("-inf")))
-        local = mx.random.categorical(sv[None], key=key)[0]
-        return mx.take(top_idx, mx.take(order, local))
-    local = mx.random.categorical(top_vals[None], key=key)[0]
-    return mx.take(top_idx, local)
+        log_weights = mx.where(
+            mx.arange(k) < keep_n, log_weights, mx.array(float("-inf"))
+        )
+    return ids, log_weights, bad
+
+
+def _mx_lazy_sample(row: mx.array, config: SamplerConfig, key: mx.array) -> mx.array:
+    """Device-side shaped sampling returning a LAZY scalar token array
+    (shaping: :func:`_mx_lazy_shape`); a device-sampler primitive, no longer
+    on the decode path.
+
+    The randomness stream is mx.random keyed from the caller-supplied key
+    instead of the numpy generator, so runs stay deterministic per key but the
+    stream differs from :func:`_sample_from_logits` — which is exactly why it
+    is off the decode path. Callers gate on temperature > 0 and 1 < top_k < vocab.
+
+    A row with NaN or +inf (or all -inf) returns -1 instead of a token so a
+    caller can raise NonFiniteLogitsError when it reads the value, rather than
+    emitting token 0 (``!``); the check rides the same lazy graph, so a reader
+    keeps its one sync per token.
+    """
+    ids, log_weights, bad = _mx_lazy_shape(row, config)
+    local = mx.random.categorical(log_weights[None], key=key)[0]
+    # argpartition ids are uint32; the sentinel needs a signed token
+    token = mx.take(ids, local).astype(mx.int32)
+    return mx.where(bad, mx.array(-1, dtype=mx.int32), token)
 
 
 def _greedy_draft_token_and_top_values(
@@ -4923,7 +7086,13 @@ def _make_device_d2_draft_core(
     token_ids: mx.array,
     *,
     mtp_hidden_variant: str,
+    rope_delta: int | None = None,
 ) -> dict[str, Any]:
+    """``rope_delta``: the image delta the promoted draft cache rotates at
+    (``_dense_draft_rope_delta``), None for text and released draft heads.
+    The closure captures the cache's ``compile_state``, which carries it as
+    an implicit input."""
+
     mtp_cache = rt.make_mtp_cache()
     if not qsa_mtp_outer_device_core_supported(mtp_cache):
         raise RuntimeError(
@@ -4940,6 +7109,7 @@ def _make_device_d2_draft_core(
     )
     _eval(logits, draft_hidden)
     promoted, failures = promote_kv_cache_offsets(mtp_cache, reserve_tokens=4)
+    stamp_rope_delta(mtp_cache, rope_delta)
     _reset_tensor_offset_cache(mtp_cache)
 
     def draft2_fn(hidden_states, first_token_ids):
@@ -5096,6 +7266,7 @@ def _make_device_draft_core(
     mtp_cache: Any,
     draft_sampler: SamplerConfig,
     seed: int,
+    rope_delta: int | None = None,
 ) -> dict[str, Any]:
     # FR-Spec pruned draft head: swapped in only around the inner maker's
     # warm+trace window and restored unconditionally, so legacy draft paths
@@ -5125,6 +7296,7 @@ def _make_device_draft_core(
             mtp_cache=mtp_cache,
             draft_sampler=draft_sampler,
             seed=seed,
+            rope_delta=rope_delta,
             frspec_ids=None,
             frspec_full_vocab=0,
         )
@@ -5141,6 +7313,7 @@ def _make_device_draft_core(
             mtp_cache=mtp_cache,
             draft_sampler=draft_sampler,
             seed=seed,
+            rope_delta=rope_delta,
             frspec_ids=getattr(frspec_text, "_mtplx_frspec_ids", None),
             frspec_full_vocab=int(
                 getattr(frspec_text, "_mtplx_frspec_full_vocab", 0)
@@ -5162,6 +7335,7 @@ def _make_device_draft_core_inner(
     seed: int,
     frspec_ids: mx.array | None,
     frspec_full_vocab: int,
+    rope_delta: int | None = None,
 ) -> dict[str, Any]:
     temperature = float(draft_sampler.temperature)
     top_k = int(draft_sampler.top_k)
@@ -5174,6 +7348,9 @@ def _make_device_draft_core_inner(
         reserve_tokens=depth + 2,
         initial_reserve_tokens=_DEVICE_CORE_HISTORY_RESERVE,
     )
+    # An admitted image request: the promoted history cache rotates at
+    # offset + delta, read by the traced chain through its compile_state.
+    stamp_rope_delta(mtp_cache, rope_delta)
     # Warm one forward per level so every module and cache view is built
     # before tracing, then trim the warm entries back off the live history.
     warm_hidden, warm_tok = hidden, token_ids
@@ -5324,6 +7501,7 @@ def _prefill(
     gdn_boundary_sink: list[tuple[int, Any]] | None = None,
     stable_prefix_len: int | None = None,
 ):
+    _reject_unwired_ple_lookahead("_prefill")
     if not prompt_ids:
         raise ValueError("prompt_ids must not be empty")
 
@@ -5345,14 +7523,17 @@ def _prefill(
             and 0 < int(stable_prefix_len) < len(body)
         ):
             _cold_edges = (int(stable_prefix_len),)
-        spans = (
-            _prefill_spans_with_tail_grid(
-                len(body),
-                tail_interval=_gdn_boundary_tail_interval(),
-                mandatory_edges=_cold_edges,
-            )
+        _inforward_hooks = (
+            _resolve_inforward_boundary_hooks(rt, vision_splice=vision_splice)
             if capture_boundaries
-            else _iter_prefill_chunk_spans(len(body))
+            else None
+        )
+        spans, _inforward_edges = _prefill_boundary_plan(
+            len(body),
+            capture_boundaries=capture_boundaries,
+            inforward=_inforward_hooks is not None,
+            tail_interval=_gdn_boundary_tail_interval(),
+            mandatory_edges=_cold_edges,
         )
         for start, end in spans:
             _check_postcommit_abort(abort_check)
@@ -5365,17 +7546,33 @@ def _prefill(
                     rt.embed_tokens, chunk_array, vision_splice
                 )
             started = time.perf_counter()
-            with attention_phase("prefill"):
+            with (
+                attention_phase("prefill"),
+                _inforward_capture_scope(
+                    _inforward_hooks, _inforward_edges, start, end
+                ) as _capture_rows,
+            ):
                 prefill = _prefill_cache_only_forward(
                     rt, chunk_array, cache, input_embeddings=chunk_embeddings
                 )
-            if prefill is None:
-                _eval_cache_roots(cache)
-            else:
-                _eval(prefill)
+            _captured = _inforward_hooks[1](cache) if _capture_rows else {}
+            _eval_prefill_chunk(prefill, None, cache, _captured)
             _runtime_count(rt, "prefill_chunks")
             target_forward_time += time.perf_counter() - started
             target_forward_time += _prefill_chunk_cache_cleanup(rt)
+            # No hidden on this lane: a record carries the recurrent state
+            # alone, as the span-end capture below does.
+            _bank_inforward_boundaries(
+                rt,
+                gdn_boundary_sink,
+                cache,
+                _captured,
+                _capture_rows,
+                span_start=start,
+                position_base=0,
+                hidden_chunk=None,
+            )
+            del _captured
             if capture_boundaries:
                 _capture_gdn_boundary(gdn_boundary_sink, end, cache)
             _check_postcommit_abort(abort_check)
@@ -5472,159 +7669,205 @@ def _prefill_committed_mtp_history_streaming(
         and 0 < int(stable_prefix_len) < len(body)
     ):
         _cold_edges = (int(stable_prefix_len),)
-    mtp_streaming_spans = (
-        _prefill_spans_with_tail_grid(
-            len(body),
-            tail_interval=_gdn_boundary_tail_interval(),
-            mandatory_edges=_cold_edges,
-            chunk_size=prefill_chunk_size,
-        )
+    _inforward_hooks = (
+        _resolve_inforward_boundary_hooks(rt, vision_splice=vision_splice)
         if capture_boundaries
-        else _iter_prefill_chunk_spans(
-            len(body), chunk_size=prefill_chunk_size
-        )
+        else None
     )
-    for start, end in mtp_streaming_spans:
-        _check_postcommit_abort(abort_check)
-        chunk_array = body_array[:, start:end]
-        chunk_len = end - start
-        token_start_index = cursor + 1
-        token_end_index = token_start_index + chunk_len
-        needs_history_hidden = (
-            history_window_tokens is None or token_end_index > history_start_token_index
-        )
-        chunk_embeddings = None
-        if vision_splice is not None:
-            from mtplx.vision.splice import spliced_chunk_embeddings
-
-            chunk_embeddings = spliced_chunk_embeddings(
-                rt.embed_tokens, chunk_array, vision_splice
+    mtp_streaming_spans, _inforward_edges = _prefill_boundary_plan(
+        len(body),
+        capture_boundaries=capture_boundaries,
+        inforward=_inforward_hooks is not None,
+        tail_interval=_gdn_boundary_tail_interval(),
+        mandatory_edges=_cold_edges,
+        chunk_size=prefill_chunk_size,
+    )
+    # PLE n-gram prefill lookahead (MTPLX_QWEN4_PLE_PREFILL_LOOKAHEAD, off
+    # by default). Every prompt token is known here, so a worker thread can
+    # hash and page-warm chunk k+1's 32,768 sidecar rows while chunk k's
+    # forward owns the GPU. The census measures those gathers as 8 host-late
+    # stalls totalling 2,313 ms with the GPU fully idle.
+    with _ple_prefill_lookahead_scope(rt, body, mtp_streaming_spans):
+        _chunk_trace = _prefill_chunk_trace_enabled()
+        for start, end in mtp_streaming_spans:
+            _iter_started = time.perf_counter()
+            _check_postcommit_abort(abort_check)
+            chunk_array = body_array[:, start:end]
+            chunk_len = end - start
+            token_start_index = cursor + 1
+            token_end_index = token_start_index + chunk_len
+            needs_history_hidden = (
+                history_window_tokens is None or token_end_index > history_start_token_index
             )
-        started = time.perf_counter()
-        with attention_phase("prefill"):
-            if needs_history_hidden:
-                logits_chunk, hidden_chunk = rt.forward_ar(
-                    chunk_array,
-                    cache=cache,
-                    return_hidden=True,
-                    hidden_variant=base_hidden_variant,
-                    emit_logits=not final_logits_only,
-                    input_embeddings=chunk_embeddings,
-                )
-            else:
-                hidden_chunk = None
-                logits_chunk = _prefill_cache_only_forward(
-                    rt, chunk_array, cache, input_embeddings=chunk_embeddings
-                )
-        if hidden_chunk is None:
-            if logits_chunk is None:
-                _eval_cache_roots(cache)
-            else:
-                _eval(logits_chunk)
-        elif logits_chunk is None:
-            _eval(hidden_chunk)
-        else:
-            _eval(logits_chunk, hidden_chunk)
-        target_forward_time += time.perf_counter() - started
-        _runtime_count(rt, "prefill_chunks")
-        if chunk_callback is not None:
-            try:
-                now = time.perf_counter()
-                phase_start = chunk_started_s if chunk_started_s is not None else started
-                chunk_elapsed = max(0.0, now - started)
-                elapsed = max(0.0, now - phase_start)
-                tokens_done = int(cursor + chunk_len)
-                chunk_tok_s = (
-                    float(chunk_len) / chunk_elapsed
-                    if chunk_elapsed > 0.0
-                    else None
-                )
-                cumulative_tok_s = (
-                    float(tokens_done) / elapsed
-                    if elapsed > 0.0 and tokens_done > 0
-                    else None
-                )
-                chunk_callback(
-                    {
-                        "phase": "chunk",
-                        "tokens_done": tokens_done,
-                        "tokens_total": int(len(prompt_ids)),
-                        "cached_tokens": int(cached_tokens),
-                        "elapsed_s": elapsed,
-                        "prefill_tok_s": cumulative_tok_s,
-                        "cumulative_prefill_tok_s": cumulative_tok_s,
-                        "prefill_wall_tok_s": cumulative_tok_s,
-                        "live_prefill_tok_s": (
-                            chunk_tok_s if chunk_tok_s is not None else cumulative_tok_s
-                        ),
-                        "chunk_size": int(chunk_len),
-                        "chunk_elapsed_s": chunk_elapsed,
-                        "chunk_prefill_tok_s": chunk_tok_s,
-                    }
-                )
-            except Exception:
-                pass
-        _check_postcommit_abort(abort_check)
+            chunk_embeddings = None
+            if vision_splice is not None:
+                from mtplx.vision.splice import spliced_chunk_embeddings
 
-        if hidden_chunk is not None:
-            token_ids = prompt_ids[token_start_index : token_start_index + chunk_len]
-            slice_start = max(0, history_start_token_index - token_start_index)
-            if slice_start < len(token_ids):
-                sliced_token_ids = token_ids[slice_start:]
-                sliced_hidden = hidden_chunk[
-                    :,
-                    slice_start : slice_start + len(sliced_token_ids),
-                    :,
-                ]
-                history_embeddings = None
-                if vision_splice is not None and pad_prefix_counts is not None:
-                    window_start = token_start_index + slice_start
-                    window_end = window_start + len(sliced_token_ids)
-                    if (
-                        pad_prefix_counts[window_end]
-                        > pad_prefix_counts[window_start]
-                    ):
-                        from mtplx.vision.splice import (
-                            spliced_embeddings_for_window,
-                        )
-
-                        history_embeddings = spliced_embeddings_for_window(
-                            rt.embed_tokens,
-                            prompt_array[:, window_start:window_end],
-                            vision_splice,
-                            rows_before=pad_prefix_counts[window_start],
-                        )
-                prompt_history_time += _append_mtp_history(
-                    rt,
-                    mtp_history_cache,
-                    sliced_hidden,
-                    sliced_token_ids,
-                    phase="prefill",
-                    mtp_hidden_variant=mtp_hidden_variant,
-                    position_offset=(
-                        token_start_index + slice_start
-                        if use_absolute_positions
-                        else token_start_index + slice_start - 1
-                        if history_window_tokens is not None
+                chunk_embeddings = spliced_chunk_embeddings(
+                    rt.embed_tokens, chunk_array, vision_splice
+                )
+            started = time.perf_counter()
+            gather_before = _ple_stage_seconds()
+            with (
+                attention_phase("prefill"),
+                _inforward_capture_scope(
+                    _inforward_hooks, _inforward_edges, start, end
+                ) as _capture_rows,
+            ):
+                if needs_history_hidden:
+                    logits_chunk, hidden_chunk = rt.forward_ar(
+                        chunk_array,
+                        cache=cache,
+                        return_hidden=True,
+                        hidden_variant=base_hidden_variant,
+                        emit_logits=not final_logits_only,
+                        input_embeddings=chunk_embeddings,
+                    )
+                else:
+                    hidden_chunk = None
+                    logits_chunk = _prefill_cache_only_forward(
+                        rt, chunk_array, cache, input_embeddings=chunk_embeddings
+                    )
+            _captured = (
+                _inforward_hooks[1](cache) if _capture_rows else {}
+            )
+            _eval_prefill_chunk(logits_chunk, hidden_chunk, cache, _captured)
+            chunk_wall_s = time.perf_counter() - started
+            target_forward_time += chunk_wall_s
+            # Cheap: two perf_counter reads and one dict per chunk.  The PLE
+            # gather is a host stall INSIDE the chunk's wall, so recording both
+            # separates "the GPU was slow" from "the host was late".
+            _record_prefill_chunk(
+                start=float(start),
+                end=float(end),
+                wall_s=chunk_wall_s,
+                ple_gather_s=_ple_stage_seconds() - gather_before,
+            )
+            _runtime_count(rt, "prefill_chunks")
+            _history_before = prompt_history_time
+            if chunk_callback is not None:
+                try:
+                    now = time.perf_counter()
+                    phase_start = chunk_started_s if chunk_started_s is not None else started
+                    chunk_elapsed = max(0.0, now - started)
+                    elapsed = max(0.0, now - phase_start)
+                    tokens_done = int(cursor + chunk_len)
+                    chunk_tok_s = (
+                        float(chunk_len) / chunk_elapsed
+                        if chunk_elapsed > 0.0
                         else None
-                    ),
-                    force_eval=True,
-                    input_embeddings=history_embeddings,
-                )
-                _check_postcommit_abort(abort_check)
-        cursor += chunk_len
-        boundary_hidden = (
-            hidden_chunk[:, -1:, :] if hidden_chunk is not None else None
-        )
-        del hidden_chunk
-        del logits_chunk
-        target_forward_time += _prefill_chunk_cache_cleanup(rt)
-        if capture_boundaries:
-            _capture_gdn_boundary(
-                gdn_boundary_sink, cursor, cache, hidden_last=boundary_hidden
+                    )
+                    cumulative_tok_s = (
+                        float(tokens_done) / elapsed
+                        if elapsed > 0.0 and tokens_done > 0
+                        else None
+                    )
+                    chunk_callback(
+                        {
+                            "phase": "chunk",
+                            "tokens_done": tokens_done,
+                            "tokens_total": int(len(prompt_ids)),
+                            "cached_tokens": int(cached_tokens),
+                            "elapsed_s": elapsed,
+                            "prefill_tok_s": cumulative_tok_s,
+                            "cumulative_prefill_tok_s": cumulative_tok_s,
+                            "prefill_wall_tok_s": cumulative_tok_s,
+                            "live_prefill_tok_s": (
+                                chunk_tok_s if chunk_tok_s is not None else cumulative_tok_s
+                            ),
+                            "chunk_size": int(chunk_len),
+                            "chunk_elapsed_s": chunk_elapsed,
+                            "chunk_prefill_tok_s": chunk_tok_s,
+                        }
+                    )
+                except Exception:
+                    pass
+            _check_postcommit_abort(abort_check)
+
+            if hidden_chunk is not None:
+                token_ids = prompt_ids[token_start_index : token_start_index + chunk_len]
+                slice_start = max(0, history_start_token_index - token_start_index)
+                if slice_start < len(token_ids):
+                    sliced_token_ids = token_ids[slice_start:]
+                    sliced_hidden = hidden_chunk[
+                        :,
+                        slice_start : slice_start + len(sliced_token_ids),
+                        :,
+                    ]
+                    history_embeddings = None
+                    if vision_splice is not None and pad_prefix_counts is not None:
+                        window_start = token_start_index + slice_start
+                        window_end = window_start + len(sliced_token_ids)
+                        if (
+                            pad_prefix_counts[window_end]
+                            > pad_prefix_counts[window_start]
+                        ):
+                            from mtplx.vision.splice import (
+                                spliced_embeddings_for_window,
+                            )
+
+                            history_embeddings = spliced_embeddings_for_window(
+                                rt.embed_tokens,
+                                prompt_array[:, window_start:window_end],
+                                vision_splice,
+                                rows_before=pad_prefix_counts[window_start],
+                            )
+                    prompt_history_time += _append_mtp_history(
+                        rt,
+                        mtp_history_cache,
+                        sliced_hidden,
+                        sliced_token_ids,
+                        phase="prefill",
+                        mtp_hidden_variant=mtp_hidden_variant,
+                        position_offset=(
+                            token_start_index + slice_start
+                            if use_absolute_positions
+                            else token_start_index + slice_start - 1
+                            if history_window_tokens is not None
+                            else None
+                        ),
+                        force_eval=True,
+                        input_embeddings=history_embeddings,
+                    )
+                    _check_postcommit_abort(abort_check)
+            _inforward_started = time.perf_counter()
+            _inforward_banked = _bank_inforward_boundaries(
+                rt,
+                gdn_boundary_sink,
+                cache,
+                _captured,
+                _capture_rows,
+                span_start=start,
+                position_base=0,
+                hidden_chunk=hidden_chunk,
             )
-        del boundary_hidden
-        _check_postcommit_abort(abort_check)
+            _inforward_s = time.perf_counter() - _inforward_started
+            del _captured
+            cursor += chunk_len
+            boundary_hidden = (
+                hidden_chunk[:, -1:, :] if hidden_chunk is not None else None
+            )
+            del hidden_chunk
+            del logits_chunk
+            _cleanup_s = _prefill_chunk_cache_cleanup(rt)
+            target_forward_time += _cleanup_s
+            _boundary_started = time.perf_counter()
+            if capture_boundaries:
+                _capture_gdn_boundary(
+                    gdn_boundary_sink, cursor, cache, hidden_last=boundary_hidden
+                )
+            _boundary_s = time.perf_counter() - _boundary_started + _inforward_s
+            del boundary_hidden
+            _check_postcommit_abort(abort_check)
+            if _chunk_trace:
+                _annotate_prefill_chunk(
+                    mtp_history_s=prompt_history_time - _history_before,
+                    cleanup_s=_cleanup_s,
+                    boundary_s=_boundary_s,
+                    inforward_boundaries=float(_inforward_banked),
+                    iter_s=time.perf_counter() - _iter_started,
+                    **_prefill_chunk_memory_fields(),
+                )
 
     started = time.perf_counter()
     _check_postcommit_abort(abort_check)
@@ -5638,9 +7881,20 @@ def _prefill_committed_mtp_history_streaming(
             logits_keep=1 if final_logits_only else None,
         )
     _eval(logits, hidden)
-    target_forward_time += time.perf_counter() - started
-    target_forward_time += _maybe_repage_target_prefill_cache(rt, cache)
+    _final_token_s = time.perf_counter() - started
+    target_forward_time += _final_token_s
+    _repage_s = _maybe_repage_target_prefill_cache(rt, cache)
+    target_forward_time += _repage_s
     _check_postcommit_abort(abort_check)
+    if _prefill_chunk_trace_enabled():
+        _emit_prefill_chunk_trace(
+            "committed_mtp_history_streaming",
+            prompt_tokens=len(prompt_ids),
+            target_forward_s=target_forward_time,
+            mtp_history_s=prompt_history_time,
+            final_token_s=_final_token_s,
+            repage_s=_repage_s,
+        )
     return (
         cache,
         logits[:, -1, :],
@@ -5659,6 +7913,7 @@ def _prefill_with_hidden_sequence(
     hidden_variant: str,
     vision_splice: Any | None = None,
 ):
+    _reject_unwired_ple_lookahead("_prefill_with_hidden_sequence")
     if not prompt_ids:
         raise ValueError("prompt_ids must not be empty")
 
@@ -6043,6 +8298,7 @@ def generate_ar(
         # desync the grammar matcher; constrained output is schema-shaped.
         repetition_stop = False
     repetition_config = _repetition_stop_config(bool(repetition_stop))
+    repetition_long_cycle = _long_cycle_stop(repetition_config)
     repetition_result: RepetitionStopResult | None = None
     _loop_guard_config = loop_guard_config_from_env(
         bool(loop_guard), tokenizer=getattr(rt, "tokenizer", None)
@@ -6201,147 +8457,7 @@ def generate_ar(
         in ("1", "true", "yes", "on")
     ) or bool(os.environ.get("MTPLX_EVAL_AUDIT"))
 
-    # ---- Pipelined AR lane (MTPLX_AR_PIPELINE) ---------------------------
-    # Software pipeline over the decode stream: sampling runs INSIDE the lazy
-    # graph (_mx_lazy_sample), so step k+1's graph is built on step k's
-    # still-lazy sampled token while the GPU executes step k. A token's KV is
-    # only ever written by the forward that consumes it, and only committed
-    # tokens are consumed — the cache never runs ahead of the committed
-    # sequence, so there is no rollback machinery. Guards observe at commit
-    # (lag <= 1 step); when one arms, the lane drains into the classic loop
-    # with its exact entry invariant (logits row + cache both at the last
-    # committed token). Engages only on models that publish
-    # set_ar_pipeline_mode (qwen4_exp: staging off + in-graph mmap gathers).
-    _lane_committed = 0
-    _lane_finished = False
-    _lane_cache_has_final = False
-    _lane_final_row: mx.array | None = None
-    _lane_mode_off = None
-    if (
-        _env_truthy("MTPLX_AR_PIPELINE")
-        and constraint is None
-        and float(sampler.temperature) > 0
-        and 1 < int(sampler.top_k or 0) < 4096
-        and not sampler.presence_penalty
-        and not sampler.frequency_penalty
-        and max_tokens > 2
-    ):
-        _set_lane_mode = getattr(rt.model, "set_ar_pipeline_mode", None)
-        if callable(_set_lane_mode) and _set_lane_mode(True):
-            _lane_mode_off = _set_lane_mode
-    if _lane_mode_off is not None:
-        try:
-            events.append({"ar_pipeline": True})
-            _lane_key = mx.random.key(int(seed) & 0x7FFFFFFF)
-            token, _ = _sample_from_logits(logits[0], sampler, rng)
-            tokens.append(token)
-            emit_token(token)
-            events.append({"step": 0, "token": token})
-            _lane_committed = 1
-            if _is_stop(token, stop_token_ids) or max_tokens <= 1:
-                _lane_finished = True
-            else:
-
-                def _lane_step(tok_lazy: mx.array) -> tuple[mx.array, mx.array]:
-                    nonlocal _lane_key
-                    _lane_key, sub = mx.random.split(_lane_key)
-                    with attention_phase("ar_decode"):
-                        out = rt.forward_ar(tok_lazy.reshape(1, 1), cache=cache)
-                    row = out[:, -1, :]
-                    nxt = _mx_lazy_sample(row[0], sampler, sub)
-                    return row, nxt
-
-                started = time.perf_counter()
-                row_lazy, tok_lazy = _lane_step(mx.array([token]))
-                mx.async_eval(tok_lazy)
-                target_forward_graph_time += time.perf_counter() - started
-                while True:
-                    built = time.perf_counter()
-                    row_next, tok_next = _lane_step(tok_lazy)
-                    mx.async_eval(tok_next)
-                    build_elapsed = time.perf_counter() - built
-                    target_forward_graph_time += build_elapsed
-                    waited = time.perf_counter()
-                    v = int(tok_lazy.item())
-                    wait_elapsed = time.perf_counter() - waited
-                    target_eval_time += wait_elapsed
-                    target_decode_time += build_elapsed + wait_elapsed
-                    verify_calls += 1
-                    step = _lane_committed
-                    tokens.append(v)
-                    emit_token(v)
-                    events.append({"step": step, "token": v})
-                    _lane_committed += 1
-                    armed = False
-                    if _loop_guard is not None:
-                        _lg = _loop_guard.observe(tokens)
-                        if _lg is not None:
-                            events.append(
-                                {
-                                    "step": step,
-                                    "loop_guard": {
-                                        "transition": _lg,
-                                        "completion_tokens": len(tokens),
-                                        **_loop_guard.summary(),
-                                    },
-                                }
-                            )
-                        armed = armed or _loop_guard.armed
-                    if _thinking_guard is not None:
-                        _tg = _thinking_guard.observe(tokens)
-                        if _tg is not None:
-                            events.append(
-                                {
-                                    "step": step,
-                                    "thinking_guard": {
-                                        "transition": _tg,
-                                        "completion_tokens": len(tokens),
-                                        **_thinking_guard.summary(),
-                                    },
-                                }
-                            )
-                        armed = armed or _thinking_guard.steering_active
-                    repetition_result = _trim_repeated_suffix(tokens, repetition_config)
-                    if repetition_result is not None:
-                        events.append(
-                            {
-                                "step": step,
-                                "repetition_stop": {
-                                    "reason": "exact_repeated_token_suffix",
-                                    "block_tokens": repetition_result.block_tokens,
-                                    "repeats": repetition_result.repeats,
-                                    "trimmed_tokens": repetition_result.repeated_tokens,
-                                },
-                            }
-                        )
-                        _lane_finished = True
-                        break
-                    if _is_stop(v, stop_token_ids) or len(tokens) >= max_tokens:
-                        _lane_finished = True
-                        _lane_cache_has_final = True
-                        _lane_final_row = row_next
-                        break
-                    if armed:
-                        # Steering must shape the NEXT sample: hand the
-                        # classic loop its invariant (this row's graph also
-                        # committed v's cache entries).
-                        _eval(row_next)
-                        logits = row_next
-                        break
-                    row_lazy, tok_lazy = row_next, tok_next
-            if _env_truthy("MTPLX_AR_PIPELINE_DEBUG") and _lane_committed > 1:
-                n = max(_lane_committed - 1, 1)
-                print(
-                    f"[ar-lane] steps={n} build={target_forward_graph_time / n * 1e3:.2f}ms "
-                    f"wait={target_eval_time / n * 1e3:.2f}ms "
-                    f"per-step={target_decode_time / n * 1e3:.2f}ms",
-                    flush=True,
-                )
-        finally:
-            _lane_mode_off(False)
-
-    _classic_start = max_tokens if _lane_finished else _lane_committed
-    for step in range(_classic_start, max_tokens):
+    for step in range(max_tokens):
         if _loop_guard is not None:
             _guard_transition = _loop_guard.observe(tokens)
             if _guard_transition is not None:
@@ -6378,7 +8494,7 @@ def generate_ar(
             # both the greedy and sampled branches draw from the constrained
             # distribution (-inf survives temperature/top-p/penalties).
             logits_row = constraint.mask_logits_row(logits_row)
-        if not _ar_sync_eval and step > _classic_start:
+        if not _ar_sync_eval and step > 0:
             sync_started = time.perf_counter()
             _eval(logits_row)
             sync_elapsed = time.perf_counter() - sync_started
@@ -6403,13 +8519,15 @@ def generate_ar(
                 # a stop token; end here rather than decode past the document.
                 events.append({"step": step, "constraint_stop": True})
                 break
-        repetition_result = _trim_repeated_suffix(tokens, repetition_config)
+        repetition_result = _trim_repeated_suffix(
+            tokens, repetition_config, repetition_long_cycle
+        )
         if repetition_result is not None:
             events.append(
                 {
                     "step": step,
                     "repetition_stop": {
-                        "reason": "exact_repeated_token_suffix",
+                        "reason": repetition_result.reason,
                         "block_tokens": repetition_result.block_tokens,
                         "repeats": repetition_result.repeats,
                         "trimmed_tokens": repetition_result.repeated_tokens,
@@ -6483,22 +8601,17 @@ def generate_ar(
     if capture_final_state and tokens and repetition_result is None:
         # The classic loop samples its final token and breaks before
         # forwarding it, so the cache is one token short of the committed
-        # sequence and must be extended here. The pipelined lane already
-        # consumed the final token (its logits row rode the in-flight graph),
-        # so extending again would double-append its KV — reuse the row.
+        # sequence and must be extended here.
         try:
-            if _lane_cache_has_final and _lane_final_row is not None:
-                tail_logits = _lane_final_row[:, None, :]
-            else:
-                with attention_phase("ar_decode"):
-                    tail_result = rt.forward_ar(
-                        mx.array([[int(tokens[-1])]]),
-                        cache=cache,
-                        return_hidden=False,
-                    )
-                tail_logits = (
-                    tail_result[0] if isinstance(tail_result, tuple) else tail_result
+            with attention_phase("ar_decode"):
+                tail_result = rt.forward_ar(
+                    mx.array([[int(tokens[-1])]]),
+                    cache=cache,
+                    return_hidden=False,
                 )
+            tail_logits = (
+                tail_result[0] if isinstance(tail_result, tuple) else tail_result
+            )
             _eval(tail_logits)
             final_state = GenerationFinalState(
                 final_trunk_cache=cache,
@@ -6584,7 +8697,7 @@ def generate_ar(
         peak_memory_bytes=mx.get_peak_memory(),
         repetition_stop_triggered=repetition_result is not None,
         repetition_stop_reason=(
-            "exact_repeated_token_suffix" if repetition_result is not None else None
+            repetition_result.reason if repetition_result is not None else None
         ),
         repetition_stop_block_tokens=(
             0 if repetition_result is None else repetition_result.block_tokens
@@ -6679,6 +8792,7 @@ def generate_mtp1(
     tokens: list[int] = []
     events: list[dict] = []
     repetition_config = _repetition_stop_config(bool(repetition_stop))
+    repetition_long_cycle = _long_cycle_stop(repetition_config)
     repetition_result: RepetitionStopResult | None = None
     accepted = rejected = drafted = 0
     skipped = 0
@@ -6695,13 +8809,15 @@ def generate_mtp1(
 
     step = 0
     while len(tokens) < max_tokens:
-        repetition_result = _trim_repeated_suffix(tokens, repetition_config)
+        repetition_result = _trim_repeated_suffix(
+            tokens, repetition_config, repetition_long_cycle
+        )
         if repetition_result is not None:
             events.append(
                 {
                     "step": step,
                     "repetition_stop": {
-                        "reason": "exact_repeated_token_suffix",
+                        "reason": repetition_result.reason,
                         "block_tokens": repetition_result.block_tokens,
                         "repeats": repetition_result.repeats,
                         "trimmed_tokens": repetition_result.repeated_tokens,
@@ -7273,7 +9389,7 @@ def generate_mtp1(
         deferred_correction_repairs=deferred_correction_repairs,
         repetition_stop_triggered=repetition_result is not None,
         repetition_stop_reason=(
-            "exact_repeated_token_suffix" if repetition_result is not None else None
+            repetition_result.reason if repetition_result is not None else None
         ),
         repetition_stop_block_tokens=(
             0 if repetition_result is None else repetition_result.block_tokens
@@ -7309,6 +9425,7 @@ def generate_mtp1(
     )
 
 
+@_with_dense_mrope_request
 def generate_mtpk(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
@@ -7470,6 +9587,32 @@ def generate_mtpk(
         )
     if draft_core not in {"stock", "device-d2", "device"}:
         raise ValueError("draft_core must be 'stock', 'device-d2', or 'device'")
+    # Dense-path image request roped at grid positions (None otherwise, text
+    # requests included). The compiled routes carry the request's rotary
+    # delta on their tensor-offset caches (mtplx.rope_origin), so an admitted
+    # request takes the compiled verifier, the graph bank and its compiled
+    # draft core like a text request; the admission names what stays eager.
+    _dense_mrope_request = _dense_mrope_state_of(vision_splice)
+    _dense_text_model = getattr(rt.model, "language_model", rt.model)
+    _dense_model_type = getattr(
+        getattr(_dense_text_model, "args", None), "model_type", None
+    )
+    _dense_admission = _dense_vision_compiled_verify_admission(
+        vision_splice,
+        prompt_ids,
+        dense_model=(
+            _dense_mrope_request is not None
+            or _dense_mrope_capable(rt)
+            or _dense_model_type in {"qwen3_5", "qwen3_5_text", "prism_hadamard_qwen35"}
+        ),
+    )
+    _dense_admitted = _dense_admission["refusal"] is None
+    if _dense_mrope_request is not None and draft_core != "stock" and not _dense_admitted:
+        # A refused request keeps today's routes end to end: the eager
+        # verifier and the stock draft core, each counted once.
+        _note_demotion("vision_request_eager_draft", _DENSE_MROPE_DRAFT_REFUSED_REASON)
+        _dense_admission["draft_core_forced"] = _DENSE_MROPE_DRAFT_REFUSED_REASON
+        draft_core = "stock"
     if not 0.0 <= adapter_ensemble_epsilon <= 1.0:
         raise ValueError("adapter_ensemble_epsilon must be in [0, 1]")
     if adapter_ensemble_min_depth < 1:
@@ -7644,8 +9787,30 @@ def generate_mtpk(
             need_distribution=need_distribution,
         )
 
+    def _relaxed_tie_cycle_draft_reader(
+        draft_logits: mx.array,
+        *,
+        depth_index: int,
+        need_distribution: bool,
+        decision_margins: list[float],
+    ) -> tuple[int, np.ndarray | SparseDistribution | None, bool]:
+        del depth_index, need_distribution, decision_margins
+        distribution = sparse_distribution_from_mlx_logits_relaxed_ties(
+            draft_logits[:, -1, :][0], draft_sampler
+        )
+        if distribution is None:
+            raise RuntimeError("relaxed-tie draft sampler requires temperature and top-k")
+        return sample_from_distribution(distribution, rng), distribution, False
+
     if adaptive_width_policy is None:
-        adaptive_width_cycle_readers = (_default_cycle_draft_reader,) * max(
+        installed_cycle_draft_reader = (
+            _relaxed_tie_cycle_draft_reader
+            if bool(getattr(rt, "qwen4_relaxed_draft_ties", False))
+            and draft_sampler.temperature > 0
+            and int(draft_sampler.top_k) > 0
+            else _default_cycle_draft_reader
+        )
+        adaptive_width_cycle_readers = (installed_cycle_draft_reader,) * max(
             1, int(speculative_depth)
         )
         capture_forward_routes = (rt.forward_ar_capture,) * max(
@@ -7756,11 +9921,13 @@ def generate_mtpk(
         _default_stop_tokens(rt.tokenizer) if stop_token_ids is None else stop_token_ids
     )
     started_all = time.perf_counter()
+    _demotions_at_start = _demotion_mark()
     if constraint is not None:
         # The repetition trimmer retracts committed tokens, which would
         # desync the grammar matcher; constrained output is schema-shaped.
         repetition_stop = False
     repetition_config = _repetition_stop_config(bool(repetition_stop))
+    repetition_long_cycle = _long_cycle_stop(repetition_config)
     repetition_result: RepetitionStopResult | None = None
     # F35 → 2.8.3: armed uncapped streams hold a detector-window tail off
     # the wire ONLY while the tail shows a forming loop (candidate-gated —
@@ -7933,9 +10100,28 @@ def generate_mtpk(
     # only. draft_time_s stays a decode-window bucket, matching generate_mtp1
     # and generate_mtpa (folding it here made exported stats show
     # draft > decode-elapsed at long context).
+    # An image request that ropes through the request context (Flash-Next with
+    # a position table) may only meet a fixed-capacity QSA bank through the
+    # fixed-M4 admission below, which hands the bank the request's rotary
+    # delta. Every other compiled route promotes caches without one, so it
+    # stays off such a request.
+    _context_roped_request = _vision_rope_request(vision_splice)
+    # A dense-path image request that the admission above let through: every
+    # cache the compiled routes promote owns this delta (rope_origin), so
+    # the graph bank and the verify bank below rotate where the eager route
+    # does. None for text requests, sequential image requests and refusals.
+    _dense_rope_delta = (
+        int(_dense_mrope_request.delta)
+        if _dense_mrope_request is not None and _dense_admitted
+        else None
+    )
     graphbank = (
-        SpecDecodeGraphBank(rt, capture_backend=verify_core_backend)
+        SpecDecodeGraphBank(
+            rt, capture_backend=verify_core_backend, rope_delta=_dense_rope_delta
+        )
         if verify_strategy in {"graphbank", "graphbank_capture_commit"}
+        and _dense_admitted
+        and not _context_roped_request
         else None
     )
     _compiled_verify_mode = compiled_verify_mode()
@@ -7944,9 +10130,45 @@ def generate_mtpk(
         and not exact_a3b_target_prefix
         and _env_truthy("MTPLX_COMPILED_TARGET_PREFIX")
     )
+    # Image requests take the compiled verifier too: the verify bank owns the
+    # request's rotary delta next to its logical offset, so no position table
+    # is ever sliced by a tensor offset (_qwen4_vision_compiled_verify_admission
+    # names the shapes and settings that stay eager).
+    fixed_m4_admission: dict[str, object] = {}
+    qwen4_fixed_m4_compiled_verify, fixed_m4_rope_delta = _qwen4_fixed_m4_admission(
+        rt,
+        vision_splice=vision_splice,
+        prompt_ids=prompt_ids,
+        bank_key_ids=bank_commit_ids,
+        verify_strategy=verify_strategy,
+        compiled_mode=_compiled_verify_mode,
+        max_tokens=max_tokens,
+        cached_tokens=int(getattr(prompt_state, "cached_tokens", 0) or 0),
+        speculative_depth=speculative_depth,
+        session_bank=session_bank,
+        receipt=fixed_m4_admission,
+    )
+    _generic_compiled_verify = (
+        verify_strategy in {"capture_commit", "graphbank_capture_commit"}
+        or generic_compiled_target_prefix
+    )
+    if (
+        _context_roped_request
+        and (
+            (_compiled_verify_mode != "off" and _generic_compiled_verify)
+            or verify_strategy in {"graphbank", "graphbank_capture_commit"}
+        )
+        # One count per request: a refusal of the fixed-M4 lane above has
+        # already said why this image request verifies eager.
+        and fixed_m4_admission.get("reason") not in _VISION_COMPILED_VERIFY_REFUSALS
+    ):
+        _note_demotion(
+            "vision_request_eager_verify", _VISION_GENERIC_BANK_EAGER_REASON
+        )
     compiled_verify_bank = (
         CompiledVerifyBank(
             rt,
+            max_verify_len=4 if qwen4_fixed_m4_compiled_verify else None,
             request_max_tokens=max_tokens,
             capture_backend=verify_core_backend,
             parity=_compiled_verify_mode == "parity",
@@ -7956,14 +10178,85 @@ def generate_mtpk(
             # promotion copy lands after TTFT, not inside it. cached_tokens
             # is 0 on cold prompts and the restored prefix length on hits.
             restored_tokens=int(getattr(prompt_state, "cached_tokens", 0) or 0),
+            # A dense-path image request: every container this bank promotes
+            # rotates at offset + delta and its verify step takes the delta
+            # as a graph input (the text trace is untouched).
+            rope_delta=_dense_rope_delta,
         )
         if _compiled_verify_mode != "off"
+        and _dense_admitted
         and (
-            verify_strategy in {"capture_commit", "graphbank_capture_commit"}
-            or generic_compiled_target_prefix
+            (_generic_compiled_verify and not _context_roped_request)
+            or qwen4_fixed_m4_compiled_verify
         )
         else None
     )
+    _dense_would_compile = (
+        _compiled_verify_mode != "off" and _generic_compiled_verify
+    ) or verify_strategy in {"graphbank", "graphbank_capture_commit"}
+    if _dense_mrope_request is not None:
+        if not _dense_admitted and _dense_would_compile:
+            # This request would have had the compiled verifier or the graph
+            # bank; it runs the eager verifier instead, and says why.
+            _note_demotion(
+                "vision_request_eager_verify",
+                _VISION_COMPILED_VERIFY_REFUSALS[_dense_admission["refusal"]],
+            )
+        if mtp_history_cache is not None and _mtp_cache_offset(
+            mtp_history_cache
+        ) != len(prompt_ids) - 1:
+            # Fully cached prompt: no suffix prefill ran to look at the
+            # restored draft history, so look here (same rule as there).
+            _dense_mrope_release_draft_head(
+                _dense_mrope_request, _DRAFT_HEAD_MISALIGNED_RESTORE_REASON
+            )
+    # The request record's answer for the dense family (the sibling of
+    # fixed_m4_admission): which route ran, and why. Filled on every request
+    # of a model that carries the dense image position adapter, so a text
+    # control and an image request read the same way.
+    compiled_verify_admission: dict[str, object] = {}
+    if _dense_mrope_capable(rt) or _dense_mrope_request is not None:
+        _dense_engaged = compiled_verify_bank is not None or graphbank is not None
+        compiled_verify_admission = {
+            "family": "dense",
+            "positions": _dense_admission["positions"],
+            "rope_delta": _dense_admission["rope_delta"],
+            "images": _dense_admission["images"],
+            "engaged": _dense_engaged,
+            "reason": (
+                _dense_admission["refusal"]
+                if not _dense_admitted
+                else "admitted"
+                if _dense_engaged
+                else "compiled_verify_off"
+                if _compiled_verify_mode == "off"
+                else "verify_strategy_not_compiled"
+            ),
+            **(
+                {"draft_core_forced": _dense_admission["draft_core_forced"]}
+                if "draft_core_forced" in _dense_admission
+                else {}
+            ),
+        }
+    if (
+        qwen4_fixed_m4_compiled_verify
+        and compiled_verify_bank is not None
+        # "on", or "parity2": the installed lane's own instrument, every round
+        # compared against the eager verifier. The admission refuses "parity".
+        and _compiled_verify_mode in ("on", "parity2")
+    ):
+        # The install keys and binds the shared verify trace, so it must see
+        # the same kernel route the request's verify forwards run under
+        # (main keys shared traces on exact_verify for the greedy contract).
+        with exact_verify(sampler.temperature <= 0):
+            compiled_verify_bank.install_fixed_m4(
+                cache,
+                prompt_ids=prompt_ids,
+                hidden_variant=base_hidden_variant,
+                # An image request: every QSA bank rotates at offset + delta
+                # and the replayed trace takes the delta as an input.
+                rope_delta=fixed_m4_rope_delta,
+            )
     a3b_target_prefix_route = None
     a3b_rebase_state = None  # stashed post-primary state for a deferred correction
     snapshot_time = accept_time = rollback_time = repair_time = 0.0
@@ -8396,6 +10689,136 @@ def generate_mtpk(
     )
     trace_current_mtp_cache = mtp_history_cache
 
+    # Route Tape (Pulse X-Ray): per-round route census. Off means off — when
+    # disabled the only cost is one `route_tape.enabled` check per round. The
+    # tape never routes through append_event (MTPLX_DROP_EVENTS nulls it in
+    # production); it emits through the Flight Recorder sink or its own JSONL.
+    # Never use trace_label here: the server's decode trace intentionally puts
+    # a prompt preview in that label. The server sink replaces this standalone
+    # opaque id with its canonical request id.
+    route_tape = RouteTape(session_id or f"rt-{os.urandom(8).hex()}")
+
+    def _route_counter_snapshot() -> dict[str, dict[str, int]]:
+        from .attention_split import gqa_packed_route_bail_counts
+        from .gdn_capture import gdn_capture_fallback_counts
+        from .nax_verify import nax_qlinear_fallback_counts
+
+        snap: dict[str, dict[str, int]] = {
+            "nax_qlinear_fallback": dict(nax_qlinear_fallback_counts),
+            "gdn_capture_fallback": dict(gdn_capture_fallback_counts),
+            "gqa_packed_bail": dict(gqa_packed_route_bail_counts),
+        }
+        if compiled_verify_bank is not None:
+            fb = getattr(compiled_verify_bank, "stats", {}).get("fallback_reasons")
+            if fb:
+                snap["bank_fallback"] = {str(k): int(v) for k, v in fb.items()}
+        return snap
+
+    _rt_prev = _route_counter_snapshot() if route_tape.enabled else {}
+
+    if route_tape.enabled:
+        from .kernel_selfcheck import _DISABLED_LANES
+        from .nax_verify import nax_available
+
+        route_tape.emit(
+            "route",
+            "header",
+            None,
+            {
+                "verify_strategy": verify_strategy,
+                "verify_core": verify_core_backend,
+                "draft_core": draft_core,
+                "speculative_depth": int(speculative_depth),
+                "sampler": {
+                    "temperature": float(sampler.temperature),
+                    "top_p": float(sampler.top_p),
+                    "top_k": int(sampler.top_k),
+                },
+                "mtp_history_policy": mtp_history_policy,
+                "mtp_cache_policy": mtp_cache_policy,
+                "cache_class": type(cache[0]).__name__ if cache else None,
+                "cache_physical_capacity": getattr(cache[0], "capacity", None) if cache else None,
+                "disabled_lanes": sorted(_DISABLED_LANES),
+                "nax_available": bool(nax_available()),
+                "prompt_tokens": len(prompt_ids),
+                "max_tokens": int(max_tokens),
+            },
+        )
+
+    def emit_round(event: dict) -> None:
+        """Single choke point for round completion: preserves append_event
+        semantics and emits the per-round route census when the tape is on."""
+        append_event(event)
+        if not route_tape.enabled:
+            return
+        nonlocal _rt_prev
+        cur = _route_counter_snapshot()
+        deltas = {
+            name: counter_deltas(_rt_prev.get(name, {}), counts)
+            for name, counts in cur.items()
+        }
+        _rt_prev = cur
+        verify_route = event.get("verify_route") or "not_run"
+        verify_width = event.get("verify_width")
+        if verify_width is None:
+            verify_width = 0 if verify_route == "not_run" else None
+        commit_route = event.get("commit_route")
+        if not commit_route:
+            context_copy = event.get("context_copy") or {}
+            if event.get("capture_repair") == "route_pending_correction":
+                commit_route = "rebase_deferred"
+            elif context_copy.get("disabled"):
+                commit_route = "rollback_reforward"
+            elif context_copy.get("block"):
+                commit_route = (
+                    "capture_commit"
+                    if int(context_copy.get("accepted") or 0)
+                    < int(context_copy["block"])
+                    else "verify_retained"
+                )
+            elif verify_route != "not_run":
+                commit_route = "verify_retained"
+            else:
+                commit_route = "primary_only"
+        required = {
+            "verify_route": verify_route,
+            "commit_route": commit_route,
+            "verify_width": verify_width,
+            "accepted_depths": event.get("accepted_depths"),
+        }
+        incomplete = [key for key, value in required.items() if value is None]
+        route_tape.emit(
+            "route",
+            "round",
+            event.get("step"),
+            {
+                "depth": event.get("depth"),
+                "requested_depth": event.get("requested_depth"),
+                "verify_strategy": event.get("verify_strategy"),
+                "verify_core": event.get("verify_core"),
+                "draft_core": event.get("draft_core"),
+                **required,
+                "complete": not incomplete,
+                "incomplete_fields": incomplete,
+                "rejected_at_depth": event.get("rejected_at_depth"),
+                "bonus_token": event.get("bonus_token") is not None,
+                "drafts": [
+                    {
+                        "depth": d.get("depth"),
+                        "accepted": d.get("accepted"),
+                        "accept_probability": d.get("accept_probability"),
+                    }
+                    for d in (event.get("drafts") or [])
+                    if isinstance(d, dict)
+                ],
+                "timing_s": event.get("timing_s"),
+                "cache_offset": _cache_offset(cache),
+                "fallback_deltas": {k: v for k, v in deltas.items() if v},
+                "draft_core_error": event.get("draft_core_error"),
+                "context_copy": event.get("context_copy"),
+            },
+        )
+
     def own_live_output_leaf(value: Any) -> Any:
         nonlocal live_output_detach_events
         nonlocal live_output_detach_time_s
@@ -8798,6 +11221,12 @@ def generate_mtpk(
             "trace_accounting_time_s": trace_accounting_time_s,
             "accepted_by_depth": list(accepted_by_depth),
             "drafted_by_depth": list(drafted_by_depth),
+            "verify_route": (compiled_verify_bank.last_dispatch_route()
+                             if compiled_verify_bank is not None else None),
+            "compiled_verify_calls": (compiled_verify_bank.stats["compiled_calls"]
+                                      if compiled_verify_bank is not None else None),
+            "eager_verify_calls": (compiled_verify_bank.stats["fallback_calls"]
+                                   if compiled_verify_bank is not None else None),
             "accept_probability_sum_by_depth": list(accept_probability_sum_by_depth),
             "draft_confidence_width_stops": draft_confidence_width_stops,
             "draft_confidence_sum_by_depth": list(draft_confidence_sum_by_depth),
@@ -8894,7 +11323,8 @@ def generate_mtpk(
     # ---- context-copy (prompt-lookup) drafting: always on (kill switch
     # MTPLX_CONTEXT_COPY=0); any temperature, no repetition penalties, on
     # capture-commit verify strategies ----
-    from .context_copy import (NgramIndex, block_for_ext,
+    from .context_copy import (JoinedTokens as _JoinedTokens, NgramIndex,
+                               block_for_ext,
                                context_copy_batched_enabled,
                                context_copy_block_k,
                                context_copy_enabled, context_copy_min_ext,
@@ -8942,6 +11372,7 @@ def generate_mtpk(
     )
     ccopy_rounds = ccopy_drafted = ccopy_accepted = 0
     ccopy_probes = ccopy_blocks_accepted = ccopy_suspensions = 0
+    ccopy_capacity_growths = 0
     ccopy_disabled_reason = None
     if _ccopy_whole_moe_conflict:
         # Requested the target_prefix takeover but whole-MoE is installed:
@@ -9008,6 +11439,11 @@ def generate_mtpk(
     # (first observe gets the span since loop entry, later ones the span
     # since the previous observe) — real cycle cost, not inter-request gaps.
     _policy_cycle_started = time.perf_counter()
+    if isinstance(adaptive_policy, ExpectedValueDepthPolicy):
+        adaptive_policy.accepts_verify_cost = bool(
+            qwen4_fixed_m4_compiled_verify
+            and os.environ.get("MTPLX_ADAPTIVE_VERIFY_COST_FEEDBACK", "1") != "0"
+        )
     # Long-context fence for the trio defaults (#313/#315c1/#318): decided
     # once per request from the prompt length, stamped through to graphbank
     # for the paged-offsets read. Receipts in _trio_max_context's docstring.
@@ -9094,6 +11530,110 @@ def generate_mtpk(
     # and compiled indexer pass their deferred model/MTP gates.  The disabled
     # branch below preserves v2.10's original rollback/reappend behavior.
     qsa_mtp_precompute_active = qsa_mtp_precompute_enabled()
+    # MTPLX_QWEN4_DRAFT_K20_PRESCATTER (default off).  Claimed ONCE, here,
+    # after every request-invariant term it refuses on already exists.  The
+    # claim arms the FR-Spec head's compact-row stash and raises on an
+    # unsupported request instead of falling back, so the receipt below can
+    # only say `installed: True` when the pre-scatter selector really ran.
+    # The PR's float32 d3 and device K20 routes do not exist on this tree, so
+    # both are passed as absent.
+    _draft_k20_prescatter_plan = None
+    _draft_k20_prescatter_receipt: dict[str, object] = {"installed": False}
+    if _QWEN4_DRAFT_K20_PRESCATTER:
+        _draft_k20_prescatter_plan = _qwen4_draft_k20_prescatter_claim(
+            rt,
+            greedy_chain_enabled=_greedy_chain_eligible,
+            receipt=_draft_k20_prescatter_receipt,
+            draft_sampler=draft_sampler,
+            draft_core=draft_core,
+            target_prefix_verify=target_prefix_verify,
+            a3b_target_prefix_route=a3b_target_prefix_route,
+            pr391_route=None,
+            device_k20_route=None,
+            frspec_legacy_ids=_frspec_legacy_ids,
+            adaptive_width_policy=adaptive_width_policy,
+            combine_greedy_draft_read=combine_greedy_draft_read,
+            draft_confidence_needed=_draft_conf_needed,
+            draft_margin_threshold=draft_margin_threshold,
+            wants_policy_metrics=wants_policy_metrics,
+            correction_cache_enabled=bool(
+                online_correction_cache or prompt_correction_cache
+            ),
+            adapter_ensemble_q=adapter_ensemble_q,
+            mtp_topk_reranker=mtp_topk_reranker,
+            # The relaxed-tie draft reader is installed only for sampled
+            # drafts (temperature > 0 with a top-k), the same condition the
+            # cycle reader above resolves on; a greedy request under the
+            # family default MTPLX_QWEN4_RELAXED_DRAFT_TIES=1 runs the stock
+            # reader and can take the compact-row read (2026-09-03 W1: the
+            # runtime flag alone declined every request).
+            relaxed_draft_ties=bool(
+                getattr(rt, "qwen4_relaxed_draft_ties", False)
+            )
+            and draft_sampler.temperature > 0
+            and int(draft_sampler.top_k) > 0,
+            penalties_active=_penalties_active,
+            steer_active=bool(loop_guard) or thinking_guard is not None,
+        )
+        if _draft_k20_prescatter_plan is not None:
+            _draft_k20_prescatter_receipt = _draft_k20_prescatter_plan.to_dict()
+    # MTPLX_QWEN4_SAMPLED_DRAFT_CHAIN: claimed once, from request-invariant
+    # terms only (the per-cycle ones stay in the loop, as for the greedy
+    # chain).  Every blocker is a routing answer: the stock serial reader runs.
+    _sampled_chain_plan = None
+    _sampled_chain_status = "off"
+    _sampled_chain_rounds = 0
+    _sampled_chain_cuts = 0
+    if _qwen4_sampled_chain.is_enabled():
+        _sampled_chain_blockers = [
+            _sc_name
+            for _sc_name, _sc_blocked in (
+                ("greedy_draft", draft_sampler.temperature <= 0),
+                ("greedy_target", sampler.temperature <= 0),
+                ("draft_core", draft_core != "stock"),
+                (
+                    "target_prefix_verify",
+                    a3b_target_prefix_route is not None or target_prefix_verify,
+                ),
+                ("constraint", constraint is not None),
+                ("draft_margin_threshold", draft_margin_threshold is not None),
+                (
+                    "draft_confidence",
+                    _draft_conf_needed or _draft_conf_width_threshold is not None,
+                ),
+                ("policy_metrics", bool(wants_policy_metrics)),
+                ("adaptive_policy", adaptive_policy is not None),
+                ("adaptive_width_policy", adaptive_width_policy is not None),
+                ("adaptive_dtemp", _dtemp_controller is not None),
+                ("mtp_corrector", mtp_corrector is not None),
+                ("topk_reranker", mtp_topk_reranker is not None),
+                ("adapter_ensemble", bool(adapter_ensemble_q)),
+                ("online_hidden", bool(online_hidden_enabled)),
+                (
+                    "correction_cache",
+                    bool(online_correction_cache or prompt_correction_cache),
+                ),
+                ("penalties", bool(_penalties_active)),
+                ("frspec_legacy", _frspec_legacy_ids is not None),
+                ("combined_greedy_read", bool(combine_greedy_draft_read)),
+                ("mtp_cache_policy", mtp_cache_policy != "persistent"),
+                (
+                    "mtp_history_policy",
+                    not _mtp_history_uses_committed_cache(mtp_history_policy),
+                ),
+                ("k20_prescatter_owns_read", _draft_k20_prescatter_plan is not None),
+            )
+            if _sc_blocked
+        ]
+        if _sampled_chain_blockers:
+            _sampled_chain_status = "declined:" + ",".join(_sampled_chain_blockers)
+        else:
+            _sampled_chain_plan, _sc_reason = _qwen4_sampled_chain.claim(
+                rt, draft_sampler
+            )
+            _sampled_chain_status = (
+                "installed" if _sampled_chain_plan is not None else f"declined:{_sc_reason}"
+            )
     while len(tokens) < max_tokens:
         if first_round_snapshot is None and step >= 1:
             # Top of iteration 2: the cumulative timers now hold exactly
@@ -9107,13 +11647,20 @@ def generate_mtpk(
                 "verify_calls": int(verify_calls),
                 "committed_tokens": len(tokens),
             }
-        repetition_result = _trim_repeated_suffix(tokens, repetition_config)
+        _policy_draft_before, _policy_verify_before = draft_time, verify_time
+        _policy_traces_before = (
+            compiled_verify_bank.stats["traces"]
+            if compiled_verify_bank is not None else 0
+        )
+        repetition_result = _trim_repeated_suffix(
+            tokens, repetition_config, repetition_long_cycle
+        )
         if repetition_result is not None:
             events.append(
                 {
                     "step": step,
                     "repetition_stop": {
-                        "reason": "exact_repeated_token_suffix",
+                        "reason": repetition_result.reason,
                         "block_tokens": repetition_result.block_tokens,
                         "repeats": repetition_result.repeats,
                         "trimmed_tokens": repetition_result.repeated_tokens,
@@ -9273,7 +11820,21 @@ def generate_mtpk(
         if len(tokens) >= max_tokens or _is_stop(primary, stop_token_ids):
             if stop_origin is None and _is_stop(primary, stop_token_ids):
                 stop_origin = "primary"
-            append_event(event)
+            # The primary that ends the response here -- freshly sampled from
+            # the last row, or a deferred correction / bonus folded into this
+            # cycle -- has been COMMITTED but never FORWARDED: the verify that
+            # would have consumed it never runs. Re-arm it as the pending
+            # primary so the final-pending commit below extends the trunk
+            # cache (and the committed MTP history) by exactly this token.
+            # Without it the banked generation-final state is one token short
+            # of the prompt+tokens key the server files it under, and the
+            # next warm turn decodes as if this turn's terminator never
+            # existed; positions stay contiguous so nothing downstream can
+            # tell (three audits, 2026-09-07/08; the greedy deferred
+            # correction was the common trigger, temperature-0 agent clients
+            # such as Cline hit it every turn).
+            pending_primary = int(primary)
+            emit_round(event)
             emit_trace()
             break
 
@@ -9303,6 +11864,10 @@ def generate_mtpk(
                 mtp_history_cache = rt.make_mtp_cache()
                 mtp_history_live_resets += 1
                 mtp_history_live_appended = 0
+                # Dense-path image request: the fresh cache restarts at row
+                # 0 and will only ever hold rows past the prompt, where the
+                # stock rope is exactly the image-request rope. Not counted.
+                _dense_mrope_release_draft_head(_dense_mrope_request, None)
             mtp_cache = mtp_history_cache
             cycle_mtp_offset = _mtp_cache_offset(mtp_cache)
         else:
@@ -9378,7 +11943,7 @@ def generate_mtpk(
             if _cc_src_idx is None and len(tokens) >= ccopy_suspend_until:
                 ccopy_probes += 1
                 _cc_pos, _cc_ext = ccopy_index.find(
-                    prompt_ids + tokens, max_pos=len(prompt_ids)
+                    _JoinedTokens(prompt_ids, tokens), max_pos=len(prompt_ids)
                 )
                 if (
                     _cc_pos is not None
@@ -9400,7 +11965,7 @@ def generate_mtpk(
                     }
         # ---- context-copy round: verbatim block from context, no MTP compute this cycle ----
         if ccopy_active and _ccopy_capture_lane and cycle_depth >= 1 and len(tokens) >= ccopy_suspend_until:
-            _cc_hist = prompt_ids + tokens
+            _cc_hist = _JoinedTokens(prompt_ids, tokens)
             ccopy_probes += 1
             # Prompt-only contract: candidates whose continuation starts at the
             # prompt edge are dropped inside find() (the best VALID match wins),
@@ -9490,10 +12055,10 @@ def generate_mtpk(
                     _cc_stats_before = (
                         int(compiled_verify_bank.stats["traces"]),
                         int(compiled_verify_bank.stats["fallback_calls"]),
-                        dict(compiled_verify_bank.stats["fallback_reasons"]),
                     )
                 started_forward = time.perf_counter()
-                with attention_phase("decode_verify"):
+                with _decode_trunk_scope(vision_splice):
+                    event["verify_width"] = 1 + len(_cc_block)
                     if _cc_bank_route:
                         # Native-length dispatch; the bank's extended window
                         # accepts T up to MTPLX_CCOPY_BANK_MAX_LEN and falls
@@ -9507,9 +12072,29 @@ def generate_mtpk(
                                 return_hidden=True,
                                 hidden_variant=base_hidden_variant,
                                 extended_window=True,
+                                committed_count=len(tokens) - 1,
                             )
                         )
+                        event["verify_route"] = (
+                            compiled_verify_bank.last_dispatch_route("ccopy_bank")
+                        )
                     else:
+                        event["verify_route"] = "ccopy_block"
+                        if compiled_verify_bank is not None:
+                            compiled_verify_bank.reserve_fixed_m4_window(
+                                cache,
+                                committed_count=len(tokens) - 1,
+                                window_tokens=_cc_T,
+                            )
+                        # Generic (non fixed-M4) banks reserve nothing for a
+                        # copy window; grow their fixed buffers before the
+                        # forward builds its mask. Without this a block that
+                        # straddled the growth edge lost its rows past the
+                        # end (functional clamp) or failed the write.
+                        _cc_grown = ensure_eager_window_capacity(cache, _cc_T)
+                        if _cc_grown:
+                            ccopy_capacity_growths += 1
+                            event["ccopy_capacity_growth"] = int(_cc_grown)
                         _cc_logits, _cc_hidden, _cc_captures = rt.forward_ar_capture(
                             mx.array([[primary] + _cc_block]),
                             cache=cache,
@@ -9608,16 +12193,9 @@ def generate_mtpk(
                         ) > 0
                         _cc_fb_reason = "-"
                         if _cc_fell_back:
-                            _cc_after = compiled_verify_bank.stats[
-                                "fallback_reasons"
-                            ]
-                            _cc_fb_reason = ",".join(
-                                sorted(
-                                    reason
-                                    for reason, count in _cc_after.items()
-                                    if count > _cc_stats_before[2].get(reason, 0)
-                                )
-                            ) or "-"
+                            _cc_fb_reason = (
+                                compiled_verify_bank.last_fallback_reason or "-"
+                            )
                         _cc_route = (
                             f"bank_eager:{_cc_fb_reason}"
                             if _cc_fell_back
@@ -9647,7 +12225,7 @@ def generate_mtpk(
                     rollback_after_verify(cache, _cc_before, verified_tokens=_cc_T)
                     rollback_time += time.perf_counter() - started_rollback
                     started = time.perf_counter()
-                    with attention_phase("decode_verify"):
+                    with _decode_trunk_scope(vision_splice):
                         _cc_l2, _cc_h2 = rt.forward_ar(
                             mx.array([[primary]]),
                             cache=cache,
@@ -9661,7 +12239,7 @@ def generate_mtpk(
                     ccopy_active = False
                     ccopy_disabled_reason = "no_per_position_commit"
                     event["context_copy"] = {"disabled": "no_per_position_commit"}
-                    append_event(event)
+                    emit_round(event)
                     continue
                 _cc_round_pos = len(tokens)
                 _cc_acc = _cc_block[:_cc_nacc]
@@ -9710,6 +12288,7 @@ def generate_mtpk(
                     ccopy_backoff = min(ccopy_backoff * 2, 4096)
                     ccopy_ema, ccopy_seen = 0.5, 0
                     ccopy_suspensions += 1
+                event["accepted_depths"] = int(_cc_nacc)
                 event["context_copy"] = {
                     "block": len(_cc_block),
                     "accepted": _cc_nacc,
@@ -9738,7 +12317,7 @@ def generate_mtpk(
                     )
                 logits = _cc_logits[:, _cc_m - 1, :]
                 hidden = _cc_hidden[:, _cc_m - 1:_cc_m, :]
-                append_event(event)
+                emit_round(event)
                 emit_new_tokens()
                 if _cc_finished:
                     break
@@ -9759,7 +12338,7 @@ def generate_mtpk(
             and cycle_depth >= 1
             and len(tokens) >= ccopy_suspend_until
         ):
-            _cb_hist = prompt_ids + tokens
+            _cb_hist = _JoinedTokens(prompt_ids, tokens)
             ccopy_probes += 1
             _cb_pos, _cb_ext = ccopy_index.find(_cb_hist, max_pos=len(prompt_ids))
             _cb_block: list[int] = []
@@ -9806,9 +12385,25 @@ def generate_mtpk(
                     if family_capture_commit_active
                     else contextlib.nullcontext()
                 )
+                # Reserve the block's rows before the forward: the fixed-M4
+                # bank's window for its QSA entries, and the dense fixed
+                # buffers for everything else. A restored entry carries only
+                # its step rounding as slack, and the first rounds after a
+                # restore can be copy rounds, so the block used to overrun
+                # the buffer (clamped silently before the in-place write).
+                if compiled_verify_bank is not None:
+                    compiled_verify_bank.reserve_fixed_m4_window(
+                        cache,
+                        committed_count=len(tokens) - 1,
+                        window_tokens=_cb_T,
+                    )
+                _cb_grown = ensure_eager_window_capacity(cache, _cb_T)
+                if _cb_grown:
+                    ccopy_capacity_growths += 1
+                    event["ccopy_capacity_growth"] = int(_cb_grown)
                 started_forward = time.perf_counter()
                 with (
-                    attention_phase("decode_verify"),
+                    _decode_trunk_scope(vision_splice),
                     model_forward_kind("target_verify"),
                     _cb_scope,
                 ):
@@ -9818,11 +12413,17 @@ def generate_mtpk(
                         return_hidden=True,
                         hidden_variant=base_hidden_variant,
                     )
+                _note_demotion("copy_round_eager", _COPY_ROUND_EAGER_REASON)
                 if sampler.temperature <= 0:
                     _cb_g = [int(x) for x in mx.argmax(_cb_logits[0], axis=-1).tolist()]
                 else:
                     mx.eval(_cb_logits)
                 elapsed_verify = time.perf_counter() - started_forward
+                # Route Tape: the batched-lane copy block is a verify round like any other;
+                # it carries the block width so the census reads the copy lane's rounds.
+                event["verify_route"] = "ccopy_block"
+                event["verify_width"] = int(_cb_T)
+                _add_timing(event, "verify_forward", elapsed_verify)
                 verify_forward_time += elapsed_verify
                 verify_time += elapsed_verify
                 target_time += elapsed_verify
@@ -9899,7 +12500,7 @@ def generate_mtpk(
                     rollback_after_verify(cache, _cb_before, verified_tokens=_cb_T)
                     rollback_time += time.perf_counter() - started_rollback
                     started = time.perf_counter()
-                    with attention_phase("decode_verify"):
+                    with _decode_trunk_scope(vision_splice):
                         _cb_l2, _cb_h2 = rt.forward_ar(
                             mx.array([[primary]]),
                             cache=cache,
@@ -9913,10 +12514,11 @@ def generate_mtpk(
                     ccopy_active = False
                     ccopy_disabled_reason = "no_per_position_commit"
                     event["context_copy"] = {"disabled": "no_per_position_commit"}
-                    append_event(event)
+                    emit_round(event)
                     continue
                 _cb_round_pos = len(tokens)
                 _cb_acc = _cb_block[:_cb_nacc]
+                event["accepted_depths"] = int(_cb_nacc)
                 _cb_stop_idx = next(
                     (
                         i
@@ -9978,7 +12580,7 @@ def generate_mtpk(
                     )
                 logits = _cb_logits[:, _cb_m - 1, :]
                 hidden = _cb_hidden[:, _cb_m - 1 : _cb_m, :]
-                append_event(event)
+                emit_round(event)
                 emit_new_tokens()
                 if _cb_finished:
                     break
@@ -10026,6 +12628,7 @@ def generate_mtpk(
                         draft_hidden,
                         mx.array([[primary]]),
                         mtp_hidden_variant=mtp_hidden_variant,
+                        rope_delta=_dense_draft_rope_delta(_dense_mrope_request),
                     )
                     elapsed_compile = time.perf_counter() - compile_started
                     device_d2_compile_time += elapsed_compile
@@ -10105,6 +12708,7 @@ def generate_mtpk(
                     draft_hidden,
                     mx.array([[primary]]),
                     mtp_hidden_variant=mtp_hidden_variant,
+                    rope_delta=_dense_draft_rope_delta(_dense_mrope_request),
                 )
             _k2_drafts = _run_device_d2_draft_core(
                 compiled_k2_d2_core, draft_hidden, int(primary)
@@ -10201,6 +12805,7 @@ def generate_mtpk(
                             mtp_cache=mtp_cache,
                             draft_sampler=draft_sampler,
                             seed=int(rng.integers(0, 2**31 - 1)),
+                            rope_delta=_dense_draft_rope_delta(_dense_mrope_request),
                         )
                         elapsed_compile = time.perf_counter() - compile_started
                         device_core_compile_time += elapsed_compile
@@ -10269,6 +12874,203 @@ def generate_mtpk(
         # knob may default on. Duplicates ~40 lines of the stock loop below —
         # keep the two in sync (and see the stock loop's own comment).
         _greedy_chain_used = False
+        # Sampled on-device draft chain (MTPLX_QWEN4_SAMPLED_DRAFT_CHAIN): the
+        # device predicts each depth's host draw so the next depth chains
+        # without a sync; one eval per round, then the host re-derives every
+        # distribution and pick with the serial reader's own arithmetic and
+        # the uniforms it drew before the round.  A prediction the host does
+        # not confirm cuts the chain at that depth (MTP cache rolled back to
+        # the recorded offset) and the rest of the round runs serially on the
+        # already drawn uniforms, so tokens, proposals and the generator
+        # stream are those of the serial compact-row reader for every seed.
+        # See mtplx/qwen4_draft_device_chain.py.
+        _sampled_chain_next_depth = 0
+        if (
+            _sampled_chain_plan is not None
+            and not used_device_core
+            and cycle_depth > 0
+            and _cc_draft_source_token is None
+            and not _steer_active
+            and mtp_cache is not None
+        ):
+            _sc_started = time.perf_counter()
+            _sc_pipeline = _qwen4_sampled_chain.pipeline_enabled()
+            # Only the fixed-M4 replay opens with a host row gather to warm.
+            _sc_prefetch = (
+                getattr(compiled_verify_bank, "prefetch_fixed_m4_aux", None)
+                if _sc_pipeline and qwen4_fixed_m4_compiled_verify
+                else None
+            )
+            _sc_uniforms = [float(rng.random()) for _ in range(cycle_depth)]
+            _sc_tok = mx.array([[int(next_token)]])
+            _sc_hidden = draft_hidden
+            _sc_supports: list[tuple[mx.array, mx.array, mx.array]] = []
+            _sc_predicted: list[mx.array] = []
+            _sc_hiddens: list[mx.array] = []
+            _sc_offsets: list[int | None] = []
+            _sc_cache_offsets: list[int] = []
+            for _sc_depth in range(cycle_depth):
+                _sc_cache_offsets.append(_mtp_cache_offset(mtp_cache))
+                _sc_offset = mtp_position_offset_for_cache(mtp_cache)
+                _sc_offsets.append(_sc_offset)
+                _sc_logits, _sc_hidden_next = rt.draft_mtp(
+                    _sc_hidden,
+                    _sc_tok,
+                    mtp_cache=mtp_cache,
+                    return_hidden=True,
+                    mtp_hidden_variant=mtp_hidden_variant,
+                    mtp_depth=_sc_depth + 1,
+                    position_offset=_sc_offset,
+                )
+                _sc_support = _qwen4_sampled_chain.device_support(
+                    _sampled_chain_plan, _sc_logits
+                )
+                _sc_token = _qwen4_sampled_chain.device_predict(
+                    _sampled_chain_plan,
+                    *_sc_support,
+                    mx.array(_sc_uniforms[_sc_depth], dtype=mx.float32),
+                )
+                _sc_supports.append(_sc_support)
+                _sc_predicted.append(_sc_token)
+                _sc_tok = _sc_token.reshape(1, 1).astype(mx.int32)
+                _sc_hidden = _sc_hidden_next[:, -1:, :]
+                _sc_hiddens.append(_sc_hidden)
+                if _sc_pipeline:
+                    # Hand this depth to the GPU now; the next depth is built
+                    # while it runs.
+                    mx.async_eval(*_sc_support, _sc_token, _sc_hidden)
+            _sc_window = [int(next_token)]
+            if _sc_pipeline:
+                # The verify window opens with the primary, known already:
+                # warm its n-gram rows under the GPU's draft steps.
+                if _sc_prefetch is not None:
+                    _sc_prefetch(
+                        _sc_window,
+                        completion_tokens=tokens,
+                        committed_count=len(tokens) - 1,
+                    )
+            else:
+                _eval(
+                    *[_sc_array for _sc_s in _sc_supports for _sc_array in _sc_s],
+                    *_sc_predicted,
+                    _sc_hidden,
+                )
+            _sc_source = int(next_token)
+            _sc_cut = False
+            for _sc_depth in range(cycle_depth):
+                if _sc_pipeline:
+                    # Wait for this depth only; later depths keep running.
+                    _eval(*_sc_supports[_sc_depth], _sc_predicted[_sc_depth])
+                _sc_local, _sc_vals, _sc_probs = _sc_supports[_sc_depth]
+                _sc_q = _qwen4_sampled_chain.host_distribution(
+                    _sampled_chain_plan,
+                    np.asarray(_sc_local),
+                    np.asarray(_sc_vals),
+                    np.asarray(_sc_probs),
+                )
+                if _sc_q is None:
+                    # No finite positive mass: the same hard failure the
+                    # serial reader raises, never a guessed token.
+                    raise non_finite_logits_error(
+                        np.asarray(_sc_probs), "sampled draft chain"
+                    )
+                _sc_host_token = _qwen4_sampled_chain.host_pick(
+                    _sc_q, _sc_uniforms[_sc_depth]
+                )
+                draft_tokens.append(_sc_host_token)
+                draft_probs.append(_sc_q)
+                draft_hidden_for_update.append(_sc_hiddens[_sc_depth])
+                draft_hidden_update_keys.append(
+                    (_sc_depth + 1, _sc_source)
+                    if online_hidden_corrector_key == "token"
+                    else _sc_depth + 1
+                )
+                drafted += 1
+                drafted_by_depth[_sc_depth] += 1
+                _sc_event = {
+                    "depth": _sc_depth + 1,
+                    "token": int(_sc_host_token),
+                    "timing_s": {"draft": 0.0},
+                    "mtp_corrector": None,
+                    "draft_core": "sampled-chain",
+                }
+                if _sc_offsets[_sc_depth] is not None:
+                    _sc_event["position_offset"] = int(_sc_offsets[_sc_depth])
+                event["drafts"].append(_sc_event)
+                draft_hidden = _sc_hiddens[_sc_depth]
+                next_token = _sc_host_token
+                _sc_source = int(_sc_host_token)
+                _sampled_chain_next_depth = _sc_depth + 1
+                if _sc_pipeline and _sc_prefetch is not None:
+                    _sc_window.append(int(_sc_host_token))
+                    _sc_prefetch(
+                        _sc_window,
+                        completion_tokens=tokens,
+                        committed_count=len(tokens) - 1,
+                    )
+                if _sc_host_token != int(_sc_predicted[_sc_depth].item()):
+                    # Every later forward consumed the device's token, not
+                    # this one: drop their MTP-cache rows and finish serially.
+                    if _sc_depth + 1 < cycle_depth:
+                        _rollback_mtp_cache(
+                            mtp_cache, _sc_cache_offsets[_sc_depth + 1]
+                        )
+                    _sc_cut = True
+                    break
+            if _sc_pipeline and not _sc_cut:
+                _eval(_sc_hidden)
+            if _sc_cut:
+                _sampled_chain_cuts += 1
+                event["sampled_chain_cut_depth"] = _sampled_chain_next_depth + 1
+                while _sampled_chain_next_depth < cycle_depth:
+                    _sc_depth = _sampled_chain_next_depth
+                    _sc_offset = mtp_position_offset_for_cache(mtp_cache)
+                    _sc_logits, _sc_hidden_next = rt.draft_mtp(
+                        draft_hidden,
+                        mx.array([[int(next_token)]]),
+                        mtp_cache=mtp_cache,
+                        return_hidden=True,
+                        mtp_hidden_variant=mtp_hidden_variant,
+                        mtp_depth=_sc_depth + 1,
+                        position_offset=_sc_offset,
+                    )
+                    _sc_host_token, _sc_q = _qwen4_sampled_chain.serial_read(
+                        _sampled_chain_plan, _sc_logits, _sc_uniforms[_sc_depth]
+                    )
+                    if _sc_q is None:
+                        raise non_finite_logits_error(
+                            np.zeros(1), "sampled draft chain (serial tail)"
+                        )
+                    _sc_source = int(next_token)
+                    draft_tokens.append(_sc_host_token)
+                    draft_probs.append(_sc_q)
+                    draft_hidden = _sc_hidden_next[:, -1:, :]
+                    draft_hidden_for_update.append(draft_hidden)
+                    draft_hidden_update_keys.append(
+                        (_sc_depth + 1, _sc_source)
+                        if online_hidden_corrector_key == "token"
+                        else _sc_depth + 1
+                    )
+                    drafted += 1
+                    drafted_by_depth[_sc_depth] += 1
+                    _sc_event = {
+                        "depth": _sc_depth + 1,
+                        "token": int(_sc_host_token),
+                        "timing_s": {"draft": 0.0},
+                        "mtp_corrector": None,
+                        "draft_core": "sampled-chain-serial",
+                    }
+                    if _sc_offset is not None:
+                        _sc_event["position_offset"] = int(_sc_offset)
+                    event["drafts"].append(_sc_event)
+                    next_token = _sc_host_token
+                    _sampled_chain_next_depth = _sc_depth + 1
+            _sc_elapsed = time.perf_counter() - _sc_started
+            draft_time += _sc_elapsed
+            if event["drafts"]:
+                event["drafts"][-1]["timing_s"]["draft"] = _sc_elapsed
+            _sampled_chain_rounds += 1
+            _greedy_chain_used = _sampled_chain_next_depth >= cycle_depth
         if (
             _greedy_chain_eligible
             and not used_device_core
@@ -10295,15 +13097,38 @@ def generate_mtpk(
                     mtp_depth=_chain_depth + 1,
                     position_offset=_chain_offset,
                 )
-                _chain_row = _chain_logits[:, -1, :][0]
-                _chain_arg = mx.argmax(_chain_row, axis=-1)
-                _chain_pending.append(_chain_arg)
-                if _draft_conf_trace:
-                    # Greedy: max(row) IS the drafted token's logit, so this
-                    # is p(drafted) without a gather. Lazy — rides the eval.
-                    _chain_conf_pending.append(
-                        mx.exp(mx.max(_chain_row) - mx.logsumexp(_chain_row))
+                if _draft_k20_prescatter_plan is not None:
+                    # MTPLX_QWEN4_DRAFT_K20_PRESCATTER on the greedy chain:
+                    # the same argmax (and the same traced confidence) taken
+                    # over the FR-Spec head's 65,536-row PRE-scatter output,
+                    # with the winning local row mapped to its real token id
+                    # by one device `mx.take` through the strictly ascending
+                    # ranked table. Same token, same tie-break - the proof is
+                    # in `qwen4_draft_k20_prescatter.greedy_chain_step`. Both
+                    # arrays stay unevaluated, so this still costs the one
+                    # `_eval` below and the 248,320-lane scatter behind
+                    # `_chain_logits` is built and dropped, never run.
+                    _chain_arg, _chain_conf = (
+                        _qwen4_draft_k20_prescatter_greedy_step(
+                            _draft_k20_prescatter_plan,
+                            _chain_logits,
+                            want_confidence=_draft_conf_trace,
+                        )
                     )
+                    _chain_pending.append(_chain_arg)
+                    if _chain_conf is not None:
+                        _chain_conf_pending.append(_chain_conf)
+                else:
+                    _chain_row = _chain_logits[:, -1, :][0]
+                    _chain_arg = mx.argmax(_chain_row, axis=-1)
+                    _chain_pending.append(_chain_arg)
+                    if _draft_conf_trace:
+                        # Greedy: max(row) IS the drafted token's logit, so
+                        # this is p(drafted) without a gather. Lazy - rides
+                        # the eval.
+                        _chain_conf_pending.append(
+                            mx.exp(mx.max(_chain_row) - mx.logsumexp(_chain_row))
+                        )
                 _chain_tok = _chain_arg.reshape(1, 1).astype(mx.int32)
                 _chain_hidden = _chain_hidden_next[:, -1:, :]
                 draft_hidden_for_update.append(_chain_hidden)
@@ -10555,6 +13380,18 @@ def generate_mtpk(
                     if prepared_greedy_draft is not None:
                         draft_token, draft_q = prepared_greedy_draft
                         greedy_confidence_token_reuses += 1
+                    elif _draft_k20_prescatter_plan is not None:
+                        # MTPLX_QWEN4_DRAFT_K20_PRESCATTER: the same read the
+                        # fixed-width reader does, on the FR-Spec head's
+                        # compact row.  `draft_logits` is never evaluated on
+                        # this branch, so the scatter behind it is never run.
+                        draft_token, draft_q = _qwen4_draft_k20_prescatter_read(
+                            _draft_k20_prescatter_plan,
+                            draft_logits,
+                            draft_sampler,
+                            rng,
+                            need_distribution=need_draft_distribution,
+                        )
                     else:
                         draft_token, draft_q, adaptive_width_stop = cycle_draft_reader(
                             draft_logits,
@@ -10738,7 +13575,13 @@ def generate_mtpk(
 
         before_verify = None
         if a3b_target_prefix_route is None:
-            if _skip_verify_snapshot():
+            # The family capture lane commits by replaying the GDN recurrences
+            # from the pre-verify snapshot (commit_verified_window), so it needs
+            # that snapshot regardless of MTPLX_SKIP_VERIFY_SNAPSHOT -- the same
+            # rule the block round applies above. The lazy snapshot is
+            # zero-copy, so honouring the skip here only removes the commit's
+            # input and forces the rollback + re-forward fallback.
+            if _skip_verify_snapshot() and not family_capture_commit_active:
                 event["snapshot"] = "skipped_capture_commit_required"
             else:
                 started = time.perf_counter()
@@ -10805,6 +13648,7 @@ def generate_mtpk(
             )
             verified_token_count = len(verify_input)
             verify_input_array = mx.array([verify_input])
+        event["verify_width"] = int(verified_token_count)
         if lazy_bonus_verify:
             lazy_bonus_verify_calls += 1
         event["lazy_bonus_verify"] = {
@@ -10848,17 +13692,17 @@ def generate_mtpk(
             else contextlib.nullcontext()
         )
         with (
-            attention_phase("decode_verify"),
+            # The verify phase and, for an image request, its positions:
+            # decode-time trunk forwards rope at sequence_index + mrope delta
+            # (equal axes past the prompt table). Every other trunk forward
+            # of this loop enters the same scope.
+            _decode_trunk_scope(vision_splice),
             model_forward_kind("target_verify"),
             # Greedy exactness contract: at t<=0 the verify forward must use
             # stock matmuls so MTP argmax matches AR argmax at near-ties (the
             # vk/nax lanes are ~6e-3 off stock, flip band ~1.6e-2 measured
             # 2026-08-29). Sampled requests keep the fast kernels.
             exact_verify(sampler.temperature <= 0),
-            # Vision requests: decode-time trunk forwards rope at
-            # sequence_index + mrope delta (equal axes past the prompt
-            # table). Nullcontext for text requests.
-            _vision_rope_scope_for(vision_splice),
             family_capture_scope,
         ):
             if verify_strategy in {"capture_commit", "graphbank_capture_commit"}:
@@ -10869,9 +13713,14 @@ def generate_mtpk(
                             cache=cache,
                             return_hidden=True,
                             hidden_variant=base_hidden_variant,
+                            committed_count=len(tokens) - 1,
                         )
                     )
+                    event["verify_route"] = (
+                        compiled_verify_bank.last_dispatch_route("compiled_bank")
+                    )
                 elif graphbank is not None:
+                    event["verify_route"] = "graphbank"
                     verify_logits, verify_hidden, captures = (
                         graphbank.forward_ar_capture(
                             verify_input_array,
@@ -10881,6 +13730,7 @@ def generate_mtpk(
                         )
                     )
                 else:
+                    event["verify_route"] = "eager_capture"
                     capture_forward = capture_forward_routes[len(draft_tokens) - 1]
                     verify_logits, verify_hidden, captures = capture_forward(
                         verify_input_array,
@@ -10894,6 +13744,7 @@ def generate_mtpk(
                 # (post-row-0, post-row-1); the accept loop picks which one the
                 # next cycle rebases from after a d1 or d2 reject.
                 if a3b_rebase_state is not None:
+                    event["verify_route"] = "a3b_m3_rebased"
                     (
                         verify_logits,
                         verify_hidden,
@@ -10904,6 +13755,7 @@ def generate_mtpk(
                     )
                     a3b_rebase_state = None
                 else:
+                    event["verify_route"] = "a3b_m3"
                     (
                         verify_logits,
                         verify_hidden,
@@ -10918,6 +13770,7 @@ def generate_mtpk(
                     # this cycle's primary and the verify runs from the
                     # stashed post-primary state of the cycle that rejected
                     # it -- the repair_m1 forward never happens.
+                    event["verify_route"] = "a3b_m2_rebased"
                     verify_logits, verify_hidden, a3b_primary_state = (
                         a3b_target_prefix_route.verify_m2_rebased(
                             verify_input_array, a3b_rebase_state
@@ -10925,9 +13778,29 @@ def generate_mtpk(
                     )
                     a3b_rebase_state = None
                 else:
+                    event["verify_route"] = "a3b_m2"
                     verify_logits, verify_hidden, a3b_primary_state = (
                         a3b_target_prefix_route.verify_m2(verify_input_array)
                     )
+            elif (
+                qwen4_fixed_m4_compiled_verify
+                and compiled_verify_bank is not None
+                and verified_token_count == 4
+            ):
+                verify_logits, verify_hidden, captures = (
+                    compiled_verify_bank.forward_fixed_m4(
+                        verify_input_array,
+                        host_input_ids=verify_input,
+                        completion_tokens=tokens,
+                        committed_count=len(tokens) - 1,
+                        cache=cache,
+                        return_hidden=True,
+                        hidden_variant=base_hidden_variant,
+                    )
+                )
+                event["verify_route"] = (
+                    compiled_verify_bank.last_dispatch_route("compiled_bank_m4")
+                )
             elif compiled_verify_bank is not None:
                 # Replace only the target forward. target_prefix keeps its
                 # authoritative snapshot/trim, pre-sampling, and correction
@@ -10938,9 +13811,14 @@ def generate_mtpk(
                         cache=cache,
                         return_hidden=True,
                         hidden_variant=base_hidden_variant,
+                        committed_count=len(tokens) - 1,
                     )
                 )
+                event["verify_route"] = (
+                    compiled_verify_bank.last_dispatch_route("compiled_bank_tp")
+                )
             elif graphbank is not None:
+                event["verify_route"] = "graphbank_plain"
                 verify_logits, verify_hidden = graphbank.forward_ar(
                     verify_input_array,
                     cache=cache,
@@ -10948,6 +13826,7 @@ def generate_mtpk(
                     hidden_variant=base_hidden_variant,
                 )
             else:
+                event["verify_route"] = "eager_plain"
                 verify_logits, verify_hidden = rt.forward_ar(
                     verify_input_array,
                     cache=cache,
@@ -11191,6 +14070,36 @@ def generate_mtpk(
             # pre-sample above already carried the overlay (and its lane has
             # no draft distributions to fall back on).
             target_distribution_batch = None
+        # MTPLX_QWEN4_BLOCK_VERIFY (default off): build the window's block
+        # ladder BEFORE the accept loop. It is a deterministic function of the
+        # rows and the drafted tokens -- it consults no uniform and draws
+        # nothing -- and the M4 verify has already produced every target row,
+        # so the whole ladder is available up front and the loop only reads it.
+        # `build_verifier` returns None (keep the shipped law for this window)
+        # unless all D draft rows and all D target rows are already on the
+        # host, so arming the flag never forces the lazy path to materialise a
+        # row it meant to skip. Greedy and target-prefix windows have no
+        # distributions at all and are excluded here.
+        _host_accept_drafts = draft_tokens
+        _bv = None
+        if (
+            _QWEN4_BLOCK_VERIFY
+            and _host_accept_drafts
+            and sampler.temperature > 0
+            and target_prefix_tokens is None
+        ):
+            _bv = _qwen4_build_block_verifier(
+                draft_tokens=draft_tokens,
+                draft_probs=draft_probs,
+                target_batch=target_distribution_batch,
+                target_list=(
+                    target_distributions
+                    if target_distributions is not None
+                    and not _penalties_active
+                    and not _steer_active
+                    else None
+                ),
+            )
         # Grammar clamp (#186 phase 3): drafts are proposed unmasked, so the
         # committed window must stop at the grammar's legal prefix. One
         # stateless validate call per cycle; the matcher itself only advances
@@ -11228,7 +14137,7 @@ def generate_mtpk(
             _batched_target_tokens = mx.argmax(
                 verify_logits[0, : len(draft_tokens), :], axis=-1
             ).tolist()
-        for depth_index, draft_token in enumerate(draft_tokens):
+        for depth_index, draft_token in enumerate(_host_accept_drafts):
             target_logits_for_draft = verify_logits[:, depth_index, :]
             if _steer_active:
                 _row_guard_overlay = _steer_overlay(
@@ -11279,6 +14188,11 @@ def generate_mtpk(
                 accept_prob = (
                     1.0 if q <= 0 and p > 0 else (0.0 if q <= 0 else min(1.0, p / q))
                 )
+                if _bv is not None:
+                    # Block verification: the CONDITIONAL accept probability
+                    # a_d = w_d / w_{d-1}, precomputed from the same rows.
+                    # Reduces to min(1, p/q) whenever the ladder is still at 1.
+                    accept_prob = _bv.accept_probability[depth_index]
                 accepted_now = float(rng.random()) <= accept_prob
                 target_p_for_cache = (
                     target_distribution_batch.to_distribution(depth_index)
@@ -11286,10 +14200,16 @@ def generate_mtpk(
                     and depth_index + 1 >= online_correction_cache_min_depth
                     else None
                 )
-                correction = (
-                    draft_token
-                    if accepted_now
-                    else sample_from_distribution(
+                if accepted_now:
+                    correction = draft_token
+                elif _bv is not None:
+                    # The block law's SCALED residual (c_{d-1}*p - q)+, one
+                    # rng.choice exactly as the shipped residual takes.
+                    correction = sample_from_distribution(
+                        _bv.scaled_residual(depth_index), rng
+                    )
+                else:
+                    correction = sample_from_distribution(
                         residual_distribution(
                             target_p_for_cache
                             if target_p_for_cache is not None
@@ -11298,7 +14218,6 @@ def generate_mtpk(
                         ),
                         rng,
                     )
-                )
             else:
                 target_p = (
                     target_distributions[depth_index]
@@ -11335,15 +14254,24 @@ def generate_mtpk(
                 accept_prob = compute_acceptance_probability(
                     target_p, draft_q, draft_token
                 )
+                if _bv is not None:
+                    # Block verification: see the batched branch above. `_bv`
+                    # is only ever built when every target row was already
+                    # materialised, so it is None on the lazy path that just
+                    # built `target_p` here.
+                    accept_prob = _bv.accept_probability[depth_index]
                 accepted_now = float(rng.random()) <= accept_prob
                 target_p_for_cache = target_p
-                correction = (
-                    draft_token
-                    if accepted_now
-                    else sample_from_distribution(
+                if accepted_now:
+                    correction = draft_token
+                elif _bv is not None:
+                    correction = sample_from_distribution(
+                        _bv.scaled_residual(depth_index), rng
+                    )
+                else:
+                    correction = sample_from_distribution(
                         residual_distribution(target_p, draft_q), rng
                     )
-                )
                 if not accepted_now and _env_truthy("MTPLX_DELTA_TELEMETRY"):
                     # Tree Stage-0 pricing (2026-08-25): would a sibling branch
                     # have caught this rejection? Record the rank of the
@@ -11390,6 +14318,14 @@ def generate_mtpk(
             event["drafts"][depth_index]["accepted"] = accepted_now
             event["drafts"][depth_index]["accept_probability"] = float(accept_prob)
             event["drafts"][depth_index]["correction"] = int(correction)
+            # Under MTPLX_QWEN4_BLOCK_VERIFY this sum (and the per-draft
+            # `accept_probability` above) carries a_d = w_d / w_{d-1}, the
+            # CONDITIONAL probability that depth's coin accepts given the
+            # window reached it -- the same operational meaning min(1, p/q)
+            # has, and it still equals min(1, p/q) whenever the reach ladder
+            # is at 1. What it stops being is an estimator of the TV overlap
+            # beta_d: E[alpha] = beta is a property of min(1, rho) and does
+            # not survive the water-fill.
             accept_probability_sum_by_depth[depth_index] += float(accept_prob)
             if _draft_conf_trace:
                 # After the constraint clamp: attribute to the COMMITTED
@@ -11515,6 +14451,17 @@ def generate_mtpk(
         if adaptive_policy is not None:
             _policy_now = time.perf_counter()
             _policy_kwargs: dict[str, float] = {}
+            if (
+                getattr(adaptive_policy, "accepts_verify_cost", False)
+                and compiled_verify_bank is not None
+                and compiled_verify_bank.stats["traces"] == _policy_traces_before
+            ):
+                # Compilation is paid once per shape; it remains in wall time
+                # but must not masquerade as the recurring cost of this depth.
+                _policy_kwargs.update(
+                    verify_time_s=verify_time - _policy_verify_before,
+                    draft_time_s=draft_time - _policy_draft_before,
+                )
             if getattr(adaptive_policy, "accepts_cycle_ms", False):
                 _policy_kwargs["cycle_ms"] = (
                     _policy_now - _policy_cycle_started
@@ -11631,7 +14578,7 @@ def generate_mtpk(
                     )
             if lazy_bonus_verify:
                 started_bonus_commit_forward = time.perf_counter()
-                with attention_phase("decode_verify"):
+                with _decode_trunk_scope(vision_splice):
                     bonus_commit_logits, bonus_commit_hidden = rt.forward_ar(
                         mx.array([[int(draft_tokens[-1])]]),
                         cache=cache,
@@ -11688,7 +14635,7 @@ def generate_mtpk(
                 maybe_detach_dirty_state(len(tokens))
                 maybe_eval_state_roots(event, len(tokens))
                 emit_new_tokens()
-                append_event(event)
+                emit_round(event)
                 break
             detach_capture_committed_state(len(tokens))
             maybe_detach_dirty_state(len(tokens))
@@ -11698,7 +14645,7 @@ def generate_mtpk(
                 if omit_speculative_bonus:
                     event["bonus_token_omitted"] = True
                     maybe_eval_state_roots(event, len(tokens))
-                    append_event(event)
+                    emit_round(event)
                     emit_trace()
                     continue
                 started_bonus = time.perf_counter()
@@ -11788,7 +14735,7 @@ def generate_mtpk(
                     # distribution.
                     event["bonus_token_constraint_skipped"] = True
                     maybe_eval_state_roots(event, len(tokens))
-                    append_event(event)
+                    emit_round(event)
                     emit_trace()
                     continue
                 tokens.append(bonus)
@@ -11799,11 +14746,11 @@ def generate_mtpk(
                 if _is_stop(bonus, stop_token_ids):
                     stop_origin = "bonus"
                     maybe_eval_state_roots(event, len(tokens))
-                    append_event(event)
+                    emit_round(event)
                     emit_trace()
                     break
             maybe_eval_state_roots(event, len(tokens))
-            append_event(event)
+            emit_round(event)
             emit_trace()
             continue
 
@@ -11861,7 +14808,7 @@ def generate_mtpk(
             )
             maybe_rebase_decode_state(cache_committed_token_count)
             maybe_eval_state_roots(event, cache_committed_token_count)
-            append_event(event)
+            emit_round(event)
 
             if any(_is_stop(token, stop_token_ids) for token in committed):
                 stop_origin = _stop_origin_for_committed(
@@ -12050,7 +14997,7 @@ def generate_mtpk(
             _add_timing(event, "rollback", elapsed_rollback)
             started = time.perf_counter()
             with (
-                attention_phase("decode_verify"),
+                _decode_trunk_scope(vision_splice),
                 model_forward_kind("repair"),
             ):
                 if generic_compiled_target_prefix and compiled_verify_bank is not None:
@@ -12133,7 +15080,14 @@ def generate_mtpk(
         )
         maybe_rebase_decode_state(cache_committed_token_count)
         maybe_eval_state_roots(event, cache_committed_token_count)
-        append_event(event)
+        event["commit_route"] = (
+            "capture_commit"
+            if committed_from_capture
+            else "trim_commit"
+            if committed_from_trim
+            else "rollback_reforward"
+        )
+        emit_round(event)
 
         if any(_is_stop(token, stop_token_ids) for token in committed):
             stop_origin = _stop_origin_for_committed(
@@ -12188,6 +15142,21 @@ def generate_mtpk(
         and pending_primary is not None
         and tokens
         and repetition_result is None
+        and a3b_rebase_state is not None
+    ):
+        # The compiled A3B routes keep the accepted-prefix state in a stash
+        # that only their next verify installs; the live trunk cache still
+        # holds the rejected rows. A one-row forward_ar from it would land
+        # the pending token on the wrong positions, so leave pending_primary
+        # set: the final state below reports safe_to_commit=False and the
+        # bank declines this turn (a cold/near-prefix next turn, never a
+        # corrupted one).
+        events.append({"final_state_capture_skipped": "a3b_rebase_pending"})
+    elif (
+        capture_final_state
+        and pending_primary is not None
+        and tokens
+        and repetition_result is None
     ):
         try:
             pending_token = int(pending_primary)
@@ -12204,7 +15173,7 @@ def generate_mtpk(
                 )
                 commit_time += time.perf_counter() - commit_started
             commit_started = time.perf_counter()
-            with attention_phase("decode_verify"):
+            with _decode_trunk_scope(vision_splice):
                 commit_logits, commit_hidden = rt.forward_ar(
                     mx.array([[pending_token]]),
                     cache=cache,
@@ -12261,6 +15230,13 @@ def generate_mtpk(
         # other downstream cache consumer must never see promoted
         # tensor-offset adapters.
         compiled_verify_bank.demote(cache)
+    # Disarm the FR-Spec head's compact-row stash.  The head is model-scoped,
+    # not request-scoped, so leaving it armed would keep one unevaluated
+    # scatter graph alive between requests.  A raise before this point leaves
+    # it armed with at most one stale entry, which the next claim clears and
+    # which `take_prescatter_row`'s identity check can never mis-consume.
+    _qwen4_draft_k20_prescatter_release(_draft_k20_prescatter_plan)
+    _qwen4_sampled_chain.release(_sampled_chain_plan)
     if constraint is not None:
         # Final sync so `completed` reflects every committed token (the loop
         # may exit between the per-cycle sync and the last commit).
@@ -12318,6 +15294,9 @@ def generate_mtpk(
             _forkev_snapshot = {"enabled": True, "errors": _forkev.errors + 1}
     stats = GenerationStats(
         mode="mtpk",
+        fixed_m4_admission=fixed_m4_admission,
+        compiled_verify_admission=compiled_verify_admission,
+        demotions=_demotions_since(_demotions_at_start),
         forkev=_forkev_snapshot,
         constraint_active=constraint is not None,
         constraint_completed=(
@@ -12344,7 +15323,6 @@ def generate_mtpk(
                     - float(prompt_state.cache_restore_time_s or 0.0),
                 )
                 + float(pre_first_token_setup_s)
-                + float(prompt_prefix_bank_commit.get("elapsed_s") or 0.0)
             ),
         ),
         accepted_drafts=accepted,
@@ -12504,9 +15482,13 @@ def generate_mtpk(
         context_copy_accepted_blocks=ccopy_blocks_accepted,
         context_copy_accepted_tokens=ccopy_accepted,
         context_copy_suspensions=ccopy_suspensions,
+        context_copy_capacity_growths=ccopy_capacity_growths,
         context_copy_suspended=len(tokens) < ccopy_suspend_until,
         context_copy_backoff_tokens=ccopy_backoff if ccopy_index is not None else 0,
         context_copy_disabled_reason=ccopy_disabled_reason,
+        sampled_draft_chain_rounds=_sampled_chain_rounds,
+        sampled_draft_chain_cuts=_sampled_chain_cuts,
+        sampled_draft_chain_status=_sampled_chain_status,
         graphbank={
             **(graphbank.to_dict() if graphbank is not None else {}),
             **(
@@ -12566,11 +15548,12 @@ def generate_mtpk(
             "greedy_confidence_sync_calls": greedy_confidence_sync_calls,
             "greedy_confidence_token_reuses": greedy_confidence_token_reuses,
         },
+        draft_k20_prescatter=_draft_k20_prescatter_receipt,
         owned_recurrent_state=owned_recurrent_state_stats(cache),
         owned_attn_kv=tail_owned_attention_kv_stats(cache),
         repetition_stop_triggered=repetition_result is not None,
         repetition_stop_reason=(
-            "exact_repeated_token_suffix" if repetition_result is not None else None
+            repetition_result.reason if repetition_result is not None else None
         ),
         repetition_stop_block_tokens=(
             0 if repetition_result is None else repetition_result.block_tokens

@@ -61,62 +61,15 @@ def _dtype_tag(dtype: mx.Dtype) -> str:
     }[dtype]
 
 
-@lru_cache(maxsize=1)
-def _mlx_nax_available() -> bool:
-    """Conservatively mirror MLX Metal's cached ``is_nax_available``."""
-
-    try:
-        macos_version = platform.mac_ver()[0]
-    except (OSError, RuntimeError, TypeError, ValueError):
-        return False
-
-    info = None
-    device_info = getattr(mx, "device_info", None)
-    if callable(device_info):
-        try:
-            # Capability is about the Metal GPU even if a CPU parity test has
-            # temporarily changed MLX's default device.
-            info = device_info(mx.gpu)
-        except (AttributeError, RuntimeError, TypeError, ValueError):
-            info = None
-    if not isinstance(info, dict):
-        # Compatibility fallback for an MLX release without mx.device_info.
-        metal_device_info = getattr(mx.metal, "device_info", None)
-        if callable(metal_device_info):
-            try:
-                info = metal_device_info()
-            except (AttributeError, RuntimeError, TypeError, ValueError):
-                info = None
-    architecture = info.get("architecture") if isinstance(info, dict) else None
-    return _nax_available_for_platform(macos_version, architecture)
-
-
-def _nax_available_for_platform(
-    macos_version: str | None, architecture: str | None
-) -> bool:
-    """Pure parser for MLX's macOS/GPU-generation NAX availability gate.
-
-    MLX 0.31.2 and 0.32.2 require macOS 26.2 or newer. Their architecture
-    parser reads the last two digits as the generation and the final suffix as
-    the device class; phone-class ``p`` needs generation 18 while base/pro,
-    max, and ultra classes need generation 17. Unknown formats fail closed.
-    """
-
-    if not isinstance(macos_version, str) or not isinstance(architecture, str):
-        return False
-    version_match = re.match(r"^\s*(\d+)\.(\d+)(?:\.\d+)?(?:\D.*)?$", macos_version)
-    if version_match is None:
-        return False
-    version = (int(version_match.group(1)), int(version_match.group(2)))
-    if version < (26, 2):
-        return False
-
-    arch_match = re.search(r"(\d{2})([pgsd])$", architecture.lower())
-    if arch_match is None:
-        return False
-    generation = int(arch_match.group(1))
-    suffix = arch_match.group(2)
-    return generation >= (18 if suffix == "p" else 17)
+# One detector for every lane (``mtplx.nax_detect``). ``_mlx_nax_available``
+# is the HARDWARE truth: the TF32 mirror below must match what MLX's own
+# float32 GEMM does on this machine, and MLX does not know our rehearsal
+# switch. Route gates read ``qsa_indexer_select_nax_available`` instead.
+from mtplx.nax_detect import (  # noqa: E402
+    nax_available as _nax_route_available,
+    nax_available_for_platform as _nax_available_for_platform,
+    nax_hardware_available as _mlx_nax_available,
+)
 
 
 @lru_cache(maxsize=1)
@@ -136,13 +89,19 @@ def _mlx_tf32_enabled() -> bool:
 
 
 def qsa_indexer_select_nax_available() -> bool:
-    """Whether MLX can use its NAX float32-matmul numerics on this host.
+    """Whether the NAX lanes may route on this host.
 
     Integration should fail closed to the eager selector for float32 inputs
     when this is false. Half and bfloat inputs do not need this restriction.
+
+    This is the ROUTE gate (the sparse prefill producer and flash consumer,
+    the MPP score kernel, the float32 selector): it honors the rehearsal
+    switch ``MTPLX_FORCE_GPU_FAMILY_FALLBACK=1`` per call, so an M5 can run
+    the exact Flash-Next prefill path an M1 to M4 gets. Before 2.12.0 only
+    the 27B verify lanes honored the switch.
     """
 
-    return _mlx_nax_available()
+    return _nax_route_available()
 
 
 def _require_metal() -> None:

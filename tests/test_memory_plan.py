@@ -169,6 +169,58 @@ def test_fit_is_monotonic_in_ram(weights: int) -> None:
     assert fits == sorted(fits)
 
 
+@pytest.mark.parametrize("model_max", [FLAGSHIP_MAX_CONTEXT, 16_384])
+@pytest.mark.parametrize("measured", [False, True])
+@pytest.mark.parametrize("quant", ["off", "q8"])
+@pytest.mark.parametrize(
+    ("kv", "aux"),
+    # Qwen3.5 4B/9B, Qwen3.8 27B and Bonsai, Qwen3.6 35B-A3B, and a QSA
+    # family with its per-token aux term.
+    [(32_768, 0), (65_536, 0), (20_480, 0), (24_576, 7_872)],
+)
+def test_window_is_monotonic_in_pack_size_and_budget(
+    kv: int, aux: int, quant: str, measured: bool, model_max: int
+) -> None:
+    # Under one budget a lighter pack never plans a smaller window than a
+    # heavier pack of the same geometry, nor a refusal where the heavier
+    # one is admitted; a larger budget never plans less for the same pack.
+    # 2026-09-22: on 16 GiB a 7.53 GiB pack planned 12,288 tokens and an
+    # 8.08 GiB pack 20,480, because the tight-machine rule engaged only for
+    # the heavier one. Budgets 8 to 40 GiB in 0.5 GiB steps; packs 0.25 to
+    # 16 GiB in 32 MiB steps.
+    budgets = [quarter * GIB // 4 for quarter in range(32, 161, 2)]
+    weights = [step * GIB // 32 for step in range(8, 513)]
+    grid = []
+    for budget in budgets:
+        row = []
+        for pack in weights:
+            plan = plan_memory(
+                total_ram_bytes=budget,
+                model_weights_bytes=pack,
+                kv_bytes_per_token=kv,
+                kv_quantization=quant,
+                aux_bytes_per_token=aux,
+                model_max_context=model_max,
+                tight_machine_measured=measured,
+            )
+            row.append((plan.model_fits, plan.context_window_resolved))
+        grid.append(row)
+    lighter_below_heavier = [
+        (budget / GIB, weights[i] / GIB, row[i], row[i + 1])
+        for budget, row in zip(budgets, grid)
+        for i in range(len(weights) - 1)
+        if row[i][1] < row[i + 1][1] or row[i][0] < row[i + 1][0]
+    ]
+    assert not lighter_below_heavier, lighter_below_heavier[:5]
+    larger_budget_below = [
+        (budgets[j] / GIB, pack / GIB, grid[j][i], grid[j + 1][i])
+        for i, pack in enumerate(weights)
+        for j in range(len(budgets) - 1)
+        if grid[j + 1][i][1] < grid[j][i][1] or grid[j + 1][i][0] < grid[j][i][0]
+    ]
+    assert not larger_budget_below, larger_budget_below[:5]
+
+
 @pytest.mark.parametrize("ram_gib", [36, 48, 64, 96, 128])
 @pytest.mark.parametrize("weights", [SPEED_WEIGHTS, QUALITY_WEIGHTS])
 def test_steady_state_always_fits_the_envelope(ram_gib: int, weights: int) -> None:
@@ -235,6 +287,51 @@ def test_budget_beats_the_real_machines_metal_limit() -> None:
         128, memory_budget_bytes=RAM[48], usable_bytes_override=96 * GIB
     )
     assert plan.usable_bytes == 36 * GIB
+
+
+def test_explicit_metal_limit_is_the_engine_budget_both_ways() -> None:
+    # Issue #443: a 96 GB seat serving a 69.2 GiB pack. The default 75%
+    # envelope (72 GiB) refuses it as "does not fit", yet the operator's
+    # explicit MTPLX_MEMORY_LIMIT_BYTES=80G runs it. An explicit limit is
+    # the engine budget, bounded by the machine.
+    weights = int(69.2 * GIB)
+    refused = _plan(96, weights=weights, usable_bytes_override=72 * GIB)
+    assert not refused.model_fits
+    assert refused.usable_source == "formula"
+    assert "MTPLX_MEMORY_LIMIT_BYTES" in " ".join(refused.notes)
+    plan = _plan(
+        96, weights=weights, usable_bytes_override=80 * GIB, usable_bytes_explicit=True
+    )
+    assert plan.usable_bytes == 80 * GIB
+    assert plan.model_fits
+    assert plan.usable_source == "metal_limit"
+    assert "engine budget 80.0G (Metal limit)" in describe_plan(plan)
+    assert "MTPLX_MEMORY_LIMIT_BYTES" not in " ".join(plan.notes)
+    capped = _plan(
+        96, weights=weights, usable_bytes_override=120 * GIB, usable_bytes_explicit=True
+    )
+    assert capped.usable_bytes == RAM[96]
+
+
+def test_default_metal_limit_stays_under_the_formula() -> None:
+    # The server passes its default cap as the override too; only an
+    # operator-set limit may raise the envelope.
+    plan = _plan(96, usable_bytes_override=80 * GIB)
+    assert plan.usable_bytes == 72 * GIB
+    assert plan.usable_source == "formula"
+
+
+def test_explicit_limit_yields_to_a_tighter_budget() -> None:
+    # A simulated 48G seat on a 128G box keeps the budgeted formula even
+    # when the real machine carries an explicit, larger limit.
+    plan = _plan(
+        128,
+        memory_budget_bytes=RAM[48],
+        usable_bytes_override=100 * GIB,
+        usable_bytes_explicit=True,
+    )
+    assert plan.usable_bytes == 36 * GIB
+    assert plan.usable_source == "formula"
 
 
 # ---------------------------------------------------------------------------

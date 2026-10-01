@@ -8,44 +8,36 @@ import mtplx.fast_sampling as fs
 from mtplx.fast_sampling import (
     batched_sparse_distributions_from_mlx_logits,
     sparse_distribution_from_mlx_logits,
+    sparse_distribution_from_mlx_logits_relaxed_ties,
     sparse_distributions_from_mlx_logits,
 )
-from mtplx.sampling import SamplerConfig, distribution_from_logits
+from mtplx.sampling import NonFiniteLogitsError, SamplerConfig, distribution_from_logits
 from mtplx.sampling import sample_from_distribution
 
 
-def test_sparse_distribution_nan_mass_falls_back_to_one_hot():
-    dist = sparse_distribution_from_mlx_logits(
-        mx.array([math.nan, math.nan], dtype=mx.float32),
-        SamplerConfig(temperature=0.6, top_p=0.95, top_k=2),
-    )
-
-    assert dist is not None
-    assert np.isfinite(dist.probs).all()
-    assert dist.probs.sum() == 1.0
+def test_sparse_distribution_nan_mass_is_a_hard_error():
+    # A NaN row used to become a one-hot on token 0 (``!``); it is a fault.
+    with pytest.raises(NonFiniteLogitsError):
+        sparse_distribution_from_mlx_logits(
+            mx.array([math.nan, math.nan], dtype=mx.float32),
+            SamplerConfig(temperature=0.6, top_p=0.95, top_k=2),
+        )
 
 
-def test_sparse_distribution_batch_nan_mass_falls_back_to_one_hot():
-    dists = sparse_distributions_from_mlx_logits(
-        mx.array([[math.nan, math.nan], [1.0, 0.0]], dtype=mx.float32),
-        SamplerConfig(temperature=0.6, top_p=0.95, top_k=2),
-    )
-
-    assert dists is not None
-    assert len(dists) == 2
-    assert np.isfinite(dists[0].probs).all()
-    assert dists[0].probs.sum() == 1.0
+def test_sparse_distribution_batch_nan_mass_is_a_hard_error():
+    with pytest.raises((NonFiniteLogitsError, FloatingPointError)):
+        sparse_distributions_from_mlx_logits(
+            mx.array([[math.nan, math.nan], [1.0, 0.0]], dtype=mx.float32),
+            SamplerConfig(temperature=0.6, top_p=0.95, top_k=2),
+        )
 
 
-def test_batched_sparse_distribution_nan_mass_falls_back_to_one_hot():
-    batch = batched_sparse_distributions_from_mlx_logits(
-        mx.array([[math.nan, math.nan], [1.0, 0.0]], dtype=mx.float32),
-        SamplerConfig(temperature=0.6, top_p=0.95, top_k=2),
-    )
-
-    assert batch is not None
-    assert np.isfinite(batch.probs).all()
-    assert np.allclose(batch.probs.sum(axis=1), 1.0)
+def test_batched_sparse_distribution_nan_mass_is_a_hard_error():
+    with pytest.raises((NonFiniteLogitsError, FloatingPointError, ValueError)):
+        batched_sparse_distributions_from_mlx_logits(
+            mx.array([[math.nan, math.nan], [1.0, 0.0]], dtype=mx.float32),
+            SamplerConfig(temperature=0.6, top_p=0.95, top_k=2),
+        )
 
 
 def test_top_p_one_sparse_distribution_matches_top_k_filtered_sampler():
@@ -115,6 +107,26 @@ def test_single_sparse_sampling_preserves_dense_vocab_order_and_rng():
         dense, dense_rng
     )
     assert sparse_rng.random() == dense_rng.random()
+
+
+def test_relaxed_ties_match_exact_support_probabilities_and_rng_without_ties():
+    logits = np.random.default_rng(91).normal(size=256).astype(np.float32)
+    config = SamplerConfig(temperature=1.0, top_p=0.95, top_k=20)
+    exact = sparse_distribution_from_mlx_logits(mx.array(logits), config)
+    relaxed = sparse_distribution_from_mlx_logits_relaxed_ties(
+        mx.array(logits), config
+    )
+    exact_rng = np.random.default_rng(20260829)
+    relaxed_rng = np.random.default_rng(20260829)
+
+    assert exact is not None
+    assert relaxed is not None
+    assert np.array_equal(relaxed.token_ids, exact.token_ids)
+    assert np.array_equal(relaxed.probs, exact.probs)
+    assert sample_from_distribution(relaxed, relaxed_rng) == sample_from_distribution(
+        exact, exact_rng
+    )
+    assert relaxed_rng.random() == exact_rng.random()
 
 
 def test_sparse_row_list_sampling_preserves_dense_vocab_order_and_rng():

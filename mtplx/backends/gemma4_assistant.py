@@ -1309,16 +1309,20 @@ class Gemma4RollbackRotatingKVCache:
                     return n_tokens
                 if last.get("kind") == "in_place":
                     mx = _require_mlx_core()
+                    # slice_update takes its start as an array (as the
+                    # matching mx.slice in _save_in_place_update already
+                    # passes it); a Python int raises TypeError.
+                    start_index = mx.array(int(last["start"]), dtype=mx.int32)
                     self.keys = mx.slice_update(
                         self.keys,
                         last["old_keys"],
-                        int(last["start"]),
+                        start_index,
                         axes=(2,),
                     )
                     self.values = mx.slice_update(
                         self.values,
                         last["old_values"],
-                        int(last["start"]),
+                        start_index,
                         axes=(2,),
                     )
                     self.offset = int(last["offset"])
@@ -1327,9 +1331,44 @@ class Gemma4RollbackRotatingKVCache:
                     self._replay_committed_prefix(update_keys, update_values, committed)
                     return n_tokens
 
+        # No exact last-update rollback covers this trim: it is the session
+        # bank restoring a prompt-boundary buffer to an earlier prefix (or a
+        # rollback deeper than the last block). The sliding buffer is a
+        # window, not a history, so the trim is exact only when every row the
+        # next forward attends to is still physically present, in temporal
+        # order. Otherwise refuse (return 0): the bank's trim helpers fail
+        # closed to a cold prefill. The old fall-through moved offset/_idx
+        # back and left the trimmed rows in place, where the next in-place
+        # step's front trim and the next concat's temporal rotation both
+        # counted them as history -- silently wrong sliding-window KV on a
+        # one-token suffix, and on any restore deeper than the last warm
+        # turn's suffix.
         n_tokens = min(int(self.offset), n_tokens)
-        self.offset -= n_tokens
-        self._idx = max(self.keep, int(self._idx) - n_tokens)
+        if n_tokens <= 0 or self.keys is None:
+            return 0
+        rows = int(self.keys.shape[2])
+        if self.keep != 0 or int(self._idx) != rows:
+            # A circular buffer (in-place decode has wrapped) or a kept
+            # prefix: the newest rows are not the physical tail.
+            return 0
+        remaining = min(int(self.offset), rows) - n_tokens
+        new_offset = int(self.offset) - n_tokens
+        if remaining != new_offset and remaining < self.max_size:
+            # Partial history (a warm turn's buffer holds max_size-1 window
+            # rows plus that turn's suffix) that would leave less than a
+            # full window before the restore point.
+            return 0
+        if remaining <= 0:
+            self.keys = None
+            self.values = None
+            self.offset = 0
+            self._idx = 0
+            self._last_update = None
+            return n_tokens
+        self.keys = self.keys[..., :remaining, :]
+        self.values = self.values[..., :remaining, :]
+        self.offset = new_offset
+        self._idx = remaining
         self._last_update = None
         return n_tokens
 
@@ -2523,6 +2562,23 @@ def _gemma4_prefill_prompt(
     )
 
 
+def _clone_gemma4_prompt_cache(
+    runtime: Gemma4AssistantRuntime,
+    cache: list[Any],
+) -> list[Any]:
+    """Retain the pre-decode cache before sliding layers evict its history."""
+
+    from mtplx.cache_state import restore_cache, snapshot_cache_lazy_hybrid
+
+    clone = runtime.make_cache()
+    restore_cache(
+        clone,
+        snapshot_cache_lazy_hybrid(cache),
+        clone_states=False,
+    )
+    return clone
+
+
 def _restore_or_prefill_gemma4_prompt(
     runtime: Gemma4AssistantRuntime,
     prompt_ids: list[int],
@@ -2575,6 +2631,92 @@ def _restore_or_prefill_gemma4_prompt(
         policy_fingerprint=session_policy_fingerprint,
     )
     if restored is None:
+        # The prompt diverges from every banked prefix (a rewritten volatile
+        # suffix, a re-rendered turn). Restore the longest compatible common
+        # prefix and prefill only the divergent tail, the way the Qwen path
+        # does in generation._restore_near_prefix: the bank lands the KV one
+        # slot short of the restore point (the seed-forward slot), that seed
+        # token leads the tail forward, so the forward always carries at
+        # least two tokens and takes the sliding-window cache's concat path.
+        candidates = getattr(session_bank, "near_prefix_candidates", None)
+        restore_prefix = getattr(session_bank, "restore_entry_prefix_cache", None)
+        if callable(candidates) and callable(restore_prefix):
+            from mtplx.session_bank import _restore_identity_compatible
+
+            for entry, matched in candidates(
+                prompt_ids,
+                model_path=str(runtime.model_path),
+                mtp_enabled=bool(runtime.mtp_enabled),
+                hidden_variant="gemma4_pre_norm",
+                template_hash=session_template_hash,
+                mtp_history_policy=GEMMA4_SESSION_STATE_POLICY,
+                draft_head_identity=session_draft_head_identity,
+                policy_fingerprint=session_policy_fingerprint,
+            ):
+                matched = int(matched)
+                if (
+                    matched < 2
+                    or matched >= int(getattr(entry, "prefix_len", 0) or 0)
+                    or matched >= len(prompt_ids)
+                    or not _restore_identity_compatible(
+                        entry,
+                        model_path=str(runtime.model_path),
+                        mtp_enabled=bool(runtime.mtp_enabled),
+                        hidden_variant="gemma4_pre_norm",
+                        template_hash=session_template_hash,
+                        mtp_history_policy=GEMMA4_SESSION_STATE_POLICY,
+                        draft_head_identity=session_draft_head_identity,
+                        policy_fingerprint=session_policy_fingerprint,
+                    )
+                ):
+                    continue
+                prefix_restore = restore_prefix(
+                    runtime,
+                    entry,
+                    matched,
+                    mode=session_restore_mode,
+                )
+                if prefix_restore is None:
+                    continue
+                boundary_hidden = None
+                if len(prefix_restore) == 5:
+                    cache, _history, storage_mode, restore_point, boundary_hidden = (
+                        prefix_restore
+                    )
+                elif len(prefix_restore) == 4:
+                    cache, _history, storage_mode, restore_point = prefix_restore
+                else:
+                    cache, _history, storage_mode = prefix_restore
+                    restore_point = matched
+                restore_point = int(restore_point)
+                if boundary_hidden is not None or restore_point != matched:
+                    # Boundary-true restores exist for recurrent entries.
+                    # Gemma 4 caches are all trimmable attention KV; a bank
+                    # that lands anywhere but the requested prefix is not
+                    # speaking this contract. Fail closed to the next one.
+                    continue
+                seed = restore_point - 1
+                output, _suffix_elapsed = _gemma4_prefill_prompt(
+                    runtime,
+                    list(prompt_ids[seed:]),
+                    cache=cache,
+                    phase="prefill",
+                )
+                entry.hits += 1
+                entry.last_access_s = time.time()
+                return Gemma4PromptState(
+                    cache=cache,
+                    logits=output.logits[:, -1, :],
+                    hidden=output.hidden[:, -1:, :],
+                    shared_kv_states=output.shared_kv_states,
+                    kv_offset=int(output.cache_offset),
+                    prompt_eval_time_s=time.perf_counter() - started,
+                    cached_tokens=seed,
+                    suffix_tokens=len(prompt_ids) - seed,
+                    cache_hit=True,
+                    cache_miss_reason=None,
+                    restore_mode=f"block_prefix_{storage_mode}",
+                )
         return cold_prefill(getattr(session_bank, "last_miss_reason", None))
 
     suffix = list(prompt_ids[restored.entry.prefix_len :])
@@ -2652,6 +2794,7 @@ def generate_gemma4_ar(
         GenerationOutput,
         GenerationStats,
         _generation_rate_fields,
+        _long_cycle_stop,
         _repetition_stop_config,
         _sample_from_logits,
         _trim_repeated_suffix,
@@ -2715,6 +2858,13 @@ def generate_gemma4_ar(
         except Exception:
             pass
     cache = prompt_state.cache
+    prompt_boundary_cache = (
+        _clone_gemma4_prompt_cache(runtime, cache) if capture_final_state else None
+    )
+    prompt_boundary_extra_state = _gemma4_session_extra_state(
+        shared_kv_states=prompt_state.shared_kv_states,
+        kv_offset=int(prompt_state.kv_offset),
+    )
     logits = prompt_state.logits
     hidden = prompt_state.hidden
     shared_kv_states = prompt_state.shared_kv_states
@@ -2725,6 +2875,7 @@ def generate_gemma4_ar(
     events: list[dict[str, Any]] = []
     pending_token_needs_commit = False
     repetition_config = _repetition_stop_config(bool(repetition_stop))
+    repetition_long_cycle = _long_cycle_stop(repetition_config)
     repetition_result = None
     wire = _Gemma4RepetitionAwareWire(
         tokens,
@@ -2740,13 +2891,15 @@ def generate_gemma4_ar(
         pending_token_needs_commit = True
         events.append({"step": int(step), "token": token})
         wire.emit()
-        repetition_result = _trim_repeated_suffix(tokens, repetition_config)
+        repetition_result = _trim_repeated_suffix(
+            tokens, repetition_config, repetition_long_cycle
+        )
         if repetition_result is not None:
             events.append(
                 {
                     "step": int(step),
                     "repetition_stop": {
-                        "reason": "exact_repeated_token_suffix",
+                        "reason": repetition_result.reason,
                         "block_tokens": repetition_result.block_tokens,
                         "repeats": repetition_result.repeats,
                         "trimmed_tokens": repetition_result.repeated_tokens,
@@ -2806,6 +2959,10 @@ def generate_gemma4_ar(
             safe_to_commit=not pending_token_needs_commit,
             finish_reason=finish_reason,
             extra_state=extra_state,
+            prompt_boundary_cache=prompt_boundary_cache,
+            prompt_boundary_logits=prompt_state.logits,
+            prompt_boundary_hidden=prompt_state.hidden,
+            prompt_boundary_extra_state=prompt_boundary_extra_state,
         )
     stats = GenerationStats(
         mode="ar",
@@ -2832,7 +2989,7 @@ def generate_gemma4_ar(
         peak_memory_bytes=int(mx.get_peak_memory()),
         repetition_stop_triggered=repetition_result is not None,
         repetition_stop_reason=(
-            "exact_repeated_token_suffix" if repetition_result is not None else None
+            repetition_result.reason if repetition_result is not None else None
         ),
         repetition_stop_block_tokens=(
             0 if repetition_result is None else repetition_result.block_tokens
@@ -2890,6 +3047,7 @@ def generate_gemma4_assistant(
         GenerationOutput,
         GenerationStats,
         _generation_rate_fields,
+        _long_cycle_stop,
         _repetition_stop_config,
         _sample_from_logits,
         _trim_repeated_suffix,
@@ -2959,6 +3117,13 @@ def generate_gemma4_assistant(
         except Exception:
             pass
     cache = prompt_state.cache
+    prompt_boundary_cache = (
+        _clone_gemma4_prompt_cache(runtime, cache) if capture_final_state else None
+    )
+    prompt_boundary_extra_state = _gemma4_session_extra_state(
+        shared_kv_states=prompt_state.shared_kv_states,
+        kv_offset=int(prompt_state.kv_offset),
+    )
 
     tokens: list[int] = []
     stats_depth = max_block_size if adaptive_draft else block_size
@@ -2998,6 +3163,7 @@ def generate_gemma4_assistant(
     pending_primary_needs_commit = False
     safe_to_commit = True
     repetition_config = _repetition_stop_config(bool(repetition_stop))
+    repetition_long_cycle = _long_cycle_stop(repetition_config)
     repetition_result = None
     wire = _Gemma4RepetitionAwareWire(
         tokens,
@@ -3013,13 +3179,15 @@ def generate_gemma4_assistant(
         pending_primary_needs_commit = True
         events.append({"step": len(tokens) - 1, "token": primary, "source": "target"})
         wire.emit()
-        repetition_result = _trim_repeated_suffix(tokens, repetition_config)
+        repetition_result = _trim_repeated_suffix(
+            tokens, repetition_config, repetition_long_cycle
+        )
         if repetition_result is not None:
             events.append(
                 {
                     "step": len(tokens) - 1,
                     "repetition_stop": {
-                        "reason": "exact_repeated_token_suffix",
+                        "reason": repetition_result.reason,
                         "block_tokens": repetition_result.block_tokens,
                         "repeats": repetition_result.repeats,
                         "trimmed_tokens": repetition_result.repeated_tokens,
@@ -3101,13 +3269,15 @@ def generate_gemma4_assistant(
                 accepted_by_depth[depth] += 1
             events.append({"step": len(tokens) - 1, "token": token, "source": "assistant"})
             wire.emit()
-            repetition_result = _trim_repeated_suffix(tokens, repetition_config)
+            repetition_result = _trim_repeated_suffix(
+                tokens, repetition_config, repetition_long_cycle
+            )
             if repetition_result is not None:
                 events.append(
                     {
                         "step": len(tokens) - 1,
                         "repetition_stop": {
-                            "reason": "exact_repeated_token_suffix",
+                            "reason": repetition_result.reason,
                             "block_tokens": repetition_result.block_tokens,
                             "repeats": repetition_result.repeats,
                             "trimmed_tokens": repetition_result.repeated_tokens,
@@ -3257,7 +3427,7 @@ def generate_gemma4_assistant(
         peak_memory_bytes=int(mx.get_peak_memory()),
         repetition_stop_triggered=repetition_result is not None,
         repetition_stop_reason=(
-            "exact_repeated_token_suffix" if repetition_result is not None else None
+            repetition_result.reason if repetition_result is not None else None
         ),
         repetition_stop_block_tokens=(
             0 if repetition_result is None else repetition_result.block_tokens
@@ -3332,6 +3502,10 @@ def generate_gemma4_assistant(
                 shared_kv_states=shared_kv_states,
                 kv_offset=int(kv_offset),
             ),
+            prompt_boundary_cache=prompt_boundary_cache,
+            prompt_boundary_logits=prompt_state.logits,
+            prompt_boundary_hidden=prompt_state.hidden,
+            prompt_boundary_extra_state=prompt_boundary_extra_state,
         )
     return GenerationOutput(
         tokens=tokens,

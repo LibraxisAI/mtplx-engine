@@ -148,6 +148,39 @@ def ramp_similarity_span() -> int:
         return 24
 
 
+class JoinedTokens:
+    """Prompt plus generated tokens as one read-only sequence.
+
+    The copy-lane probe runs once per decode round and only reads the last few
+    tokens and a handful of prompt positions. Building ``prompt_ids + tokens``
+    for it copied the whole prompt every round: about a millisecond of host
+    time per round at 131K tokens, inside the gap where the GPU waits for the
+    next round. Indexing and slicing return the same values the concatenated
+    list would.
+    """
+
+    __slots__ = ("_head", "_tail", "_split")
+
+    def __init__(self, head: list[int], tail: list[int]) -> None:
+        self._head = head
+        self._tail = tail
+        self._split = len(head)
+
+    def __len__(self) -> int:
+        return self._split + len(self._tail)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(len(self)))]
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError("JoinedTokens index out of range")
+        if index < self._split:
+            return self._head[index]
+        return self._tail[index - self._split]
+
+
 class _RampFuzzyAnchor:
     """Mismatch-tolerant short-anchor fallback, consulted only after the exact
     ng_min-gram index misses. Anchors on a shorter `anchor_len`-gram and ranks

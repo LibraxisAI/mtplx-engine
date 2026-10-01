@@ -22,10 +22,9 @@ from mtplx.memory_plan import (
     GIB,
     NGRAM_TABLE_FILENAME,
     describe_plan,
-    ngram_table_resident_policy,
     plan_memory,
 )
-from mtplx.models.qwen4_exp import NGramTable, _ngram_resident_policy
+from mtplx.models.qwen4_exp import Model, NGramTable
 
 ROWS, DIM, GROUP, BITS = 64, 64, 32, 4
 
@@ -153,15 +152,29 @@ def test_model_weights_bytes_excludes_streamed_table(tmp_path):
     assert ngram_table_bytes(tmp_path / "missing") == 0
 
 
-def test_resident_policy_env_pins_and_single_source(monkeypatch):
-    monkeypatch.setenv("MTPLX_NGRAM_RESIDENT", "1")
-    assert ngram_table_resident_policy() is True
-    assert _ngram_resident_policy() is True
-    monkeypatch.setenv("MTPLX_NGRAM_RESIDENT", "0")
-    assert ngram_table_resident_policy() is False
-    assert _ngram_resident_policy() is False
-    monkeypatch.setenv("MTPLX_NGRAM_RESIDENT", "auto")
-    assert isinstance(ngram_table_resident_policy(), bool)
+def test_post_weight_load_streams_the_table_and_never_loads_it(tmp_path, monkeypatch):
+    # Every Mac, whatever its RAM: gathers read the SSD sidecar, and no copy
+    # of the table is ever loaded into MLX memory (a 29.8 GiB resident copy
+    # on 160 GiB+ Macs was read by nothing).
+    from types import SimpleNamespace
+
+    class _Layer(dict):
+        __getattr__ = dict.__getitem__
+
+    path = tmp_path / NGRAM_TABLE_FILENAME
+    ref = _write_quantized_table(path)
+    table = NGramTable(ROWS, DIM, sidecar=True)
+    layer = _Layer(ple=SimpleNamespace(ple_embedding=SimpleNamespace(ngram_embedding=table)))
+
+    def _no_load(*_args, **_kwargs):
+        raise AssertionError("the n-gram table must never be loaded into MLX memory")
+
+    monkeypatch.setattr(mx, "load", _no_load)
+    Model.post_weight_load(SimpleNamespace(layers=[layer]), tmp_path)
+
+    assert table._sidecar is not None
+    ids = np.array([0, 5, 5, ROWS - 1], dtype=np.int64)
+    assert np.array_equal(_gather(table, ids), np.asarray(ref.astype(mx.float32))[ids])
 
 
 def test_plan_streams_table_as_note_not_commitment():
@@ -200,10 +213,7 @@ def test_hot_cache_env_parse_is_forgiving(tmp_path, monkeypatch, value):
     assert table._sidecar._hot_cap_rows > 0  # bad value falls back to default
 
 
-@pytest.mark.parametrize("resident", [False, True])
-def test_memory_attribution_counts_table_only_when_resident(
-    tmp_path, monkeypatch, resident
-):
+def test_memory_attribution_never_counts_the_streamed_table(tmp_path):
     from types import SimpleNamespace
 
     from mtplx.server.openai import _memory_attribution
@@ -211,10 +221,7 @@ def test_memory_attribution_counts_table_only_when_resident(
     shard = mx.zeros((256, 8), dtype=mx.float16)
     mx.save_safetensors(str(tmp_path / "model.safetensors"), {"w": shard})
     _write_quantized_table(tmp_path / NGRAM_TABLE_FILENAME)
-    monkeypatch.setenv("MTPLX_NGRAM_RESIDENT", "1" if resident else "0")
 
     state = SimpleNamespace(args=SimpleNamespace(model=str(tmp_path)))
     weights = _memory_attribution(state)["model_weights_bytes"]
-    shard_bytes = (tmp_path / "model.safetensors").stat().st_size
-    table_bytes = (tmp_path / NGRAM_TABLE_FILENAME).stat().st_size
-    assert weights == shard_bytes + (table_bytes if resident else 0)
+    assert weights == (tmp_path / "model.safetensors").stat().st_size

@@ -6,6 +6,8 @@ from mtplx.diagnostics import (
     required_download_free_bytes,
     write_doctor_bundle,
 )
+from mtplx.hf_loader import safe_model_name
+from mtplx.profiles import DEFAULT_HF_MODEL_ID
 
 
 def _write_minimal_complete_model(path) -> None:
@@ -47,6 +49,7 @@ def test_diagnostics_payload_has_production_checks(tmp_path) -> None:
         "python.native_arm64",
         "python.version",
         "mlx.import",
+        "runtime.identity",
         "resource.memory",
         "resource.model_cache_disk",
         "model.cache",
@@ -106,6 +109,27 @@ def test_model_cache_check_honors_explicit_cache_dir_even_with_local_default(
     assert check["fix"] == "Download the default model before first run."
 
 
+def test_model_cache_check_finds_complete_default_in_secondary_root(tmp_path) -> None:
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    model = secondary / safe_model_name(DEFAULT_HF_MODEL_ID)
+    _write_minimal_complete_model(model)
+
+    payload = build_diagnostics_payload(
+        model_cache=primary,
+        model_search_dirs=[secondary],
+        include_startup_default_model=False,
+    )
+
+    assert payload["host"]["model_dirs"] == [
+        str(primary.resolve()),
+        str(secondary.resolve()),
+    ]
+    check = next(item for item in payload["checks"] if item["id"] == "model.cache")
+    assert check["status"] == "pass"
+    assert check["observed"]["hf_cache_path"] == str(model)
+
+
 def test_write_doctor_bundle_creates_redacted_zip(tmp_path) -> None:
     report = {
         "environment": {"project_root": "/Users/example/private"},
@@ -118,3 +142,52 @@ def test_write_doctor_bundle_creates_redacted_zip(tmp_path) -> None:
     assert bundle["bundle_zip"].endswith(".zip")
     assert (tmp_path / bundle["bundle_id"] / "doctor.json").exists()
     assert (tmp_path / f"{bundle['bundle_id']}.zip").exists()
+
+
+def test_runtime_identity_flags_a_foreign_launcher_on_path(tmp_path, monkeypatch) -> None:
+    """Issue #479: an installer shim ahead of the venv on PATH answers with an
+    older MTPLX; the doctor names the mismatch instead of leaving it to the
+    paste."""
+    import sys
+
+    from mtplx import diagnostics
+
+    foreign = tmp_path / "other-venv" / "bin" / "mtplx"
+    foreign.parent.mkdir(parents=True)
+    foreign.write_text("#!/bin/sh\nexec /somewhere/else/bin/python -m mtplx \"$@\"\n")
+    monkeypatch.setattr(diagnostics.shutil, "which", lambda name: str(foreign))
+    identity = diagnostics.runtime_identity({"gpu_architecture": "applegpu_g14s"})
+    assert identity["launcher_matches_this_python"] is False
+    assert identity["mtplx_on_path"] == str(foreign)
+    assert identity["gpu_architecture"] == "applegpu_g14s"
+    assert identity["python_executable"] == sys.executable
+
+    checks = {c["id"]: c for c in diagnostics.build_diagnostics_payload(
+        model_cache=tmp_path, mlx_info={"mlx_error": "missing"}, thermal_control={"available": False}
+    )["checks"]}
+    assert checks["runtime.identity"]["status"] == "warn"
+    assert checks["runtime.identity"]["command"] == "which -a mtplx"
+
+
+def test_runtime_identity_accepts_a_shim_naming_this_venv(tmp_path, monkeypatch) -> None:
+    import sys
+    from pathlib import Path
+
+    from mtplx import diagnostics
+
+    shim = tmp_path / "shim" / "mtplx"
+    shim.parent.mkdir(parents=True)
+    this_bin = Path(sys.executable).resolve().parent
+    shim.write_text(f"#!/bin/sh\nexec {this_bin}/python -m mtplx \"$@\"\n")
+    monkeypatch.setattr(diagnostics.shutil, "which", lambda name: str(shim))
+    identity = diagnostics.runtime_identity(None)
+    assert identity["launcher_matches_this_python"] is True
+    assert "gpu_architecture" not in identity
+
+    monkeypatch.setattr(diagnostics.shutil, "which", lambda name: None)
+    identity = diagnostics.runtime_identity(None)
+    assert identity["launcher_matches_this_python"] is None
+    checks = {c["id"]: c for c in diagnostics.build_diagnostics_payload(
+        model_cache=tmp_path, mlx_info={"mlx_error": "missing"}, thermal_control={"available": False}
+    )["checks"]}
+    assert checks["runtime.identity"]["status"] == "pass"

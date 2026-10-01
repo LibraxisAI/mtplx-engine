@@ -64,6 +64,20 @@ TRANSIENT_RESERVE_CAP_BYTES = 16 * GIB
 BANK_FLOOR_BYTES = 1 * GIB
 BANK_CAP_BYTES = 48 * GIB
 
+# Margin over RUNTIME_TRANSIENTS_BYTES that the tight-machine admission
+# (below) charges instead of the bank floor. Measured 2026-09-21 on the
+# Bonsai 2 27B pack (8.23 GiB weights, MTP head and vision weights resident)
+# under the 16, 18 and 24 GiB class budgets: the text-decode peak sat 3.056
+# to 3.075 GiB above weights plus dense KV in every completed row (4K, 8K
+# and 16K prompts, with and without a 1K decode), i.e. the 3 GiB constant
+# plus at most 77 MiB. 256 MiB is a bit over three times that excess. One
+# pack's text decode is the whole evidence, so the admission is offered only
+# to packs no heavier than that one, or to a pack that stamps its own
+# measurement (``measured_on_tight_machine``).
+TIGHT_MACHINE_MARGIN_BYTES = 256 * 1024 * 1024
+# Bonsai 2 27B's resident weights (model + MTP files), the measured pack.
+TIGHT_MACHINE_MAX_WEIGHTS_BYTES = 8_834_412_216
+
 # Context windows resolve on 4096-token blocks (the cold tier's restore
 # granularity); the floor is one block. Below one block the model simply
 # does not fit the machine and the plan says so instead of inventing a
@@ -72,43 +86,14 @@ CONTEXT_ALIGN_TOKENS = 4096
 CONTEXT_FLOOR_TOKENS = 4096
 
 # The Qwen3.8-Flash-Next n-gram sidecar (ngram-table.safetensors, ~30 GiB)
-# serves in one of two modes, and the plan must count it exactly one way:
-#
-# * streamed (the default): row gathers read numpy memmaps over the file, so
-#   only touched pages ever become resident, they are clean file-backed
-#   pages, and macOS reclaims them under pressure. NOT a commitment.
-#   Counting it as weights anyway was a real shipped-defect chain
-#   (2026-08-28): a 128G Mac planned ~99G of "weights", printed MODEL DOES
-#   NOT FIT, and shrank both the context window and the session bank by
-#   30G — while the engine actually served fine at ~69G resident.
-# * resident (pinned, or auto on >=160 GiB machines): the table is
-#   materialized into MLX allocator memory once at load so the pipelined-AR
-#   lane can gather in-graph. A true commitment; counts as weights.
+# streams from SSD on every Mac: row gathers read numpy memmaps over the
+# file, so only touched pages ever become resident, they are clean
+# file-backed pages, and macOS reclaims them under pressure. NOT a
+# commitment. Counting it as weights anyway was a real shipped-defect chain
+# (2026-08-28): a 128G Mac planned ~99G of "weights", printed MODEL DOES NOT
+# FIT, and shrank both the context window and the session bank by 30G —
+# while the engine actually served fine at ~69G resident.
 NGRAM_TABLE_FILENAME = "ngram-table.safetensors"
-NGRAM_RESIDENT_AUTO_MIN_RAM_BYTES = 160 * GIB
-
-
-def ngram_table_resident_policy() -> bool:
-    """Single source of the table's resident-vs-streamed decision.
-
-    The model backend (gather lanes), the server's Metal floor, and the
-    memory plan all consult THIS function, so behavior and accounting can
-    never disagree. MTPLX_NGRAM_RESIDENT=1/0 pins it; the "auto" default
-    arms residency only at >=160 GiB RAM: on a 128 GiB M5 Max the resident
-    set (~99G pack + table) left no headroom over the user's own apps —
-    two Jetsam events and a watchdogd-starved kernel panic (2026-08-26
-    receipts). 128G-class machines stream the table from SSD.
-    """
-    raw = (os.environ.get("MTPLX_NGRAM_RESIDENT") or "auto").strip().lower()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "no", "off"}:
-        return False
-    try:
-        total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-    except (ValueError, OSError):
-        return False
-    return total >= NGRAM_RESIDENT_AUTO_MIN_RAM_BYTES
 
 # Dense-attention KV bytes per token for the flagship geometry
 # (16 full-attention layers x K+V x 4 KV heads x head_dim 256 x bf16
@@ -280,6 +265,72 @@ def usable_engine_bytes(total_ram_bytes: int) -> int:
     )
 
 
+def system_reserve_bytes(total_ram_bytes: int) -> int:
+    """Unwired headroom macOS keeps outside the allocator caps.
+
+    16 GiB is right on 128 GB+ machines, but as a flat constant it refused
+    the 96 GB class by exactly the release notes' own margin (issue #400:
+    77.3 GiB weights + 6 GiB floor margin + 16 GiB = 99.3 > 96, while the
+    same pack ships healthy there with about 16 GiB left unwired). Scale to
+    RAM/8 below 128 GB, floored at 8 GiB, and keep 128 GB+ unchanged.
+
+    Lives here (pure arithmetic) so the Metal caps, the planner and the
+    planner replay in the tests read one rule.
+    """
+    return int(min(16 * GIB, max(8 * GIB, int(total_ram_bytes) // 8)))
+
+
+def engine_envelope_bytes(
+    total_ram_bytes: int, *, resident_floor_bytes: int | None = None
+) -> int:
+    """The allocator envelope for this machine AND this model.
+
+    The 75% rule for every model whose weights sit under it. A family that
+    declares a resident floor above that rule (Flash-Next on a 96 GB Mac:
+    77.3 GiB of weights + margin against a 72 GiB envelope) is admitted by
+    the Metal caps on the ground that floor + system reserve fits the
+    machine. The same ground defines its envelope: everything outside the
+    system reserve. Before this rule the caps raised the limit to the bare
+    floor (80.3 GiB) while the planner kept budgeting 72 GiB, so the
+    catalog offered the pack, the planner printed MODEL DOES NOT FIT, and
+    the fixed-M4 gate (0.97 of a limit that equals the weights) skipped the
+    compiled verifier on nearly every request.
+
+    Never below the floor; seats whose 75% envelope already covers the
+    floor (128 GB and up for Flash-Next) are unchanged.
+    """
+    total = int(total_ram_bytes)
+    base = usable_engine_bytes(total)
+    floor = max(0, int(resident_floor_bytes or 0))
+    if floor <= base:
+        return base
+    return min(total, max(floor, total - system_reserve_bytes(total)))
+
+
+def measured_on_tight_machine(contract: Any, model_weights_bytes: int | None) -> bool:
+    """Whether a pack's runtime contract carries its own tight-machine peaks.
+
+    ``memory_evidence`` is the measured memory table the pack builder stamps
+    (scripts/bonsai_memory_table.py; today only the Bonsai 2 pack has one).
+    It counts when it measured these exact weights and holds a row the
+    tight-machine rule admitted that completed inside its engine budget.
+    """
+    evidence = contract.get("memory_evidence") if isinstance(contract, dict) else None
+    if not isinstance(evidence, dict):
+        return False
+    pack = evidence.get("pack")
+    if not isinstance(pack, dict) or pack.get("weights_bytes") != model_weights_bytes:
+        return False
+    return any(
+        isinstance(row, dict)
+        and row.get("completed") is True
+        and row.get("within_engine_budget") is True
+        and isinstance(row.get("planner"), dict)
+        and row["planner"].get("tight_machine") is True
+        for row in evidence.get("rows") or ()
+    )
+
+
 def _align_down(tokens: int) -> int:
     return (int(tokens) // CONTEXT_ALIGN_TOKENS) * CONTEXT_ALIGN_TOKENS
 
@@ -301,10 +352,9 @@ class MemoryPlan:
     memory_budget_bytes: int | None = None
     usable_bytes: int = 0
     model_weights_bytes: int = 0
-    # Flash-Next n-gram sidecar bytes when it STREAMS from SSD (0 for every
-    # other model, and 0 when the resident policy folds it into weights).
-    # Carried so the banner/app can say where the other ~30G of the pack
-    # lives instead of the number silently not adding up to the disk size.
+    # Flash-Next n-gram sidecar bytes, streamed from SSD (0 for every other
+    # model). Carried so the banner/app can say where the other ~30G of the
+    # pack lives instead of the number silently not adding up to the disk size.
     ngram_table_streamed_bytes: int = 0
     kv_bytes_per_token: int = DEFAULT_DENSE_KV_BYTES_PER_TOKEN
     kv_quantization: str = "off"
@@ -340,7 +390,23 @@ class MemoryPlan:
     bank_idle_max_bytes: int = BANK_FLOOR_BYTES
     bank_steady_bytes: int = BANK_FLOOR_BYTES
 
+    # The runtime transient and the bank floor this plan was solved with.
+    # Both equal the module constants on every machine that funds the
+    # bank floor with at least the tight rule's largest window (the 128 GB
+    # resolution does not move by a byte); on a tight machine
+    # (``tight_machine``) the transient carries the measured margin and
+    # the floor is zero: the warm cache yields fully to live KV and
+    # restores come from the SSD tier.
+    runtime_transients_bytes: int = RUNTIME_TRANSIENTS_BYTES
+    bank_floor_bytes: int = BANK_FLOOR_BYTES
+    tight_machine: bool = False
+
     headroom_bytes: int = 0
+    # "formula" (the 75% envelope on the planning RAM), "metal_limit" (the
+    # Metal cap the server configured decided the engine budget) or
+    # "resident_floor" (the family's wired floor sits above the 75% rule, so
+    # the envelope is everything outside the system reserve).
+    usable_source: str = "formula"
     notes: tuple[str, ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict[str, Any]:
@@ -372,7 +438,9 @@ class MemoryPlan:
             "kv_reserve_bytes": int(self.kv_reserve_bytes),
             "bank_idle_max_bytes": int(self.bank_idle_max_bytes),
             "bank_steady_bytes": int(self.bank_steady_bytes),
-            "runtime_transients_bytes": int(RUNTIME_TRANSIENTS_BYTES),
+            "runtime_transients_bytes": int(self.runtime_transients_bytes),
+            "bank_floor_bytes": int(self.bank_floor_bytes),
+            "tight_machine": bool(self.tight_machine),
             "headroom_bytes": int(self.headroom_bytes),
             "notes": list(self.notes),
         }
@@ -396,6 +464,9 @@ def plan_memory(
     ngram_table_streamed_bytes: int = 0,
     aux_bytes_per_token: int = 0,
     prefill_transient_bytes_per_token: int = 0,
+    usable_bytes_explicit: bool = False,
+    resident_floor_bytes: int | None = None,
+    tight_machine_measured: bool = False,
 ) -> MemoryPlan:
     """Solve the machine's memory geometry.
 
@@ -404,7 +475,20 @@ def plan_memory(
     the whole stack down, and the way a 128 GB dev box tests a 48 GB
     seat. ``usable_bytes_override`` lets the server pass the Metal memory
     limit it actually configured instead of this module's mirror of the
-    default formula.
+    default formula; with ``usable_bytes_explicit`` (the operator set
+    MTPLX_MEMORY_LIMIT_BYTES) that limit is the engine budget both ways,
+    bounded by the machine (#443: a 96 GB seat serving a 69 GiB pack).
+    ``resident_floor_bytes`` is the wired floor a family declares (weights
+    plus working margin); when it exceeds the 75% rule the envelope is
+    everything outside the system reserve (``engine_envelope_bytes``), the
+    same number the Metal caps configure, on a real seat and on a seat
+    simulated with --memory-budget alike. A machine that cannot fund the
+    bank floor still runs a pack no heavier than the measured one
+    (``TIGHT_MACHINE_MAX_WEIGHTS_BYTES``), or a pack that stamps its own
+    tight-machine peaks (``tight_machine_measured``). A lighter such pack
+    whose floor leaves it less context than that rule grants a heavier
+    one yields its floor too, so a lighter pack never plans a smaller
+    window than a heavier pack of the same geometry.
     """
     if total_ram_bytes is None or int(total_ram_bytes) <= 0:
         return _unavailable("total_ram_unknown")
@@ -422,14 +506,32 @@ def plan_memory(
     else:
         planning_ram = total_ram
         budget = None
+    usable_source = "formula"
     if usable_bytes_override is not None and int(usable_bytes_override) > 0:
-        # The override is the Metal limit the server actually configured —
+        # The override is the Metal limit the server actually configured,
         # computed from the REAL machine. Under a tighter --memory-budget
         # the formula on the planning RAM must still win, or a simulated
-        # 48G seat would inherit the 128G box's 96G envelope.
-        usable = min(int(usable_bytes_override), usable_engine_bytes(planning_ram))
+        # 48G seat would inherit the 128G box's 96G envelope. An operator's
+        # explicit limit (MTPLX_MEMORY_LIMIT_BYTES) is the engine budget in
+        # both directions, bounded by the machine: issue #443's 96 GB seat
+        # runs a 69.2 GiB pack under an 80G limit that the 72G formula
+        # refused as "does not fit".
+        override = int(usable_bytes_override)
+        envelope = engine_envelope_bytes(
+            planning_ram, resident_floor_bytes=resident_floor_bytes
+        )
+        if usable_bytes_explicit and planning_ram >= total_ram:
+            usable = min(override, total_ram)
+        else:
+            usable = min(override, envelope)
+        if usable == override and (usable_bytes_explicit or override < envelope):
+            usable_source = "metal_limit"
     else:
-        usable = usable_engine_bytes(planning_ram)
+        usable = engine_envelope_bytes(
+            planning_ram, resident_floor_bytes=resident_floor_bytes
+        )
+    if usable_source == "formula" and usable > usable_engine_bytes(planning_ram):
+        usable_source = "resident_floor"
 
     weights = int(model_weights_bytes)
     notes: list[str] = []
@@ -446,15 +548,88 @@ def plan_memory(
     kv_budget = usable - weights - RUNTIME_TRANSIENTS_BYTES - BANK_FLOOR_BYTES
     fit_raw = _align_down(max(0, kv_budget) // per_token)
     model_fits = fit_raw >= CONTEXT_FLOOR_TOKENS
+    model_cap = int(model_max_context) if model_max_context else None
+    transients = RUNTIME_TRANSIENTS_BYTES
+    bank_floor = BANK_FLOOR_BYTES
+    tight_machine = False
+    if tight_machine_measured or weights <= TIGHT_MACHINE_MAX_WEIGHTS_BYTES:
+        # Tight machine: the resident session bank yields. The refusal
+        # above charges the 1 GiB bank floor as if it were a physical need;
+        # it is a clamp on the warm cache, and a machine that cannot fund
+        # it can still run the model. Measured 2026-09-21 (Bonsai 2 27B,
+        # 8.23 GiB weights, 16 GiB class at the 12 GiB budget): the peak
+        # with no resident bank is weights + dense KV + 3.06 to 3.08 GiB
+        # (4K 11.55 GiB, 8K 11.78 to 11.80 GiB under the budget; 16K 12.11
+        # GiB over it). The q8 KV setting did not lower that peak (below
+        # the paged ceiling the dense lane holds KV at full width: the 16K
+        # peaks were byte-identical for off and q8), so this fit counts KV
+        # at its dense width. Admit with the bank floor at zero and the
+        # measured margin; the SSD tier keeps restores working.
+        #
+        # A pack the floor refuses is short of one block of KV with it, so
+        # the most this rule grants is that block plus the floor net of the
+        # margin, at the dense rate (``tight_ceiling``). A lighter pack whose
+        # floor leaves it less than that yields its floor as well and takes
+        # that window; otherwise a heavier pack plans more context than a
+        # lighter one (2026-09-22: a 7.53 GiB MiMo build planned 12,288
+        # tokens on 16 GiB while the 8.08 GiB Qwen3.5-9B planned 20,480).
+        # Stopping at the ceiling keeps the window monotonic in pack size,
+        # and a pack whose floor-funded window reaches it keeps its floor.
+        tight_transients = RUNTIME_TRANSIENTS_BYTES + TIGHT_MACHINE_MARGIN_BYTES
+        tight_per_token = kv_per_token + aux_pt + transient_pt
+        tight_budget = usable - weights - tight_transients
+        tight_ceiling = _align_down(
+            (
+                CONTEXT_FLOOR_TOKENS * per_token
+                - 1
+                + BANK_FLOOR_BYTES
+                - TIGHT_MACHINE_MARGIN_BYTES
+            )
+            // tight_per_token
+        )
+        tight_own = _align_down(max(0, tight_budget) // tight_per_token)
+        tight_fit = min(tight_own, tight_ceiling)
+        if (
+            tight_fit >= CONTEXT_FLOOR_TOKENS
+            and tight_fit > fit_raw
+            and (model_cap is None or fit_raw < model_cap)
+        ):
+            model_fits = True
+            tight_machine = True
+            fit_raw = tight_fit
+            transients = tight_transients
+            bank_floor = 0
+            # The reserve and the server's admission arithmetic read this
+            # rate; under the paged ceiling the measured KV is dense.
+            kv_effective = kv_per_token
+            notes.append(
+                "tight machine: the session bank has no floor (the warm "
+                "cache yields fully to live KV; restores come from SSD) and "
+                f"KV is counted at its dense width; weights {weights / GIB:.1f}"
+                f" GiB + runtime {tight_transients / GIB:.2f} GiB leave "
+                f"{tight_budget / GIB:.2f} GiB for KV under the "
+                f"{usable / GIB:.1f} GiB engine budget"
+                + (
+                    f"; the window stops at {tight_ceiling} tokens, the most "
+                    "this rule grants a pack that cannot fund the floor"
+                    if tight_own > tight_ceiling
+                    else ""
+                )
+            )
     if not model_fits:
         notes.append(
             "model does not fit: weights + minimum runtime need "
             f"{(weights + RUNTIME_TRANSIENTS_BYTES + BANK_FLOOR_BYTES + kv_effective * CONTEXT_FLOOR_TOKENS) / GIB:.1f}"
             f" GiB but the engine budget is {usable / GIB:.1f} GiB"
+            + (
+                ""
+                if usable_source != "formula"
+                else "; MTPLX_MEMORY_LIMIT_BYTES sets the engine budget past the"
+                " default envelope (swap past the fit is then yours)"
+            )
         )
         fit_raw = CONTEXT_FLOOR_TOKENS
 
-    model_cap = int(model_max_context) if model_max_context else None
     context_fit = fit_raw if model_cap is None else min(fit_raw, model_cap)
     machine_bound = model_cap is not None and fit_raw < model_cap
 
@@ -487,13 +662,11 @@ def plan_memory(
         resolved, int(dense_decode_ceiling) if dense_decode_ceiling else resolved
     )
     kv_reserve = reserve_tokens * kv_effective
-    bank_idle = usable - weights - RUNTIME_TRANSIENTS_BYTES
-    bank_idle = max(BANK_FLOOR_BYTES, min(BANK_CAP_BYTES, bank_idle))
-    bank_steady = usable - weights - RUNTIME_TRANSIENTS_BYTES - kv_reserve
-    bank_steady = max(BANK_FLOOR_BYTES, min(BANK_CAP_BYTES, bank_steady))
-    headroom = max(
-        0, usable - weights - RUNTIME_TRANSIENTS_BYTES - kv_reserve - bank_steady
-    )
+    bank_idle = usable - weights - transients
+    bank_idle = max(bank_floor, min(BANK_CAP_BYTES, bank_idle))
+    bank_steady = usable - weights - transients - kv_reserve
+    bank_steady = max(bank_floor, min(BANK_CAP_BYTES, bank_steady))
+    headroom = max(0, usable - weights - transients - kv_reserve - bank_steady)
 
     return MemoryPlan(
         available=True,
@@ -516,7 +689,11 @@ def plan_memory(
         kv_reserve_bytes=kv_reserve,
         bank_idle_max_bytes=bank_idle,
         bank_steady_bytes=bank_steady,
+        runtime_transients_bytes=transients,
+        bank_floor_bytes=bank_floor,
+        tight_machine=tight_machine,
         headroom_bytes=headroom,
+        usable_source=usable_source,
         notes=tuple(notes),
     )
 
@@ -577,18 +754,16 @@ def bank_dynamic_ceiling(
     """
     if not plan.available:
         return BANK_CAP_BYTES
-    reserve = (
-        RUNTIME_TRANSIENTS_BYTES
-        if transient_bytes is None
-        else max(RUNTIME_TRANSIENTS_BYTES, int(transient_bytes))
-    )
+    static = int(getattr(plan, "runtime_transients_bytes", RUNTIME_TRANSIENTS_BYTES))
+    reserve = static if transient_bytes is None else max(static, int(transient_bytes))
     ceiling = (
         plan.usable_bytes
         - plan.model_weights_bytes
         - reserve
         - max(0, int(working_set_bytes))
     )
-    return max(BANK_FLOOR_BYTES, min(int(plan.bank_idle_max_bytes), ceiling))
+    floor = int(getattr(plan, "bank_floor_bytes", BANK_FLOOR_BYTES))
+    return max(floor, min(int(plan.bank_idle_max_bytes), ceiling))
 
 
 def describe_plan(plan: MemoryPlan) -> str:
@@ -603,7 +778,14 @@ def describe_plan(plan: MemoryPlan) -> str:
     )
     line = (
         f"{ram:.0f}G Mac{budget}: engine budget "
-        f"{plan.usable_bytes / GIB:.1f}G, weights "
+        f"{plan.usable_bytes / GIB:.1f}G"
+        + (" (Metal limit)" if plan.usable_source == "metal_limit" else "")
+        + (
+            " (RAM minus the system reserve: the weights sit above the 75% rule)"
+            if plan.usable_source == "resident_floor"
+            else ""
+        )
+        + ", weights "
         f"{plan.model_weights_bytes / GIB:.1f}G, context "
         f"{plan.context_window_resolved}"
         + (" (machine-bound)" if plan.context_machine_bound else "")
@@ -620,6 +802,8 @@ def describe_plan(plan: MemoryPlan) -> str:
             f", n-gram table {plan.ngram_table_streamed_bytes / GIB:.1f}G "
             "streamed from SSD (not wired)"
         )
+    if plan.tight_machine:
+        line += " (tight machine: no bank floor, restores from SSD)"
     if not plan.model_fits:
         line += " — MODEL DOES NOT FIT"
     return line

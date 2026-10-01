@@ -294,6 +294,52 @@ def test_load_vision_tower_loads_model_visual_prefix(tmp_path):
     assert np.isfinite(np.array(embeddings, copy=False)).all()
 
 
+# --- packs that ship one un-indexed model.safetensors (language model and
+#     vision tower in the same file, no model.safetensors.index.json) ---------
+
+
+def _write_unindexed_single_file_fixture(model_dir, *, vision: bool) -> None:
+    (model_dir / "config.json").write_text(json.dumps(_QWEN3_5_MOE_VISION_CONFIG))
+    raw = {"language_model.model.embed_tokens.weight": mx.zeros((10, 32), dtype=mx.float16)}
+    if vision:
+        tower = Qwen3VLVisionTower(
+            Qwen3VLVisionConfig.from_dict(_QWEN3_5_MOE_VISION_CONFIG["vision_config"])
+        )
+        raw.update(
+            {f"vision_tower.{path}": v for path, v in tree_flatten(tower.parameters())}
+        )
+    mx.save_safetensors(str(model_dir / "model.safetensors"), raw)
+
+
+def test_vision_spec_reads_shard_headers_when_there_is_no_index(tmp_path):
+    from mtplx.vision import checkpoint_weight_map
+
+    _write_unindexed_single_file_fixture(tmp_path, vision=True)
+    assert not (tmp_path / "model.safetensors.index.json").exists()
+    weight_map = checkpoint_weight_map(tmp_path)
+    assert weight_map["vision_tower.pos_embed.weight"] == "model.safetensors"
+    spec = vision_spec_for_model_dir(tmp_path)
+    assert spec is not None
+    assert spec.out_hidden_size == 32
+
+
+def test_vision_spec_none_for_unindexed_text_only_shards(tmp_path):
+    _write_unindexed_single_file_fixture(tmp_path, vision=False)
+    assert vision_spec_for_model_dir(tmp_path) is None
+
+
+def test_load_vision_tower_from_an_unindexed_single_file(tmp_path):
+    _write_unindexed_single_file_fixture(tmp_path, vision=True)
+    tower = load_vision_tower(tmp_path)
+    pixel_values, grid_thw = preprocess_images(
+        [_random_image(96, 64)], TINY_PREPROCESSOR_CONFIG
+    )
+    embeddings, _ = tower(pixel_values, grid_thw)
+    mx.eval(embeddings)
+    assert embeddings.shape == (6, 32)
+    assert np.isfinite(np.array(embeddings, copy=False)).all()
+
+
 # --- splice window helpers (MTP history alignment, issue #103) --------------
 
 

@@ -79,6 +79,13 @@ def _mlx_info() -> dict[str, Any]:
 
         info["mlx"] = getattr(mx, "__version__", "unknown")
         info["default_device"] = str(mx.default_device())
+        try:
+            device_info = mx.device_info()
+        except Exception:  # pragma: no cover - host dependent
+            device_info = {}
+        architecture = device_info.get("architecture") if isinstance(device_info, dict) else None
+        if architecture:
+            info["gpu_architecture"] = str(architecture)
         for attr in ("get_active_memory", "get_peak_memory"):
             fn = getattr(mx, attr, None)
             if fn is not None:

@@ -11,6 +11,7 @@ import time
 from typing import Any
 
 from .attention_context import current_attention_phase
+from .rope_origin import RotaryOrigin
 
 SUPPORTED_DETACH_MODES = {
     "eval_only",
@@ -2835,13 +2836,18 @@ class VllmMetalPagedKVCache:
         }
 
 
-class TensorOffsetVllmMetalPagedKVCache:
+class TensorOffsetVllmMetalPagedKVCache(RotaryOrigin):
     """GraphBank-safe paged KV cache with an array-backed offset.
 
     ``VllmMetalPagedKVCache`` stores the decode offset as a Python integer,
     which is unsafe for ``mx.compile`` replay.  This adapter preserves the
     physical page buffers but makes the offset and rollback window part of the
     compiled array state.
+
+    Like the dense adapter it owns its rotary origin (``RotaryOrigin``):
+    ``rope_delta`` for an image request, None for text; ``rope_offset`` is
+    where the attention routes rotate the next row while ``offset`` keeps
+    driving the page writes and the paged attention window.
     """
 
     def __init__(
@@ -2852,6 +2858,7 @@ class TensorOffsetVllmMetalPagedKVCache:
         offset: int | Any,
         block_size: int,
         num_blocks: int,
+        rope_delta: Any = None,
     ) -> None:
         import mlx.core as mx
 
@@ -2863,6 +2870,7 @@ class TensorOffsetVllmMetalPagedKVCache:
         self.rollback_state = [None, None, None]
         self.block_size = int(block_size)
         self.num_blocks = int(num_blocks)
+        self._init_rotary_origin(rope_delta)
         # Per-instance static attention ceiling for the dynamic-offset paged
         # kernel.  When set it wins over MTPLX_GRAPHBANK_PAGED_STATIC_MAX_OFFSET
         # so a compiled-verify bucket can pin the kernel's static block count
@@ -2917,7 +2925,9 @@ class TensorOffsetVllmMetalPagedKVCache:
 
     @property
     def compile_state(self):
-        return [self.cache, self.rollback_state]
+        # The rotary origin rides next to the leaves so a closure that
+        # captures this tree reads the delta at call time (see rope_origin).
+        return [self.cache, self.rollback_state, self.rope_state]
 
     def _flat_key_cache(self):
         return self.cache[0].reshape(-1, int(self.cache[0].shape[2]), int(self.cache[0].shape[3]))
@@ -3216,6 +3226,7 @@ class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
         kv_quant_config: Any,
         source_dtypes: tuple[Any, Any],
         head_dims: tuple[int, int],
+        rope_delta: Any = None,
     ) -> None:
         super().__init__(
             key_cache=key_cache,
@@ -3223,6 +3234,7 @@ class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
             offset=offset,
             block_size=block_size,
             num_blocks=num_blocks,
+            rope_delta=rope_delta,
         )
         self.cache.extend([key_scale_cache, value_scale_cache])
         self.rollback_state = [None, None, None, None, None]

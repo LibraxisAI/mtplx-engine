@@ -7,7 +7,7 @@ change:
 - apps/MTPLXApp/Sources/MTPLXAppCore/Models/MTPLXModelOption.swift
   (``officialCatalog``, ``recommendedCatalogIDs``/``recommendationIDs``)
 - apps/MTPLXApp/Sources/MTPLXAppCore/Onboarding/ModelFeasibility.swift
-  (``memorySafetyFactor``, ``diskMultiplier``, verdict rules)
+  (``memorySafetyFactor``, ``downloadHeadroomGiB``, verdict rules)
 
 The CLI previously picked default models from chip generation alone, which
 offered a 27B download to 8 GB Macs. This catalog gives every surface the
@@ -22,10 +22,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from mtplx.hf_loader import cached_model_is_complete, model_cache_dir
+from mtplx.hf_loader import cached_model_is_complete, model_library_roots
 
 MEMORY_SAFETY_FACTOR = 1.5
-DISK_MULTIPLIER = 2.5
+# `mtplx pull` needs the bytes still to download plus this headroom. Files land
+# as `.incomplete` beside their final names and are renamed in place.
+DOWNLOAD_HEADROOM_GIB = 5.0
+# Bonsai 2 leads from this much RAM; its measured 8K-context peak is 11.80 GiB.
+BONSAI_RECOMMENDATION_MIN_GIB = 16.0
 
 MODERN_TIER = "modern"
 LEGACY_TIER = "legacy"
@@ -62,7 +66,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Qwen 3.5 4B Optimized Speed",
         detail="4-bit quantization. Fastest fit for smaller Macs.",
         hf_model_id="Youssofal/Qwen3.5-4B-MTPLX-Optimized-Speed",
-        size_bytes=2_567_456_776,
+        size_bytes=2_567_456_768,
         peak_memory_gib=2.86,
         recommended_tiers=frozenset({MODERN_TIER}),
         aliases=(
@@ -78,7 +82,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Qwen 3.5 4B Optimized Quality",
         detail="8-bit quantization. Highest-fidelity 4B; 2x MTP multiplier.",
         hf_model_id="Youssofal/Qwen3.5-4B-MTPLX-Optimized-Quality",
-        size_bytes=4_576_426_401,
+        size_bytes=4_576_426_393,
         peak_memory_gib=4.75,
         recommended_tiers=frozenset({MODERN_TIER}),
         aliases=(
@@ -88,12 +92,33 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
             "Qwen 3.5 4B Quality",
         ),
     ),
+    # MiMo V2.6 Qwen 9B (2026-09-23): Xiaomi's supervised fine-tune of Qwen3.5-9B
+    # for agentic coding (XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B, MIT), packed like
+    # the 6-bit 9B: 6-bit group-64 body, the Qwen3.5-9B MTP head and the vision
+    # tower in BF16. The architecture is plain Qwen 3.5, so it takes the Qwen 3.5
+    # contract, never the MiMo one. No FP16 sibling exists, so M1 and M2 are not
+    # offered it. Mirrors MTPLXModelOption.officialCatalog.
+    CatalogModel(
+        id="mimo-v26-qwen-9b-optimized-speed",
+        display_name="MiMo V2.6 Qwen 9B Optimized Speed",
+        detail="6-bit quantization. Xiaomi's agentic coding distill of Qwen 3.5 9B.",
+        hf_model_id="Youssofal/MiMo-V2.6-Qwen-9B-MTPLX-Optimized-Speed",
+        # Published Hub bytes (2026-09-23). Same geometry and bytes as the 6-bit
+        # 9B, so its peak carries over; measured 8.70 GiB at 15K tokens.
+        size_bytes=8_695_116_595,
+        peak_memory_gib=10.0,
+        recommended_tiers=frozenset({MODERN_TIER}),
+        aliases=(
+            "mtplx-mimo-v26-qwen-9b-optimized-speed",
+            "MiMo-V2.6-Qwen-9B-MTPLX-Optimized-Speed",
+        ),
+    ),
     CatalogModel(
         id="qwen35-9b-optimized-speed",
         display_name="Qwen 3.5 9B Optimized Speed",
         detail="6-bit quantization. Strong small-Mac speed pick.",
         hf_model_id="Youssofal/Qwen3.5-9B-MTPLX-Optimized-Speed",
-        size_bytes=8_695_118_657,
+        size_bytes=8_695_118_659,
         peak_memory_gib=10.0,
         recommended_tiers=frozenset({MODERN_TIER}),
         aliases=(
@@ -110,7 +135,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Qwen 3.5 9B Optimized Speed FP16",
         detail="FP16-friendly 9B speed artifact for M1 and M2 Macs.",
         hf_model_id="Youssofal/Qwen3.5-9B-MTPLX-Optimized-Speed-FP16",
-        size_bytes=7_783_301_179,
+        size_bytes=7_783_301_181,
         peak_memory_gib=10.5,
         recommended_tiers=frozenset({LEGACY_TIER}),
         aliases=(
@@ -130,7 +155,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         # Exact byte sum of the published HF repo files (2026-08-15 tree API;
         # three trunk shards + bf16 MTP sidecar + restored bf16 vision tower
         # (#263) + tokenizer + card).
-        size_bytes=16_313_698_865,
+        size_bytes=16_313_700_871,
         # Measured 2026-08-14: request-log MLX high-water 19.6 GiB during
         # quiet-window 2.4k-context serving (boot + Flappy arms + rung).
         peak_memory_gib=20.0,
@@ -146,14 +171,13 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         id="qwen38-27b-optimized-speed",
         display_name="Qwen 3.8 27B Optimized Speed",
         detail=(
-            "4-bit dynamic quant. Great coding speeds and good quality. "
-            "Recommended."
+            "4-bit dynamic quant. Great coding speeds and good quality."
         ),
         hf_model_id="Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed",
         # Exact byte sum of the published HF repo files (2026-08-15 tree API;
         # module_overrides recipe, 5.807 bits/weight, bf16 MTP sidecar,
         # restored bf16 vision tower (#263)).
-        size_bytes=20_703_484_600,
+        size_bytes=20_703_486_605,
         # Measured 2026-08-14: request-log MLX high-water 24.6 GiB during
         # quiet-window 2.4k-context serving (boot + Flappy arms + rung).
         peak_memory_gib=25.0,
@@ -173,7 +197,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         hf_model_id="Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality",
         # Exact byte sum of the published HF repo files (2026-08-15 tree API;
         # includes the restored bf16 vision tower, #263).
-        size_bytes=29_972_712_041,
+        size_bytes=29_972_714_046,
         # Measured 2026-08-14: request-log MLX high-water 32.9 GiB during
         # quiet-window 2.4k-context serving (boot + Flappy arms + rung).
         peak_memory_gib=33.0,
@@ -198,7 +222,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         hf_model_id="Youssofal/Qwen3.8-27B-MTPLX-Bare-Speed-FP16",
         # Exact byte sum of the published HF repo files (2026-08-15 tree API;
         # includes the restored bf16 vision tower, #263).
-        size_bytes=16_314_182_467,
+        size_bytes=16_314_184_539,
         # Same packs and tensor bytes as the parent; peak carried over.
         peak_memory_gib=20.0,
         recommended_tiers=frozenset({LEGACY_TIER}),
@@ -214,12 +238,12 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Qwen 3.8 27B Optimized Speed FP16",
         detail=(
             "4-bit dynamic quant. Great coding speeds and good quality. "
-            "FP16 build for M1 and M2 Macs. Recommended."
+            "FP16 build for M1 and M2 Macs."
         ),
         hf_model_id="Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed-FP16",
         # Exact byte sum of the published HF repo files (2026-08-15 tree API;
         # includes the restored bf16 vision tower, #263).
-        size_bytes=20_703_969_110,
+        size_bytes=20_703_971_173,
         # Same packs and tensor bytes as the parent; peak carried over.
         peak_memory_gib=25.0,
         recommended_tiers=frozenset({LEGACY_TIER}),
@@ -239,7 +263,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         hf_model_id="Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality-FP16",
         # Exact byte sum of the published HF repo files (2026-08-15 tree API;
         # includes the restored bf16 vision tower, #263).
-        size_bytes=29_973_197_540,
+        size_bytes=29_973_199_603,
         # Same packs and tensor bytes as the parent; peak carried over.
         peak_memory_gib=33.0,
         recommended_tiers=frozenset({LEGACY_TIER}),
@@ -262,7 +286,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         hf_model_id="Youssofal/Qwen3.8-Flash-Next-MTPLX-Bare-Speed",
         # Exact byte sum of the published HF repo (2026-08-28 audit); includes
         # the 32 GB SSD-streamed n-gram table and the vision tower.
-        size_bytes=106_336_812_636,
+        size_bytes=106_336_814_165,
         # Weights 72.6 GB + MTP 1.7 GB resident (n-gram on SSD) plus
         # KV/working headroom at the default profile.
         peak_memory_gib=78.0,
@@ -279,12 +303,12 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Qwen 3.8 Flash-Next Optimized Speed",
         detail=(
             "Dynamic 4-bit quant with 8-bit attention. Higher quality and "
-            "slightly slower. Recommended."
+            "slightly slower."
         ),
         hf_model_id="Youssofal/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed",
         # Exact byte sum of the published HF repo (2026-08-28 audit); includes
         # the 32 GB SSD-streamed n-gram table and the vision tower.
-        size_bytes=115_061_253_581,
+        size_bytes=115_061_255_377,
         # Weights 81.4 GB + MTP 1.7 GB resident (n-gram on SSD) plus
         # KV/working headroom at the default profile.
         peak_memory_gib=87.0,
@@ -297,6 +321,37 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         ),
     ),
     CatalogModel(
+        id="flash-next-optimized-quality",
+        display_name="Qwen 3.8 Flash-Next Optimized Quality",
+        detail="8-bit body and MTP head, BF16 structural tensors, and a 4-bit n-gram table. Higher-fidelity Flash-Next build.",
+        hf_model_id="Youssofal/Qwen3.8-Flash-Next-MTPLX-Optimized-Quality",
+        # Recipe: body/MTP 8-bit group 64, BF16 structural tensors, n-gram 4-bit group 32.
+        # Planner need at 128K with the n-gram table streamed from SSD (calculated,
+        # not yet measured on a 256 GB Mac).
+        size_bytes=169_958_537_520, peak_memory_gib=136.4,
+        recommended_tiers=frozenset({MODERN_TIER}),
+        aliases=(
+            "mtplx-flash-next-optimized-quality",
+            "Qwen3.8-Flash-Next-MTPLX-Optimized-Quality",
+            "Flash-Next Optimized Quality",
+        ),
+    ),
+    CatalogModel(
+        id="bonsai-2-27b-optimized-speed",
+        display_name="Bonsai 2 27B Optimized Speed",
+        detail="Prism ML ternary 27B model with vision and MTP. Compact weights for smaller Macs.",
+        hf_model_id="Youssofal/Ternary-Bonsai-2-27B-MTPLX-Optimized-Speed",
+        # Published Hub bytes (2026-09-22) and the measured 8K context peak.
+        size_bytes=8_847_919_618, peak_memory_gib=11.80,
+        recommended_tiers=frozenset({MODERN_TIER}),
+        aliases=(
+            "mtplx-bonsai-2-27b-optimized-speed",
+            "Ternary-Bonsai-2-27B-MTPLX-Optimized-Speed",
+            "Bonsai-3.8-27B-MTPLX-Optimized-Speed",
+            "mtplx-bonsai-38-27b-optimized-speed",
+        ),
+    ),
+    CatalogModel(
         id="optimized-speed-v2",
         display_name="Qwen 3.6 27B Optimized Speed V2",
         detail=(
@@ -305,7 +360,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
             "agent tasks, slightly larger, and a little slower for short chats."
         ),
         hf_model_id="Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-V2",
-        size_bytes=19_887_455_619,
+        size_bytes=19_887_455_621,
         peak_memory_gib=21.5,
         recommended_tiers=frozenset({MODERN_TIER}),
         aliases=(
@@ -319,7 +374,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Qwen 3.6 27B Optimized Speed",
         detail="Smaller 4-bit model. A little faster for short chats.",
         hf_model_id="Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed",
-        size_bytes=16_419_081_846,
+        size_bytes=16_419_081_848,
         peak_memory_gib=17.0,
         recommended_tiers=frozenset({MODERN_TIER}),
         aliases=(
@@ -331,11 +386,11 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
     CatalogModel(
         id="optimized-speed-fp16",
         display_name="Qwen 3.6 27B Optimized Speed FP16",
-        detail="FP16 speed artifact recommended for M1 and M2 Macs.",
+        detail="FP16 speed artifact for M1 and M2 Macs.",
         hf_model_id="Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-FP16",
         # Exact sum of the published HF repo files (2026-07-03 audit); the
         # previous 16-GiB figure was a pre-publish estimate ~0.7 GiB high.
-        size_bytes=16_419_644_366,
+        size_bytes=16_419_644_386,
         peak_memory_gib=17.5,
         recommended_tiers=frozenset({LEGACY_TIER}),
         aliases=(
@@ -349,7 +404,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Qwen 3.6 35B-A3B Optimized Speed",
         detail="4-bit quantization. Blazingly fast and quite smart.",
         hf_model_id="Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed",
-        size_bytes=21_014_908_550,
+        size_bytes=21_014_908_552,
         peak_memory_gib=28.0,
         recommended_tiers=frozenset({MODERN_TIER}),
         aliases=(
@@ -366,7 +421,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Qwen 3.6 35B-A3B Optimized Speed FP16",
         detail="FP16-friendly 35B speed artifact for M1 and M2 Macs.",
         hf_model_id="Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16",
-        size_bytes=21_016_116_512,
+        size_bytes=21_016_116_514,
         peak_memory_gib=28.5,
         recommended_tiers=frozenset({LEGACY_TIER}),
         aliases=(
@@ -380,7 +435,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Qwen 3.6 35B-A3B Optimized Balance",
         detail="6-bit quantization. Stronger balance of speed and quality.",
         hf_model_id="Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Balance",
-        size_bytes=29_671_037_161,
+        size_bytes=29_671_037_163,
         peak_memory_gib=32.0,
         recommended_tiers=frozenset({MODERN_TIER}),
         aliases=(
@@ -394,7 +449,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Qwen 3.6 35B-A3B Optimized Balance FP16",
         detail="FP16-friendly 35B balance artifact for M1 and M2 Macs.",
         hf_model_id="Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Balance-FP16",
-        size_bytes=29_672_249_552,
+        size_bytes=29_672_249_554,
         peak_memory_gib=32.5,
         recommended_tiers=frozenset({LEGACY_TIER}),
         aliases=(
@@ -408,7 +463,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Gemma 4 31B Optimized Speed",
         detail="High quality. Moderate speeds.",
         hf_model_id="Youssofal/Gemma4-MTPLX-Optimized-Speed",
-        size_bytes=17_715_574_395,
+        size_bytes=17_715_574_397,
         peak_memory_gib=18.0,
         recommended_tiers=frozenset({MODERN_TIER}),
         aliases=(
@@ -425,7 +480,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Qwen 3.6 27B Optimized Quality",
         detail="Maximum quality. Moderate speeds.",
         hf_model_id="Youssofal/Qwen3.6-27B-MTPLX-Optimized-Quality",
-        size_bytes=30_016_961_493,
+        size_bytes=30_016_961_495,
         peak_memory_gib=27.62,
         recommended_tiers=frozenset({MODERN_TIER}),
         aliases=(
@@ -437,11 +492,11 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
     CatalogModel(
         id="optimized-quality-fp16",
         display_name="Qwen 3.6 27B Optimized Quality FP16",
-        detail="FP16 quality artifact recommended for M1 and M2 Macs.",
+        detail="FP16 quality artifact for M1 and M2 Macs.",
         hf_model_id="Youssofal/Qwen3.6-27B-MTPLX-Optimized-Quality-FP16",
         # Exact byte sum of the published HF repo files (2026-07-07 upload,
         # verified via the tree API).
-        size_bytes=30_017_528_922,
+        size_bytes=30_017_528_942,
         peak_memory_gib=28.12,
         recommended_tiers=frozenset({LEGACY_TIER}),
         aliases=(
@@ -475,21 +530,33 @@ _MODERN_TOP_RECOMMENDATION_IDS = (
     "qwen38-27b-optimized-quality",
     "flash-next-bare-speed",
     "flash-next-optimized-speed",
+    "flash-next-optimized-quality",
     "optimized-speed-v2",
     "optimized-speed",
     "optimized-quality",
     "qwen36-35b-a3b-optimized-speed",
     "qwen36-35b-a3b-optimized-balance",
     "gemma4-optimized-speed",
+    "mimo-v26-qwen-9b-optimized-speed",
+    "qwen35-9b-optimized-speed",
+    "bonsai-2-27b-optimized-speed",
+)
+
+# The 9B-class speed picks on modern chips. MiMo V2.6 Qwen 9B rides
+# immediately ahead of the Qwen 3.5 9B wherever the 9B is offered, so it is a
+# top onboarding suggestion (founder, 2026-09-23) without replacing any tier's
+# first pick. Mirrors MTPLXModelOption.modernSmallIDs.
+_MODERN_SMALL_IDS = (
+    "mimo-v26-qwen-9b-optimized-speed",
     "qwen35-9b-optimized-speed",
 )
 
-# Qwen 3.8 Flash-Next pair (2026-08-27): Bare Speed first (the fast
-# flat-4-bit pick), then Optimized Speed. Modern-tier, big-Mac only.
-# Mirrors MTPLXModelOption.flashNextIDs.
+# Flash-Next options on modern chips; Optimized Speed and Quality lead from
+# 256 GiB. Mirrors MTPLXModelOption.flashNextIDs.
 _FLASH_NEXT_IDS = (
     "flash-next-bare-speed",
     "flash-next-optimized-speed",
+    "flash-next-optimized-quality",
 )
 
 
@@ -549,14 +616,14 @@ def recommended_catalog_ids(
     if chip_tier == INTEL_TIER:
         return []
     if chip_tier == LEGACY_TIER:
-        small = "qwen35-9b-optimized-speed-fp16"
+        small = ["qwen35-9b-optimized-speed-fp16"]
         speed27 = "optimized-speed-fp16"
         speed27_v2 = None
         speed35 = "qwen36-35b-a3b-optimized-speed-fp16"
         balance35 = "qwen36-35b-a3b-optimized-balance-fp16"
         quality27 = "optimized-quality-fp16"
     else:
-        small = "qwen35-9b-optimized-speed"
+        small = list(_MODERN_SMALL_IDS)
         speed27 = "optimized-speed"
         speed27_v2 = "optimized-speed-v2"
         speed35 = "qwen36-35b-a3b-optimized-speed"
@@ -576,7 +643,7 @@ def recommended_catalog_ids(
         trio38 = [f"{model_id}-fp16" for model_id in trio38]
     if memory_gib is None or memory_gib <= 0:
         if chip_tier == LEGACY_TIER:
-            return [*trio38, speed27, quality27, speed35, balance35, "gemma4-optimized-speed", small]
+            return [*trio38, speed27, quality27, speed35, balance35, "gemma4-optimized-speed", *small]
         return list(_MODERN_TOP_RECOMMENDATION_IDS)
     # The rebuilt 4B pair leads the sub-16GB tiers and trails every larger
     # modern tier so it stays discoverable as the fast-small pick. No fp16 4B
@@ -587,27 +654,40 @@ def recommended_catalog_ids(
         else []
     )
     if memory_gib < 16:
-        return tiny_ids or [small]
+        return tiny_ids or small
     if memory_gib < 32:
-        return [small, *tiny_ids]
+        if chip_tier == LEGACY_TIER:
+            return small
+        bonsai = "bonsai-2-27b-optimized-speed"
+        leading = [bonsai, *small] if memory_gib >= BONSAI_RECOMMENDATION_MIN_GIB else [*small, bonsai]
+        return [*leading, *tiny_ids]
     if memory_gib < 48:
         if speed27_v2 is None:
-            return [*trio38, small, speed27, "gemma4-optimized-speed", speed35, quality27]
+            return [*trio38, *small, speed27, "gemma4-optimized-speed", speed35, quality27]
         return [
             *trio38,
             speed27_v2,
             speed27,
-            small,
+            *small,
             "gemma4-optimized-speed",
             speed35,
             quality27,
+            "bonsai-2-27b-optimized-speed",
             *tiny_ids,
         ]
-    # Flash-Next rides right behind the 3.8 trio on big modern Macs.
-    # Modern tier only (bf16 packs, no fp16 sibling); the peak-memory
-    # filter in recommended_models hides both entries below ~96 GB.
-    flash_next = list(_FLASH_NEXT_IDS) if chip_tier != LEGACY_TIER else []
+    # Offer Flash-Next from 96 GiB, Optimized Speed from 128 GiB: its wired
+    # floor (80.3 GiB) is above a 96 GB Mac's stock GPU limit (about 72 GiB).
+    # From 256 GiB Optimized Speed leads and Optimized Quality follows, as
+    # the 27B trio does. The normal peak-memory filter still applies.
+    flash_next = list(_FLASH_NEXT_IDS) if chip_tier != LEGACY_TIER and memory_gib >= 96 else []
+    if memory_gib < 128:
+        flash_next = [model_id for model_id in flash_next if model_id != "flash-next-optimized-speed"]
+    leading = []
+    if chip_tier != LEGACY_TIER and memory_gib >= 256:
+        leading = ["flash-next-optimized-speed", "flash-next-optimized-quality"]
+        flash_next = [model_id for model_id in flash_next if model_id not in leading]
     return [
+        *leading,
         *trio38,
         *flash_next,
         *([speed27_v2] if speed27_v2 else []),
@@ -616,7 +696,8 @@ def recommended_catalog_ids(
         speed35,
         balance35,
         "gemma4-optimized-speed",
-        small,
+        *small,
+        *(["bonsai-2-27b-optimized-speed"] if chip_tier != LEGACY_TIER else []),
         *tiny_ids,
     ]
 
@@ -669,10 +750,12 @@ def evaluate_feasibility(
     chip_tier: str,
     ram_gib: float,
     disk_free_gib: float | None = None,
+    downloaded_bytes: int = 0,
 ) -> FeasibilityVerdict:
     safe_memory_floor = model.peak_memory_gib * MEMORY_SAFETY_FACTOR
-    if disk_free_gib is not None:
-        disk_required = model.download_gib * DISK_MULTIPLIER
+    if disk_free_gib is not None and model.size_bytes > 0:
+        remaining_gib = max(0, model.size_bytes - downloaded_bytes) / 1_073_741_824.0
+        disk_required = remaining_gib + DOWNLOAD_HEADROOM_GIB
         if disk_free_gib < disk_required:
             return FeasibilityVerdict("insufficient_disk", needs_gib=disk_required)
     if chip_tier == INTEL_TIER:
@@ -692,6 +775,9 @@ class InstalledModel:
     name: str
     size_bytes: int
     catalog: CatalogModel | None
+    root: Path | None = None
+    root_index: int = 0
+    is_primary: bool = True
 
     @property
     def display_name(self) -> str:
@@ -724,6 +810,8 @@ def _is_complete_install(path: Path) -> bool:
 
 def scan_installed_models(
     cache_dir: str | Path | None = None,
+    *,
+    search_dirs: Iterable[str | Path] | None = None,
 ) -> list[InstalledModel]:
     """Complete installs under the model cache, official catalog first.
 
@@ -732,33 +820,43 @@ def scan_installed_models(
     picker never offers a model that cannot load.
     """
 
-    root = model_cache_dir(cache_dir)
-    if not root.is_dir():
-        return []
     installed: list[InstalledModel] = []
-    for child in sorted(root.iterdir()):
-        if not child.is_dir() or child.name.startswith("."):
+    seen: set[str] = set()
+    for root_index, root in enumerate(
+        model_library_roots(cache_dir, search_dirs=search_dirs)
+    ):
+        if not root.is_dir():
             continue
-        if not _is_complete_install(child):
-            continue
-        installed.append(
-            InstalledModel(
-                path=child,
-                name=child.name,
-                size_bytes=_directory_size_bytes(child),
-                catalog=catalog_model_matching(child.name),
+        for child in sorted(root.iterdir()):
+            if not child.is_dir() or child.name.startswith("."):
+                continue
+            identity = os.path.normcase(str(child.resolve(strict=False)))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if not _is_complete_install(child):
+                continue
+            installed.append(
+                InstalledModel(
+                    path=child,
+                    name=child.name,
+                    size_bytes=_directory_size_bytes(child),
+                    catalog=catalog_model_matching(child.name),
+                    root=root,
+                    root_index=root_index,
+                    is_primary=root_index == 0,
+                )
             )
-        )
 
-    def sort_key(model: InstalledModel) -> tuple[int, int, str]:
+    def sort_key(model: InstalledModel) -> tuple[int, int, int, str]:
         if model.catalog is not None:
             catalog_index = next(
                 index
                 for index, entry in enumerate(OFFICIAL_CATALOG)
                 if entry.id == model.catalog.id
             )
-            return (0, catalog_index, model.name.lower())
-        return (1, 0, model.name.lower())
+            return (0, catalog_index, model.root_index, model.name.lower())
+        return (1, 0, model.root_index, model.name.lower())
 
     return sorted(installed, key=sort_key)
 

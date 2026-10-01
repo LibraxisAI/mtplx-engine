@@ -19,9 +19,13 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
-from mtplx.hf_loader import cached_model_path, validate_mtplx_model_files
+from mtplx.hf_loader import (
+    cached_model_path,
+    model_library_roots,
+    validate_mtplx_model_files,
+)
 from mtplx.profiles import DEFAULT_HF_MODEL_ID, DEFAULT_PROFILE_NAME
 
 
@@ -180,8 +184,63 @@ def _http_probe(url: str, *, timeout: float = 1.0) -> dict[str, Any]:
         return {"ok": False, "error": repr(exc)}
 
 
-def host_report(*, model_cache: str | Path | None = None) -> dict[str, Any]:
-    cache_root = Path(model_cache or os.environ.get("MTPLX_MODEL_DIR") or "~/.mtplx/models").expanduser()
+def runtime_identity(mlx_info: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Which MTPLX is answering, from where, and on which GPU class.
+
+    Issue #479: a macOS 15 / M2 Max report showed a kernel that only builds on
+    an M5-class GPU under macOS 26.2 or newer, from a checkout whose gate makes
+    that compile unreachable. The paste could not show whether the failing
+    process ran that checkout or an older launcher on PATH (the installer's
+    ``~/.local/bin`` shim, a Homebrew venv, the app runtime). Say it in the
+    first doctor block so the next report answers the question itself.
+    """
+    import importlib.metadata as importlib_metadata
+
+    import mtplx
+
+    on_path = shutil.which("mtplx")
+    info: dict[str, Any] = {
+        "mtplx_version": None,
+        "mtplx_path": str(Path(mtplx.__file__).resolve().parent),
+        "python_executable": sys.executable,
+        "mtplx_on_path": on_path,
+        "launcher_matches_this_python": None,
+    }
+    try:
+        info["mtplx_version"] = importlib_metadata.version("mtplx")
+    except importlib_metadata.PackageNotFoundError:
+        pass
+    if on_path:
+        launcher = Path(on_path).resolve()
+        this_bin = Path(sys.executable).resolve().parent
+        same = launcher.parent == this_bin
+        if not same:
+            # The installer's shim is a shell script that exec's a venv by
+            # absolute path; accept it when it names this interpreter's venv.
+            try:
+                same = str(this_bin) in launcher.read_text(errors="ignore")[:4096]
+            except OSError:
+                same = False
+        info["launcher_matches_this_python"] = bool(same)
+    architecture = (mlx_info or {}).get("gpu_architecture")
+    if architecture:
+        info["gpu_architecture"] = str(architecture)
+        try:
+            from mtplx.nax_verify import nax_available
+
+            info["nax_route_available"] = bool(nax_available())
+        except Exception as exc:  # pragma: no cover - host dependent
+            info["nax_probe_error"] = repr(exc)
+    return info
+
+
+def host_report(
+    *,
+    model_cache: str | Path | None = None,
+    model_search_dirs: Iterable[str | Path] | None = None,
+) -> dict[str, Any]:
+    roots = model_library_roots(model_cache, search_dirs=model_search_dirs)
+    cache_root = roots[0]
     macos = _run(["sw_vers", "-productVersion"]) if platform.system() == "Darwin" else {}
     mem_raw = _sysctl("hw.memsize") if platform.system() == "Darwin" else None
     memory_bytes = int(mem_raw) if mem_raw and mem_raw.isdigit() else None
@@ -205,6 +264,7 @@ def host_report(*, model_cache: str | Path | None = None) -> dict[str, Any]:
         "memory_bytes": memory_bytes,
         "memory_gib": round(memory_bytes / GIB, 2) if memory_bytes else None,
         "cache_dir": str(cache_root),
+        "model_dirs": [str(root) for root in roots],
         "disk_free_bytes": disk.free if disk else None,
         "disk_free_gib": round(disk.free / GIB, 2) if disk else None,
     }
@@ -329,6 +389,7 @@ def _port_open(host: str, port: int) -> bool:
 def build_diagnostic_checks(
     *,
     model_cache: str | Path | None = None,
+    model_search_dirs: Iterable[str | Path] | None = None,
     include_startup_default_model: bool = True,
     deep: bool = False,
     server_port: int = 8000,
@@ -337,9 +398,10 @@ def build_diagnostic_checks(
     thermal_control: dict[str, Any] | None = None,
     server_dependencies: dict[str, bool] | None = None,
 ) -> tuple[dict[str, Any], list[DiagnosticCheck]]:
-    host = host_report(model_cache=model_cache)
+    roots = model_library_roots(model_cache, search_dirs=model_search_dirs)
+    host = host_report(model_cache=model_cache, model_search_dirs=model_search_dirs)
     checks: list[DiagnosticCheck] = []
-    cache_root = Path(model_cache or os.environ.get("MTPLX_MODEL_DIR") or "~/.mtplx/models").expanduser()
+    cache_root = roots[0]
     macos_version = host.get("macos_version")
     macos_ok = platform.system() == "Darwin" and bool(macos_version) and _parse_version(str(macos_version)) >= (SUPPORT_MACOS_MAJOR, 0)
     checks.append(
@@ -397,6 +459,23 @@ def build_diagnostic_checks(
             "python3 -m pip install --force-reinstall mlx 'mtplx[server]'",
         )
     )
+    identity = runtime_identity(mlx)
+    launcher_ok = identity.get("launcher_matches_this_python") is not False
+    checks.append(
+        DiagnosticCheck(
+            "runtime.identity",
+            "pass" if launcher_ok else "warn",
+            "warning",
+            identity,
+            "the `mtplx` on PATH runs the same MTPLX this doctor imported",
+            "Two MTPLX runtimes are installed (an installer launcher in "
+            "~/.local/bin, a Homebrew venv, the app runtime, a source checkout) "
+            "and the first on PATH is not this one. `which -a mtplx` lists "
+            "them; run the one you mean, or move the other off PATH.",
+            None,
+            "which -a mtplx",
+        )
+    )
     memory_check = _default_model_memory_check(host)
     checks.append(
         DiagnosticCheck(
@@ -433,7 +512,19 @@ def build_diagnostic_checks(
         )
     )
     default_cached = cached_model_path(DEFAULT_HF_MODEL_ID, cache_dir=cache_root)
-    default_validation = validate_mtplx_model_files(default_cached) if default_cached.exists() else None
+    default_validation = None
+    for root in roots:
+        candidate = cached_model_path(DEFAULT_HF_MODEL_ID, cache_dir=root)
+        if not candidate.exists():
+            continue
+        validation = validate_mtplx_model_files(candidate)
+        if validation.get("ok"):
+            default_cached = candidate
+            default_validation = validation
+            break
+        if default_validation is None:
+            default_cached = candidate
+            default_validation = validation
     startup_default = _startup_default_model_observed(
         model_cache=model_cache,
         include_startup_default_model=include_startup_default_model,
@@ -662,7 +753,72 @@ def build_diagnostic_checks(
             "Let the Mac cool down or improve airflow before sustained benchmarks.",
         )
     )
+    checks.append(last_failed_start_check())
     return host, checks
+
+
+#: How much of the app's failed-start report doctor repeats. A Python
+#: traceback plus the start-up lines before it fits; the file keeps 200.
+FAILED_START_TAIL_LINES = 60
+#: A failed start older than this is history, not the reason for today's report.
+FAILED_START_MAX_AGE_DAYS = 14
+
+
+def failed_start_report_path() -> Path:
+    """Where the app writes a failed start's output (SYNC PAIR:
+    ``StartFailureReport.defaultURL`` in the app). The override exists so the
+    test suite never reads a developer's real file."""
+    override = os.environ.get("MTPLX_START_FAILURE_REPORT")
+    if override and override.strip():
+        return Path(override).expanduser()
+    return Path.home() / ".mtplx" / "logs" / "last-failed-start.log"
+
+
+def last_failed_start_check() -> DiagnosticCheck:
+    """The output of the app's last failed start, if it is recent (#504).
+
+    A daemon that dies before /health leaves the app one line to show, and the
+    banner cuts that line off. The app keeps the whole output in this file,
+    with the launch line's secrets already masked, and doctor repeats its
+    tail, so a "will not start" report carries its cause.
+    """
+
+    path = failed_start_report_path()
+    expected = "no recent failed start recorded by the app"
+    try:
+        stat = path.stat()
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return DiagnosticCheck("app.last_failed_start", "pass", "warning", None, expected)
+    age_s = max(0.0, time.time() - stat.st_mtime)
+    if age_s > FAILED_START_MAX_AGE_DAYS * 24 * 3600:
+        return DiagnosticCheck(
+            "app.last_failed_start",
+            "pass",
+            "warning",
+            {"path": str(path), "stale_days": int(age_s // (24 * 3600))},
+            expected,
+        )
+    lines = text.splitlines()
+    header: dict[str, str] = {}
+    for line in lines[:8]:
+        key, sep, value = line.partition(": ")
+        if sep and key in {"when", "app", "macos", "reason"}:
+            header[key] = value
+    return DiagnosticCheck(
+        "app.last_failed_start",
+        "warn",
+        "warning",
+        {
+            "path": str(path),
+            "age_hours": round(age_s / 3600, 1),
+            **header,
+            "tail": lines[-FAILED_START_TAIL_LINES:],
+        },
+        expected,
+        "The MTPLX app could not start its server. The lines under `tail` are "
+        "what the server printed before it stopped; include them in a bug report.",
+    )
 
 
 def summarize_checks(checks: list[DiagnosticCheck]) -> str:
@@ -676,6 +832,7 @@ def summarize_checks(checks: list[DiagnosticCheck]) -> str:
 def build_diagnostics_payload(
     *,
     model_cache: str | Path | None = None,
+    model_search_dirs: Iterable[str | Path] | None = None,
     include_startup_default_model: bool = True,
     deep: bool = False,
     server_port: int = 8000,
@@ -685,6 +842,7 @@ def build_diagnostics_payload(
 ) -> dict[str, Any]:
     host, checks = build_diagnostic_checks(
         model_cache=model_cache,
+        model_search_dirs=model_search_dirs,
         include_startup_default_model=include_startup_default_model,
         deep=deep,
         server_port=server_port,

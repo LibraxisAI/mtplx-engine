@@ -111,3 +111,25 @@ def test_cli_converts_markdown_end_to_end(tmp_path):
     assert "<h1>MTPLX 9.9.9</h1>" in page
     assert "<code>decode</code>" in page
     assert ":root{color-scheme:light dark}" in page
+
+
+def test_release_script_draft_guard_passes_shipped_notes_and_catches_drafts():
+    script = (REPO / "scripts" / "release_macos_v1.sh").read_text(encoding="utf-8")
+    guard = re.search(r"grep -n -E '([^']+)'", script)
+    assert guard, "release_macos_v1.sh lost its draft-wording guard"
+    pattern = re.compile(guard.group(1))
+    version = re.search(r'^version = "([^"]+)"', (REPO / "pyproject.toml").read_text(), re.M)
+    shipped = [
+        path
+        for path in (REPO / "docs" / "releases").glob("v*.md")
+        if path.name != f"v{version.group(1)}.md"
+    ]
+    assert shipped
+    assert [path.name for path in shipped if pattern.search(path.read_text(encoding="utf-8"))] == []
+    for draft in (
+        "*Release draft. Still being verified.*",
+        "| Final signed, notarized app and DMG | Pending |",
+        "## [2.12.0] - Unreleased",
+        "In this release candidate the sizes are provisional.",
+    ):
+        assert pattern.search(draft), draft

@@ -21,7 +21,9 @@ def _clean_env(monkeypatch):
     for key in (
         CEILING,
         "MTPLX_DENSE_KV_BYTES_PER_TOKEN",
+        "MTPLX_DENSE_KV_BYTES_PER_TOKEN_DERIVED",
         "MTPLX_DENSE_DECODE_RAM_PERCENT",
+        "MTPLX_MEMORY_BUDGET",
         "MTPLX_CONTEXT_WINDOW_TOKENS",
         "MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS",
         "MTPLX_SUSTAINED_PREFILL_LAYOUT",
@@ -110,3 +112,88 @@ def test_layout_repages_above_ceiling(monkeypatch):
     monkeypatch.setenv(CEILING, "131072")
     monkeypatch.setenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", "147434")
     assert _sustained_prefill_layout() == "contiguous_then_repage"
+
+
+# --- PX.3(b), 2026-09-18: geometry from the model config, seat-aware floor ---
+
+
+def test_auto_reads_the_geometry_the_loader_derived(monkeypatch):
+    # Flash-Next: 12 full-attention layers x K+V x 2 KV heads x 256 x bf16
+    # = 24,576 B/token, exported by runtime.load from config.json. Before the
+    # export every model was budgeted with the 27B's 65,536.
+    monkeypatch.setenv(CEILING, "auto")
+    monkeypatch.setenv("MTPLX_DENSE_KV_BYTES_PER_TOKEN_DERIVED", "24576")
+    monkeypatch.setattr(os, "sysconf", _fake_sysconf(96 * 1024**3))
+    assert _dense_decode_max_context() == int(96 * 1024**3 * 15 / 100) // 24576
+
+
+def test_operator_geometry_beats_the_derived_value(monkeypatch):
+    monkeypatch.setenv(CEILING, "auto")
+    monkeypatch.setenv("MTPLX_DENSE_KV_BYTES_PER_TOKEN", "32768")
+    monkeypatch.setenv("MTPLX_DENSE_KV_BYTES_PER_TOKEN_DERIVED", "24576")
+    monkeypatch.setattr(os, "sysconf", _fake_sysconf(96 * 1024**3))
+    assert _dense_decode_max_context() == 471859
+
+
+def test_loader_exports_the_derived_geometry_and_clears_it(monkeypatch):
+    from mtplx.runtime import DERIVED_DENSE_KV_BYTES_ENV, _export_derived_model_geometry
+
+    flash_next = {
+        "text_config": {
+            "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 12,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+        }
+    }
+    dense_27b = {
+        "num_hidden_layers": 64,
+        "full_attention_interval": 4,
+        "num_key_value_heads": 4,
+        "head_dim": 256,
+    }
+    assert _export_derived_model_geometry(flash_next) == 24_576
+    assert os.environ[DERIVED_DENSE_KV_BYTES_ENV] == "24576"
+    assert _export_derived_model_geometry(dense_27b) == 65_536
+    assert os.environ[DERIVED_DENSE_KV_BYTES_ENV] == "65536"
+    # A config that does not describe its attention must not inherit the
+    # previous model's value.
+    assert _export_derived_model_geometry({"model_type": "mystery"}) is None
+    assert DERIVED_DENSE_KV_BYTES_ENV not in os.environ
+
+
+@pytest.mark.parametrize(
+    ("ram_gib", "expected"),
+    [
+        # 27B geometry. From 32 GB up the 131072 floor holds (8 GiB slab is
+        # within a quarter of RAM): nothing moves, the 48 GB seat included.
+        (128, 314572),
+        (64, 157286),
+        (48, 131072),
+        (36, 131072),
+        (32, 131072),
+        # Small seats lose the flat floor: a quarter of RAM bounds the slab.
+        (24, 98304),
+        (16, 65536),
+    ],
+)
+def test_floor_is_seat_aware_on_the_27b_geometry(monkeypatch, ram_gib, expected):
+    monkeypatch.setenv(CEILING, "auto")
+    monkeypatch.setenv("MTPLX_DENSE_KV_BYTES_PER_TOKEN_DERIVED", "65536")
+    monkeypatch.setattr(os, "sysconf", _fake_sysconf(ram_gib * 1024**3))
+    assert _dense_decode_max_context() == expected
+
+
+def test_floor_holds_for_flash_next_on_every_seat_that_loads_it(monkeypatch):
+    # 131072 x 24,576 B = 3 GiB: inside a quarter of RAM from 12 GiB up.
+    monkeypatch.setenv(CEILING, "auto")
+    monkeypatch.setenv("MTPLX_DENSE_KV_BYTES_PER_TOKEN_DERIVED", "24576")
+    monkeypatch.setenv("MTPLX_CONTEXT_WINDOW_TOKENS", "86016")
+    monkeypatch.setattr(os, "sysconf", _fake_sysconf(96 * 1024**3))
+    assert _dense_decode_max_context() == 131072
+
+
+def test_simulated_small_seat_matches_a_real_one(monkeypatch):
+    monkeypatch.setenv(CEILING, "auto")
+    monkeypatch.setenv("MTPLX_MEMORY_BUDGET", "24G")
+    monkeypatch.setattr(os, "sysconf", _fake_sysconf(128 * 1024**3))
+    assert _dense_decode_max_context() == 98304

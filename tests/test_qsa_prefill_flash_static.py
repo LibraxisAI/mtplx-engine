@@ -62,24 +62,94 @@ def test_production_geometry_is_narrow_and_explicit():
     assert ast.unparse(_assignment("_THREADS")) == "_SIMD_WIDTH"
 
 
-def test_kernel_is_one_m16_n32_tensorops_simdgroup_per_row_and_kv_head():
+SOURCES = ("_SOURCE", "_STAGED_SOURCE")
+
+
+def test_both_sources_are_one_m16_n32_tensorops_simdgroup_per_row_and_kv_head():
     header = _literal("_HEADER")
-    source = _literal("_SOURCE")
     assert "MetalPerformancePrimitives/MetalPerformancePrimitives.h" in header
     assert "qsa_nax_coord" in header
+    for name in SOURCES:
+        source = _literal(name)
+        assert "constexpr int TILE_BLOCKS = 8" in source, name
+        assert "constexpr int TOKENS_PER_TILE = TILE_BLOCKS * BLOCK_TOKENS" in source
+        assert "uint local_active_slots = 0u" in source
+        assert "const uint active_blocks = simd_max(local_active_slots)" in source
+        assert "block_id >= 0 && block_id < complete_blocks" in source
+        assert "const int active_selected_tiles" in source
+        assert "const int active_tiles" in source
+        assert "const int row = work / KV_HEADS" in source
+        assert "const int kv_head = work - row * KV_HEADS" in source
+        assert "mpp::tensor_ops::matmul2d_descriptor(" in source
+        assert "16, 32, 16, false, true, true" in source
+        # macOS 27 SDK: the destination tensor strips the address space.
+        assert "metal::remove_addrspace_t<decltype(" in source
+
+        # All potentially non-contiguous inputs use the strides injected by MLX.
+        for stride_name in (
+            "q_strides",
+            "k_strides",
+            "v_strides",
+            "block_ids_strides",
+            "block_valid_strides",
+        ):
+            assert stride_name in source, (name, stride_name)
+
+    kernel_factory = _function_source("_kernel")
+    for input_name in ('"q"', '"k"', '"v"', '"block_ids"', '"block_valid"'):
+        assert input_name in kernel_factory
+    assert "ensure_row_contiguous=False" in kernel_factory
+
+    forbidden = (
+        "mx.take",
+        "scaled_dot_product_attention",
+        "dense_mask",
+        "concatenate",
+    )
+    implementation = _function_source("qsa_prefill_flash")
+    for token in forbidden:
+        for name in SOURCES:
+            assert token not in _literal(name)
+        assert token not in implementation
+
+
+def test_direct_source_reads_the_cache_in_place_without_threadgroup_memory():
+    source = _literal("_SOURCE")
+    # Two descriptors: QK with a transposed right operand, PV without, so V is
+    # read in its natural [token, dim] layout and never staged as V-transpose.
+    assert "16, 32, 16, false, false, true" in source
+    assert "mpp::tensor_ops::matmul2d<desc_qk, metal::execution_simdgroup> mm_qk" in source
+    assert "mpp::tensor_ops::matmul2d<desc_pv, metal::execution_simdgroup> mm_pv" in source
+    assert source.count("mm_qk.run(qk_a, qk_b, qk_c)") == 1
+    assert source.count("mm_pv.run(pv_a, pv_b, pv_c)") == 1
+    # No staging: no threadgroup allocation, no threadgroup barrier.
+    assert "threadgroup T" not in source
+    assert "simdgroup_barrier" not in source
+    assert "tg_tile" not in source
+    # The query fragments are read once per threadgroup, not once per tile.
+    assert "T q_frag[D_FRAGS][QSA_ELEMS_PER_FRAG]" in source
+    assert source.index("T q_frag[D_FRAGS]") < source.index(
+        "for (int tile_index = 0; tile_index < active_tiles; ++tile_index)"
+    )
+    # Production layout takes vector reads; any other feature stride takes the
+    # strided reads. One loop-invariant branch, uniform across the simdgroup.
+    assert "const bool unit_stride = q_strides[3] == 1 && k_strides[3] == 1 &&" in source
+    assert "k[k_at + size_t(col)]" in source
+    assert "k[k_at + size_t(col) * k_strides[3]]" in source
+    assert "v[v_at + size_t(col)]" in source
+    assert "v[v_at + size_t(col) * v_strides[3]]" in source
+    # The selection itself never substitutes for causality: a producer bug
+    # cannot make an incomplete/future block visible, and an invalid slot
+    # never produces a cache address.
+    assert source.index("block_id < complete_blocks") < source.index("k[k_at")
+    assert "block_token[local_block] = ok ? block_id * BLOCK_TOKENS : -1" in source
+    assert "if (token >= 0) {" in source
+
+
+def test_staged_source_is_the_2_11_3_kernel_kept_as_the_rollback():
+    source = _literal("_STAGED_SOURCE")
     assert "constexpr int M_ROWS = 16" in source
-    assert "constexpr int TILE_BLOCKS = 8" in source
-    assert "constexpr int TOKENS_PER_TILE = TILE_BLOCKS * BLOCK_TOKENS" in source
     assert "constexpr int MAX_SELECTED_TILES = TOP_K_BLOCKS / TILE_BLOCKS" in source
-    assert "uint local_active_slots = 0u" in source
-    assert "const uint active_blocks = simd_max(local_active_slots)" in source
-    assert "block_id >= 0 && block_id < complete_blocks" in source
-    assert "const int active_selected_tiles" in source
-    assert "const int active_tiles" in source
-    assert "const int row = work / KV_HEADS" in source
-    assert "const int kv_head = work - row * KV_HEADS" in source
-    assert "mpp::tensor_ops::matmul2d_descriptor(" in source
-    assert "16, 32, 16, false, true, true" in source
     assert "mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup>" in source
     assert source.count("mm.run(ct_a, ct_b, ct_c)") == 2
 
@@ -95,47 +165,6 @@ def test_kernel_is_one_m16_n32_tensorops_simdgroup_per_row_and_kv_head():
     assert source.index(k_store) < source.index(vt_store)
     assert "simdgroup_barrier(mem_flags::mem_threadgroup)" in source
 
-    # All potentially non-contiguous inputs use the strides injected by MLX.
-    for stride_name in (
-        "q_strides",
-        "k_strides",
-        "v_strides",
-        "block_ids_strides",
-        "block_valid_strides",
-    ):
-        assert stride_name in source
-
-    kernel_factory = _function_source("_kernel")
-    for input_name in ('"q"', '"k"', '"v"', '"block_ids"', '"block_valid"'):
-        assert input_name in kernel_factory
-    assert "ensure_row_contiguous=False" in kernel_factory
-
-    forbidden = (
-        "mx.take",
-        "scaled_dot_product_attention",
-        "dense_mask",
-        "concatenate",
-    )
-    implementation = _function_source("qsa_prefill_flash")
-    for token in forbidden:
-        assert token not in source
-        assert token not in implementation
-
-
-def test_kernel_rechecks_validity_and_adds_only_the_visible_causal_tail():
-    source = _literal("_SOURCE")
-    assert "bool(block_valid[valid_at])" in source
-    assert "block_id >= 0 && block_id < complete_blocks" in source
-    assert "const int complete_blocks = (query_pos + 1) / BLOCK_TOKENS" in source
-    assert "const int tail_start = complete_blocks * BLOCK_TOKENS" in source
-    assert "const int tail_count = query_pos + 1 - tail_start" in source
-    assert "tile_index == active_selected_tiles" in source
-    assert "token_valid = token_slot < tail_count && token < total_tokens" in source
-    assert "tile_index < active_tiles" in source
-
-
-def test_cache_gathers_use_unaligned_safe_wide_copies_with_stride_fallbacks():
-    source = _literal("_SOURCE")
     assert "if (k_strides[3] == 1)" in source
     assert "if (v_strides[3] == 1)" in source
     assert "struct alignas(sizeof(T)) QSAReadVector8" in source
@@ -146,41 +175,79 @@ def test_cache_gathers_use_unaligned_safe_wide_copies_with_stride_fallbacks():
     assert "const device vec<T, 4>" not in source
     assert "const int dim0 = int(lane) * 8" in source
     assert "for (int dim = int(lane); dim < HEAD_DIM; dim += 32)" in source
-
-    # The selection itself never substitutes for causality: a producer bug
-    # cannot make an incomplete/future block visible.
     assert source.index("block_id < complete_blocks") < source.index("k[k_at]")
 
 
-def test_kernel_uses_fp32_online_softmax_and_tensorops_pv():
-    source = _literal("_SOURCE")
-    assert "float row_max[2]" in source
-    assert "float row_sum[2]" in source
-    assert "float out_frag[OUT_GROUPS][2][QSA_ELEMS_PER_FRAG]" in source
-    assert "float probabilities[2][QSA_ELEMS_PER_FRAG]" in source
-    assert "const float new_max = metal::max(row_max[row_part], tile_max)" in source
-    assert "metal::exp(row_max[row_part] - new_max)" in source
-    assert "metal::exp(score - new_max)" in source
+def test_both_sources_recheck_validity_and_add_only_the_visible_causal_tail():
+    for name in SOURCES:
+        source = _literal(name)
+        assert "bool(block_valid[valid_at])" in source, name
+        assert "block_id >= 0 && block_id < complete_blocks" in source
+        assert "const int complete_blocks = (query_pos + 1) / BLOCK_TOKENS" in source
+        assert "const int tail_start = complete_blocks * BLOCK_TOKENS" in source
+        assert "const int tail_count = query_pos + 1 - tail_start" in source
+        assert "tile_index == active_selected_tiles" in source
+        assert "tile_index < active_tiles" in source
     assert (
-        "row_sum[row_part] = row_sum[row_part] * correction[row_part] + tile_sum"
-        in source
+        "token_valid = token_slot < tail_count && token < total_tokens"
+        in _literal("_STAGED_SOURCE")
     )
-    assert "const float factor = correction[row_part]" in source
+    direct = _literal("_SOURCE")
+    assert "token = (token_slot < tail_count && t < total_tokens) ? t : -1" in direct
+    assert (
+        "token_valid = token_slot < tail_count &&"
+        "\n                            tail_start + token_slot < total_tokens" in direct
+    )
+
+
+def test_both_sources_use_fp32_online_softmax_and_tensorops_pv():
+    for name in SOURCES:
+        source = _literal(name)
+        assert "float row_max[2]" in source, name
+        assert "float row_sum[2]" in source
+        assert "float out_frag[OUT_GROUPS][2][QSA_ELEMS_PER_FRAG]" in source
+        assert "float probabilities[2][QSA_ELEMS_PER_FRAG]" in source
+        assert "const float new_max = metal::max(row_max[row_part], tile_max)" in source
+        assert "metal::exp(row_max[row_part] - new_max)" in source
+        assert "metal::exp(score - new_max)" in source
+        assert (
+            "row_sum[row_part] = row_sum[row_part] * correction[row_part] + tile_sum"
+            in source
+        )
+        assert "const float factor = correction[row_part]" in source
+        assert (
+            "row_sum[row_part] > 0.0f ? 1.0f / row_sum[row_part] : 0.0f" in source
+        )
+        # No decode-style scalar token loop remains in either source.
+        assert "dot_partial" not in source
+        assert "simd_sum" not in source
+        assert "TOP_K_BLOCKS * HEAD_DIM" not in source
+        assert "Q_HEADS * TOP_K_BLOCKS" not in source
+
+    staged = _literal("_STAGED_SOURCE")
     assert (
         "out_frag[group][dim_half]"
         "\n                                [row_part * QSA_ELEM_COLS + col] *= factor"
-        in source
+        in staged
     )
-    assert (
-        "row_sum[row_part] > 0.0f ? 1.0f / row_sum[row_part] : 0.0f" in source
-    )
-    assert "ct_a[row_part * QSA_ELEM_COLS + col] = T(" in source
+    assert "ct_a[row_part * QSA_ELEM_COLS + col] = T(" in staged
+    # Direct: the rescale of the running output rides in the destination load
+    # (the same fp32 multiply), and the probabilities enter PV in T.
+    direct = _literal("_SOURCE")
+    assert "pv_c[at] = out_frag[group][0][at] * factor" in direct
+    assert "pv_c[QSA_ELEMS_PER_FRAG + at] = out_frag[group][1][at] * factor" in direct
+    assert "pv_a[elem] = T(probabilities[token_half][elem])" in direct
 
-    # No decode-style scalar token loop remains in the active source.
-    assert "dot_partial" not in source
-    assert "simd_sum" not in source
-    assert "TOP_K_BLOCKS * HEAD_DIM" not in source
-    assert "Q_HEADS * TOP_K_BLOCKS" not in source
+
+def test_the_source_switch_defaults_to_direct_and_keeps_the_staged_rollback():
+    assert _literal("_KERNEL_VARIANTS") == ("direct", "staged")
+    variant = _function_source("_kernel_variant")
+    assert 'os.environ.get("MTPLX_QSA_PREFILL_FLASH_KERNEL") or "direct"' in variant
+    assert 'return raw if raw in _KERNEL_VARIANTS else "direct"' in variant
+    factory = _function_source("_kernel")
+    assert "source=_STAGED_SOURCE if staged else _SOURCE" in factory
+    assert '+ ("" if staged else "_direct")' in factory
+    assert "kernel = _kernel(_kernel_variant())" in _function_source("qsa_prefill_flash")
 
 
 def test_wrapper_launch_and_output_contract_match_one_tg_per_row_and_kv_head():

@@ -37,6 +37,20 @@ public enum DownloadEvent: Sendable {
     case cancelled
 }
 
+public struct CachedModelRemovalResult: Codable, Equatable, Sendable {
+    public let repoID: String
+    public let path: String
+    public let removed: Bool
+    public let sizeBytesRemoved: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case repoID = "repo_id"
+        case path
+        case removed
+        case sizeBytesRemoved = "size_bytes_removed"
+    }
+}
+
 // MARK: - ModelDownloader
 //
 // Shells out to `mtplx pull <repo> --progress-json` and consumes the
@@ -66,6 +80,12 @@ public struct ModelDownloader: Sendable {
     private let pollInterval: TimeInterval
     private let stalledThreshold: TimeInterval
     private let executableOverride: URL?
+    /// Test seam invoked at the top of `stream`'s build closure, on the
+    /// thread that builds the stream. The closure runs synchronously and
+    /// does blocking work (runtime resolution, directory walks, spawning
+    /// the CLI), so callers must build the stream off the main actor;
+    /// this lets a test prove they do. Production leaves it nil.
+    var streamBuildObserver: (@Sendable () -> Void)?
 
     // MARK: Public surface
 
@@ -81,12 +101,20 @@ public struct ModelDownloader: Sendable {
     static func streamArguments(
         repo: String,
         update: Bool,
-        destinationPath: String? = nil
+        destinationPath: String? = nil,
+        cacheRoot: URL? = nil
     ) -> [String] {
-        guard update else { return ["pull", repo, "--progress-json"] }
-        var arguments = ["models", "--update", repo, "--progress-json"]
-        if let destinationPath, !destinationPath.isEmpty {
+        var arguments: [String]
+        if update {
+            arguments = ["models", "--update", repo, "--progress-json"]
+        } else {
+            arguments = ["pull", repo, "--progress-json"]
+        }
+        if update, let destinationPath, !destinationPath.isEmpty {
             arguments += ["--installed-path", destinationPath]
+        }
+        if let cacheRoot {
+            arguments += ["--cache-dir", cacheRoot.path]
         }
         return arguments
     }
@@ -96,11 +124,16 @@ public struct ModelDownloader: Sendable {
         totalBytes: Int64?,
         extraEnvironment: [String: String] = [:],
         update: Bool = false,
-        sizeProbePath: String? = nil
+        sizeProbePath: String? = nil,
+        cacheRoot: URL? = nil
     ) -> AsyncStream<DownloadEvent> {
-        AsyncStream { continuation in
+        let operationCacheRoot = modelCacheRoot
+            ?? cacheRoot
+            ?? Self.defaultCacheRoot(env: processEnvironment)
+        return AsyncStream<DownloadEvent> { continuation in
+            self.streamBuildObserver?()
             let destination = sizeProbePath.map { URL(fileURLWithPath: $0) }
-                ?? self.cachedModelPath(for: repo)
+                ?? self.cachedModelPath(for: repo, cacheRoot: operationCacheRoot)
             // Make the destination dir up-front so the first poll returns 0
             // rather than spuriously matching "exists". Never for updates:
             // an empty canonical dir would shadow a populated legacy-layout
@@ -122,7 +155,7 @@ public struct ModelDownloader: Sendable {
                     ))
                 }
                 continuation.yield(.status(
-                    message: "MTPLX runtime ready",
+                    message: tr("MTPLX runtime ready"),
                     bytesOnDisk: Self.recursiveSize(of: destination),
                     totalBytes: totalBytes,
                     path: destination.path
@@ -140,7 +173,8 @@ public struct ModelDownloader: Sendable {
             process.arguments = Self.streamArguments(
                 repo: repo,
                 update: update,
-                destinationPath: sizeProbePath
+                destinationPath: sizeProbePath,
+                cacheRoot: operationCacheRoot
             )
             // Inherit a sensible PATH so Homebrew installs and wrappers can
             // find their helpers. Apply caller-owned download knobs first,
@@ -195,7 +229,7 @@ public struct ModelDownloader: Sendable {
                 return
             }
             continuation.yield(.status(
-                message: "Resolving files",
+                message: tr("Resolving files"),
                 bytesOnDisk: Self.recursiveSize(of: destination),
                 totalBytes: totalBytes,
                 path: destination.path
@@ -322,10 +356,10 @@ public struct ModelDownloader: Sendable {
 
         switch event {
         case "resolving":
-            return [.status(message: "Resolving files", bytesOnDisk: bytes, totalBytes: total, path: path)]
+            return [.status(message: tr("Resolving files"), bytesOnDisk: bytes, totalBytes: total, path: path)]
         case "start", "resume":
             return [
-                .status(message: "Downloading", bytesOnDisk: bytes ?? 0, totalBytes: total, path: path),
+                .status(message: tr("Downloading"), bytesOnDisk: bytes ?? 0, totalBytes: total, path: path),
             ]
         case "progress":
             let rate = double(payload["rate_bps"]) ?? 0
@@ -350,7 +384,7 @@ public struct ModelDownloader: Sendable {
             }
             return events
         case "verifying":
-            return [.status(message: "Verifying model files", bytesOnDisk: bytes, totalBytes: total, path: path)]
+            return [.status(message: tr("Verifying model files"), bytesOnDisk: bytes, totalBytes: total, path: path)]
         case "complete":
             state.markTerminal()
             return [.complete(bytesOnDisk: bytes ?? Self.recursiveSize(of: destination), path: path)]
@@ -363,14 +397,14 @@ public struct ModelDownloader: Sendable {
             let message = (payload["message"] as? String)
                 ?? (payload["detail"] as? String)
                 ?? (payload["error"] as? String)
-                ?? "Download failed."
+                ?? tr("Download failed.")
             return [.failed(exitCode: nil, stderrTail: message)]
         case "failed", "error":
             state.markTerminal()
             let message = (payload["message"] as? String)
                 ?? (payload["detail"] as? String)
                 ?? (payload["error"] as? String)
-                ?? "Download failed."
+                ?? tr("Download failed.")
             return [.failed(exitCode: nil, stderrTail: message)]
         case "cancelled", "interrupted":
             state.markTerminal()
@@ -415,9 +449,55 @@ public struct ModelDownloader: Sendable {
     /// Mirrors `mtplx/hf_loader.py:cached_model_path` exactly so the
     /// directory we poll matches the directory `mtplx pull` writes to.
     public func cachedModelPath(for repo: String) -> URL {
-        let root = modelCacheRoot ?? Self.defaultCacheRoot(env: processEnvironment)
+        cachedModelPath(for: repo, cacheRoot: nil)
+    }
+
+    public func cachedModelPath(for repo: String, cacheRoot: URL?) -> URL {
+        let root = modelCacheRoot ?? cacheRoot ?? Self.defaultCacheRoot(env: processEnvironment)
         let safeName = repo.replacingOccurrences(of: "/", with: "--")
         return root.appendingPathComponent(safeName, isDirectory: true)
+    }
+
+    /// The root the app downloads into, resolved the same way `download`
+    /// and `checkModelUpdates` resolve it: the injected root, then the
+    /// caller's primary model folder, then the default cache. Removal is
+    /// fenced against this root only. The additional model folders are
+    /// read-only by contract and never receive the removal action.
+    func managedCacheRoot(_ cacheRoot: URL?) -> URL {
+        (modelCacheRoot ?? cacheRoot ?? Self.defaultCacheRoot(env: processEnvironment))
+            .standardizedFileURL
+    }
+
+    /// The cache entry (folder name) behind an installed path, or nil when
+    /// the path is not a plain direct child of the configured MTPLX cache.
+    /// Paths outside that cache are user-managed local models, and a
+    /// symlinked entry points at storage the app does not own; neither may
+    /// receive the app's destructive removal affordance.
+    public func cachedEntryName(
+        forInstalledPath path: String,
+        cacheRoot: URL? = nil
+    ) -> String? {
+        let root = managedCacheRoot(cacheRoot)
+        let candidate = URL(fileURLWithPath: path).standardizedFileURL
+        guard candidate.deletingLastPathComponent().path == root.path else { return nil }
+        let safeName = candidate.lastPathComponent
+        guard !safeName.isEmpty, !safeName.hasPrefix(".") else { return nil }
+        if let attributes = try? FileManager.default.attributesOfItem(atPath: candidate.path),
+           attributes[.type] as? FileAttributeType == .typeSymbolicLink {
+            return nil
+        }
+        return safeName
+    }
+
+    /// The Hugging Face style reference (`org/name`) of a cache entry, for
+    /// matching against selections and pack-update records. The CLI is
+    /// handed the entry name itself, never this form.
+    public func cachedModelReference(
+        forInstalledPath path: String,
+        cacheRoot: URL? = nil
+    ) -> String? {
+        cachedEntryName(forInstalledPath: path, cacheRoot: cacheRoot)?
+            .replacingOccurrences(of: "--", with: "/")
     }
 
     public static func defaultCacheRoot(env: [String: String]) -> URL {
@@ -430,18 +510,28 @@ public struct ModelDownloader: Sendable {
             .appendingPathComponent("models", isDirectory: true)
     }
 
-    /// Recursive sum of all regular file sizes under `url`. Returns 0
-    /// if the directory doesn't exist yet (first poll, before HF
-    /// writes anything).
+    /// Recursive sum of the regular file sizes under `url`, used only as
+    /// the display fallback when the CLI emits no structured progress.
+    /// Returns 0 if the directory doesn't exist yet (first poll, before
+    /// anything is written). The hub cache's `.cache` staging tree is
+    /// skipped: older pulls left multi-GB `*.incomplete` partials there
+    /// that no download consumes. The structured path counts the
+    /// download manifest instead.
     public static func recursiveSize(of url: URL) -> Int64 {
         guard let enumerator = FileManager.default.enumerator(
             at: url,
-            includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
+            includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey, .isDirectoryKey],
             options: []
         ) else { return 0 }
         var total: Int64 = 0
         for case let fileURL as URL in enumerator {
-            let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+            let values = try? fileURL.resourceValues(
+                forKeys: [.fileSizeKey, .isRegularFileKey, .isDirectoryKey]
+            )
+            if values?.isDirectory == true, fileURL.lastPathComponent == ".cache" {
+                enumerator.skipDescendants()
+                continue
+            }
             if values?.isRegularFile == true {
                 total += Int64(values?.fileSize ?? 0)
             }
@@ -456,12 +546,24 @@ public struct ModelDownloader: Sendable {
     /// network access and freshness logic live entirely in the CLI, this
     /// just shells and decodes. Safe to run while a daemon is serving.
     public func checkModelUpdates(
+        cacheRoot: URL? = nil,
+        searchRoots: [URL] = [],
         timeoutSeconds: TimeInterval = 120
     ) async throws -> [ModelUpdateInfo] {
+        let operationCacheRoot = modelCacheRoot
+            ?? cacheRoot
+            ?? Self.defaultCacheRoot(env: processEnvironment)
         let executable = try resolveMtplxExecutable { _ in }
         let process = Process()
         process.executableURL = executable
-        process.arguments = ["models", "--check", "--json"]
+        var arguments = [
+            "models", "--check", "--json",
+            "--cache-dir", operationCacheRoot.path,
+        ]
+        for root in searchRoots {
+            arguments += ["--model-search-dir", root.path]
+        }
+        process.arguments = arguments
         var env = processEnvironment
         env["PATH"] = MTPLXCommandBuilder.expandedPATH(environment: processEnvironment)
         process.environment = MTPLXCommandBuilder.pythonBytecodeSafeEnvironment(
@@ -471,6 +573,8 @@ public struct ModelDownloader: Sendable {
         let errPipe = Pipe()
         process.standardOutput = outPipe
         process.standardError = errPipe
+        let exited = ProcessExitSignal()
+        process.terminationHandler = { _ in exited.signal() }
         try process.run()
         let watchdog = Task.detached(priority: .utility) {
             try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
@@ -479,11 +583,10 @@ public struct ModelDownloader: Sendable {
             }
         }
         defer { watchdog.cancel() }
-        let stdout = try await Task.detached(priority: .utility) { () -> Data in
-            let data = outPipe.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            return data
+        let stdout = await Task.detached(priority: .utility) { () -> Data in
+            outPipe.fileHandleForReading.readDataToEndOfFile()
         }.value
+        await exited.wait()
         guard process.terminationStatus == 0 else {
             let stderr = errPipe.fileHandleForReading.readDataToEndOfFile()
             let tail = String(decoding: stderr.suffix(512), as: UTF8.self)
@@ -499,6 +602,119 @@ public struct ModelDownloader: Sendable {
         return try JSONDecoder().decode(ModelUpdateCheckPayload.self, from: stdout).models
     }
 
+    /// `--yes` because the app already confirmed with the user: `mtplx
+    /// remove` refuses a non-interactive delete without it (a GUI app's
+    /// stdin is never a terminal) and would otherwise sit on its prompt
+    /// until the watchdog kills it. `--cache-dir` is always explicit so the
+    /// CLI deletes inside the root the entry was fenced against, never a
+    /// root it infers from its own environment. The entry's folder name is
+    /// the reference: the CLI takes it verbatim, so the folder removed is
+    /// the folder the user pointed at.
+    static func removalArguments(directoryName: String, cacheRoot: URL) -> [String] {
+        [
+            "remove", directoryName, "--yes", "--missing-ok", "--json",
+            "--cache-dir", cacheRoot.path,
+        ]
+    }
+
+    /// Why the CLI refused. Under `--json` the CLI writes its refusal to
+    /// stdout as `{"error": ..., "detail": ...}` and leaves stderr empty
+    /// (exit 2: a ref it will not resolve, two copies under one name, a
+    /// failed delete). Without `--yes` semantics it writes a plain line to
+    /// stderr (exit 1). Read both, so the user sees the reason and not a
+    /// bare exit code.
+    static func removalRefusalReason(stdout: Data, stderrTail: String) -> String? {
+        struct Refusal: Decodable { let detail: String? }
+        if let refusal = try? JSONDecoder().decode(Refusal.self, from: stdout),
+           let detail = refusal.detail?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !detail.isEmpty
+        {
+            return detail
+        }
+        return stderrTail.isEmpty ? nil : stderrTail
+    }
+
+    /// Delete one direct child of the MTPLX model cache through the public
+    /// CLI contract. The caller owns confirmation and the selected- and
+    /// serving-model guards.
+    public func removeCachedModel(
+        directoryName: String,
+        cacheRoot: URL? = nil,
+        timeoutSeconds: TimeInterval = 120
+    ) async throws -> CachedModelRemovalResult {
+        let executable = try resolveMtplxExecutable { _ in }
+        let cacheRoot = managedCacheRoot(cacheRoot)
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = Self.removalArguments(directoryName: directoryName, cacheRoot: cacheRoot)
+        var env = processEnvironment
+        env["PATH"] = MTPLXCommandBuilder.expandedPATH(environment: processEnvironment)
+        process.environment = MTPLXCommandBuilder.pythonBytecodeSafeEnvironment(
+            environment: env
+        )
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        // Never hand the CLI a terminal: a delete must not be able to wait
+        // on a prompt the user cannot see.
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+        let exited = ProcessExitSignal()
+        process.terminationHandler = { _ in exited.signal() }
+        try process.run()
+        let watchdog = Task.detached(priority: .utility) {
+            try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
+            if process.isRunning {
+                process.terminate()
+            }
+        }
+        defer { watchdog.cancel() }
+        let stdout = await Task.detached(priority: .utility) { () -> Data in
+            outPipe.fileHandleForReading.readDataToEndOfFile()
+        }.value
+        await exited.wait()
+        guard process.terminationStatus == 0 else {
+            let stderr = errPipe.fileHandleForReading.readDataToEndOfFile()
+            let tail = String(decoding: stderr.suffix(1024), as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            throw NSError(
+                domain: "ModelDownloader",
+                code: Int(process.terminationStatus),
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        Self.removalRefusalReason(stdout: stdout, stderrTail: tail)
+                            ?? "model removal exited \(process.terminationStatus)"
+                ]
+            )
+        }
+        let result: CachedModelRemovalResult
+        do {
+            result = try JSONDecoder().decode(CachedModelRemovalResult.self, from: stdout)
+        } catch {
+            throw NSError(
+                domain: "ModelDownloader",
+                code: 2,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "MTPLX returned an invalid model-removal response"
+                ]
+            )
+        }
+        // Contract check, not a guard: the CLI reports the folder it acted
+        // on, and that must be the entry named above. Anything else is a
+        // contract drift that has to be loud, not a state to recover from.
+        guard URL(fileURLWithPath: result.path).lastPathComponent == directoryName else {
+            throw NSError(
+                domain: "ModelDownloader",
+                code: 3,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "MTPLX reported acting on \(result.path) instead of \(directoryName)"
+                ]
+            )
+        }
+        return result
+    }
+
     private func resolveMtplxExecutable(
         status: @escaping @Sendable (String) -> Void
     ) throws -> URL {
@@ -507,7 +723,7 @@ public struct ModelDownloader: Sendable {
         {
             return executableOverride
         }
-        return try MTPLXRuntimeBootstrapper(environment: processEnvironment).installOrUpdate(status: status)
+        return try MTPLXRuntimeBootstrapper(environment: processEnvironment).installOrUpdate { key in status(tr(key)) }
     }
 }
 
@@ -586,6 +802,45 @@ private final class DownloadProgressJSONState: @unchecked Sendable {
         if let bytes { observedBytes = bytes }
         if let total { observedTotal = total }
         lock.unlock()
+    }
+}
+
+/// One-shot exit signal for a child process.
+///
+/// `Process.waitUntilExit()` spins the calling thread's run loop. Called from
+/// a Swift concurrency pool thread, the termination wake-up can be missed:
+/// the child is gone and the wait never returns. Seen on 2026-09-18 in
+/// `ModelRemovalServiceTests`: a stand-in CLI that exited within
+/// milliseconds, and the waiter parked in `__CFRunLoopServiceMachPort` for
+/// ten minutes. For the app that is a Remove that spins forever, because the
+/// watchdog only terminates a child that is still running. The termination
+/// handler is installed before `run()`, so the exit cannot be missed, and
+/// the waiter suspends instead of holding a thread.
+final class ProcessExitSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var exited = false
+    private var waiter: CheckedContinuation<Void, Never>?
+
+    func signal() {
+        lock.lock()
+        exited = true
+        let resumed = waiter
+        waiter = nil
+        lock.unlock()
+        resumed?.resume()
+    }
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if exited {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                waiter = continuation
+                lock.unlock()
+            }
+        }
     }
 }
 

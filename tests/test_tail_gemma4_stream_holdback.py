@@ -274,3 +274,83 @@ def test_gemma4_assistant_disarmed_stream_matches_committed_tokens(monkeypatch):
     wire = [token for call in calls for token in call]
     assert len(out.tokens) == 60  # no trim when disarmed
     assert wire == list(out.tokens)
+
+
+# ---------------------------------------------------------------------------
+# Long-cycle stop: both gemma4 loops end a period above max_block_tokens
+# without a trim (wire == final tokens) and report why.
+# ---------------------------------------------------------------------------
+
+LONG_PERIOD = 20
+# Walk 1..39, cycle from index 39, three whole copies at 99 tokens; both
+# loops check after every appended token, so they stop exactly there.
+LONG_CYCLE_FIRE_LEN = 99
+
+
+def _next_token_long_cycle(token: int) -> int:
+    nxt = int(token) + 1
+    if nxt >= LOOP_START + LONG_PERIOD:
+        return LOOP_START
+    return nxt
+
+
+def _set_long_cycle_env(monkeypatch) -> None:
+    _set_repetition_env(monkeypatch)  # the short-block stop covers <= 8
+    monkeypatch.setenv("MTPLX_REPETITION_STOP_MAX_CYCLE_TOKENS", "64")
+    monkeypatch.setenv("MTPLX_REPETITION_STOP_MIN_CYCLE_COPIES", "3")
+    monkeypatch.setenv("MTPLX_REPETITION_STOP_MIN_CYCLE_SPAN_TOKENS", "48")
+
+
+def _assert_long_cycle_receipt(out) -> None:
+    stats = out.stats
+    assert len(out.tokens) == LONG_CYCLE_FIRE_LEN
+    assert stats.repetition_stop_triggered is True
+    assert stats.repetition_stop_reason == "long_cycle"
+    assert stats.repetition_stop_block_tokens == LONG_PERIOD
+    assert stats.repetition_stop_repeats == 3
+    assert stats.repetition_stop_trimmed_tokens == 0
+    assert stats.repetition_stop_raw_tokens == LONG_CYCLE_FIRE_LEN
+    assert any(
+        event.get("repetition_stop", {}).get("reason") == "long_cycle"
+        for event in stats.events
+    )
+
+
+def test_gemma4_ar_long_cycle_stops_without_trim(monkeypatch):
+    _set_long_cycle_env(monkeypatch)
+    _patch_prefill(monkeypatch, _next_token_long_cycle)
+    calls, callback = _collecting_callback()
+    out = gemma4.generate_gemma4_ar(
+        _ScriptedGemmaRuntime(_next_token_long_cycle),
+        [0],
+        max_tokens=400,
+        sampler=GREEDY,
+        seed=7,
+        stop_token_ids=set(),
+        token_callback=callback,
+        repetition_stop=True,
+    )
+    _assert_long_cycle_receipt(out)
+    wire = [token for call in calls for token in call]
+    assert wire == list(out.tokens)
+
+
+def test_gemma4_assistant_long_cycle_stops_without_trim(monkeypatch):
+    _set_long_cycle_env(monkeypatch)
+    _patch_prefill(monkeypatch, _next_token_long_cycle)
+    _patch_speculative_round(monkeypatch, _next_token_long_cycle)
+    calls, callback = _collecting_callback()
+    out = gemma4.generate_gemma4_assistant(
+        _ScriptedGemmaRuntime(_next_token_long_cycle),
+        [0],
+        max_tokens=400,
+        sampler=GREEDY,
+        speculative_depth=2,
+        seed=7,
+        stop_token_ids=set(),
+        token_callback=callback,
+        repetition_stop=True,
+    )
+    _assert_long_cycle_receipt(out)
+    wire = [token for call in calls for token in call]
+    assert wire == list(out.tokens)

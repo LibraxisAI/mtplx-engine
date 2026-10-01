@@ -317,11 +317,38 @@ def split_reasoning_text(
 
 
 class ReasoningContentStreamSplitter:
-    """Incrementally split backend-native reasoning from visible content."""
+    """Incrementally split backend-native reasoning from visible content.
+
+    This class is the whole contract the server's stream lane reads from a
+    splitter, whichever codec built it. It is stated here once because it had
+    drifted: the lane read a member that only the server's own Qwen splitter
+    defined, so every streamed Gemma 4 turn without tools failed at the finish
+    frame after a successful generation (#517).
+
+    * ``start()``, ``feed(text)`` and ``finish(...)`` return ``(field, text)``
+      chunks, ``field`` being ``"reasoning_content"`` or ``"content"``.
+    * ``finish(recover_unclosed_reasoning_as_content=True)``: the turn stopped
+      inside a think block and nothing visible was ever emitted, so the
+      reasoning is handed to the content channel instead of leaving the user
+      an empty reply.
+    * ``reentry_count``: think blocks re-entered after the first.
+    * ``suppressed_tool_markup_chars``: characters of tool-call markup the
+      splitter withheld from the visible channel because the request declared
+      no tools. A codec that never withholds markup reports 0.
+    * ``tool_preamble_recovered_content``: pre-tool-call text ``finish`` hands
+      back for the content channel, or ``None``.
+
+    A codec implements ``_feed`` and ``_finish``; the public methods own the
+    bookkeeping, so a new codec cannot satisfy half of the contract.
+    """
 
     def __init__(self, *, thinking_enabled: bool) -> None:
         self._thinking_enabled = thinking_enabled
         self._reentry_count = 0
+        self.suppressed_tool_markup_chars = 0
+        self.tool_preamble_recovered_content: str | None = None
+        self._streamed_reasoning: list[str] = []
+        self._streamed_content = False
 
     @property
     def reentry_count(self) -> int:
@@ -331,10 +358,38 @@ class ReasoningContentStreamSplitter:
         return []
 
     def feed(self, text: str) -> list[tuple[str, str]]:
+        return self._observe(self._feed(text))
+
+    def finish(
+        self,
+        *,
+        recover_unclosed_reasoning_as_content: bool | None = None,
+    ) -> list[tuple[str, str]]:
+        chunks = self._observe(self._finish())
+        if (
+            recover_unclosed_reasoning_as_content
+            and self._thinking_enabled
+            and not self._streamed_content
+        ):
+            recovered = "".join(self._streamed_reasoning).strip()
+            if recovered:
+                self._streamed_content = True
+                chunks.append(("content", recovered))
+        return chunks
+
+    def _feed(self, text: str) -> list[tuple[str, str]]:
         raise NotImplementedError
 
-    def finish(self) -> list[tuple[str, str]]:
+    def _finish(self) -> list[tuple[str, str]]:
         raise NotImplementedError
+
+    def _observe(self, chunks: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        for field, text in chunks:
+            if field == "reasoning_content":
+                self._streamed_reasoning.append(text)
+            elif field == "content" and text:
+                self._streamed_content = True
+        return chunks
 
 
 class QwenThinkingContentStreamSplitter(ReasoningContentStreamSplitter):
@@ -345,7 +400,7 @@ class QwenThinkingContentStreamSplitter(ReasoningContentStreamSplitter):
         self._disabled_visible_started = False
         self._pending = ""
 
-    def feed(self, text: str) -> list[tuple[str, str]]:
+    def _feed(self, text: str) -> list[tuple[str, str]]:
         if not text:
             return []
         if not self._thinking_enabled:
@@ -354,7 +409,7 @@ class QwenThinkingContentStreamSplitter(ReasoningContentStreamSplitter):
         self._pending += text
         return self._drain(final=False)
 
-    def finish(self) -> list[tuple[str, str]]:
+    def _finish(self) -> list[tuple[str, str]]:
         chunks = (
             self._drain(final=True)
             if self._thinking_enabled
@@ -500,13 +555,13 @@ class Gemma4ThinkingContentStreamSplitter(ReasoningContentStreamSplitter):
         self._reasoning_prefix_buffer = ""
         self._reasoning_prefix_stripped = False
 
-    def feed(self, text: str) -> list[tuple[str, str]]:
+    def _feed(self, text: str) -> list[tuple[str, str]]:
         if not text:
             return []
         self._pending += text
         return self._drain(final=False)
 
-    def finish(self) -> list[tuple[str, str]]:
+    def _finish(self) -> list[tuple[str, str]]:
         chunks = self._drain(final=True)
         self._inside_thinking = False
         return chunks
@@ -600,8 +655,19 @@ class ThinkingContentStreamNormalizer(QwenThinkingContentStreamSplitter):
     def feed(self, text: str) -> list[str]:
         return [chunk for _, chunk in super().feed(text)]
 
-    def finish(self) -> list[str]:
-        return [chunk for _, chunk in super().finish()]
+    def finish(
+        self,
+        *,
+        recover_unclosed_reasoning_as_content: bool | None = None,
+    ) -> list[str]:
+        return [
+            chunk
+            for _, chunk in super().finish(
+                recover_unclosed_reasoning_as_content=(
+                    recover_unclosed_reasoning_as_content
+                )
+            )
+        ]
 
 
 def stream_splitter_for_parser(

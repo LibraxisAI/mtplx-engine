@@ -4,6 +4,7 @@ import base64
 import json
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -19,6 +20,7 @@ from mtplx.opencode import (
     opencode_session_headers_plugin_path,
     repair_opencode_desktop_state,
     write_opencode_config,
+    write_opencode_session_headers_plugin,
 )
 
 
@@ -60,11 +62,20 @@ def test_build_opencode_config_keeps_sampler_policy_server_side():
     assert model["reasoning"] is True
     assert model["tool_call"] is True
     assert model["temperature"] is True
-    assert model["limit"] == {"context": 262144, "output": 262144}
+    assert model["limit"] == {"context": 262144, "output": 32000}
     assert "interleaved" not in model
     assert "options" not in model
     assert "variants" not in model
     assert "maxTokens" not in json.dumps(payload)
+
+
+def test_opencode_writer_upgrades_text_only_model_registration(tmp_path):
+    path = tmp_path / "opencode.json"
+    kwargs = dict(base_url="http://127.0.0.1:8000/v1", model_id="vision-model", path=path)
+    write_opencode_config(**kwargs)
+    assert json.loads(path.read_text())["provider"]["mtplx"]["models"]["vision-model"]["modalities"]["input"] == ["text"]
+    write_opencode_config(**kwargs, vision=True)
+    assert json.loads(path.read_text())["provider"]["mtplx"]["models"]["vision-model"]["modalities"]["input"] == ["text", "image"]
 
 
 def test_build_opencode_config_carries_family_effort_dial():
@@ -240,10 +251,49 @@ def test_merge_opencode_config_canonicalizes_stale_session_headers_entries():
     ]
 
 
-def test_write_opencode_config_backs_up_invalid_json(tmp_path, monkeypatch):
+def test_write_opencode_config_refuses_unreadable_json_and_leaves_it_alone(tmp_path, monkeypatch):
+    """C-12: an opencode.json that does not parse used to be moved to a
+    .invalid-<stamp>.bak and replaced with an MTPLX-only config, so the
+    user's other providers, agents and keybinds vanished from the live file.
+    Now nothing is moved or written and the caller gets the path and error."""
+    from mtplx.jsonc import InvalidConfigFile
+
     path = tmp_path / "opencode.json"
     settings_store = tmp_path / "default.dat"
-    path.write_text("{bad json", encoding="utf-8")
+    path.write_text('{"provider": {"lmstudio": {}}, bad json', encoding="utf-8")
+    monkeypatch.setenv("MTPLX_OPENCODE_CONFIG", str(path))
+    monkeypatch.setenv("MTPLX_OPENCODE_DESKTOP_SETTINGS_STORE", str(settings_store))
+
+    with pytest.raises(InvalidConfigFile) as excinfo:
+        write_opencode_config(
+            base_url="http://127.0.0.1:18083/v1",
+            model_id="mtplx-qwen36-27b-optimized-quality",
+            api_key="1234",
+        )
+
+    assert str(path) in str(excinfo.value)
+    assert "line 1, column 32" in str(excinfo.value)
+    assert path.read_text(encoding="utf-8") == '{"provider": {"lmstudio": {}}, bad json'
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["opencode.json"], "nothing else written"
+    assert not settings_store.exists()
+
+
+def test_write_opencode_config_merges_a_jsonc_config_instead_of_replacing_it(
+    tmp_path, monkeypatch
+):
+    """OpenCode reads opencode.json as JSONC (jsonc-parser, allowTrailingComma).
+    A config with comments and trailing commas is a working config; MTPLX must
+    merge into it, and keep the user's original text next to the rewrite."""
+    path = tmp_path / "opencode.json"
+    settings_store = tmp_path / "default.dat"
+    original = (
+        "{\n"
+        "  // my providers\n"
+        '  "provider": {"lmstudio": {"name": "LM Studio",},},\n'
+        '  "keybinds": {"leader": "ctrl+x",}, /* keep */\n'
+        "}\n"
+    )
+    path.write_text(original, encoding="utf-8")
     monkeypatch.setenv("MTPLX_OPENCODE_CONFIG", str(path))
     monkeypatch.setenv("MTPLX_OPENCODE_DESKTOP_SETTINGS_STORE", str(settings_store))
 
@@ -254,12 +304,54 @@ def test_write_opencode_config_backs_up_invalid_json(tmp_path, monkeypatch):
     )
 
     assert result["written"] is True
-    assert result["backup_path"]
-    assert path.exists()
     payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["provider"]["lmstudio"] == {"name": "LM Studio"}
+    assert payload["keybinds"] == {"leader": "ctrl+x"}
     assert payload["provider"]["mtplx"]["options"]["baseURL"] == "http://127.0.0.1:18083/v1"
-    assert result["reasoning_visibility"]["status"] == "enabled"
-    assert settings_store.exists()
+    assert not list(tmp_path.glob("*.invalid-*")), "a readable config is never treated as invalid"
+    backup = Path(result["backup_path"])
+    assert backup.parent == tmp_path
+    assert "before-mtplx" in backup.name
+    assert backup.read_text(encoding="utf-8") == original
+
+
+def test_write_opencode_config_leaves_an_up_to_date_file_untouched(tmp_path, monkeypatch):
+    path = tmp_path / "opencode.json"
+    settings_store = tmp_path / "default.dat"
+    monkeypatch.setenv("MTPLX_OPENCODE_CONFIG", str(path))
+    monkeypatch.setenv("MTPLX_OPENCODE_DESKTOP_SETTINGS_STORE", str(settings_store))
+    kwargs = dict(
+        base_url="http://127.0.0.1:18083/v1",
+        model_id="mtplx-qwen36-27b-optimized-quality",
+        api_key="1234",
+    )
+
+    first = write_opencode_config(**kwargs)
+    assert first["written"] is True
+    assert first["backup_path"] is None  # nothing existed to keep
+    # The user adds a comment; the content MTPLX cares about is unchanged.
+    commented = "// mine\n" + path.read_text(encoding="utf-8")
+    path.write_text(commented, encoding="utf-8")
+
+    second = write_opencode_config(**kwargs)
+
+    assert second["written"] is False
+    assert second["backup_path"] is None
+    assert path.read_text(encoding="utf-8") == commented
+    assert not list(tmp_path.glob("*.bak"))
+
+
+def test_ensure_opencode_reasoning_summaries_visible_leaves_unreadable_store_alone(tmp_path):
+    store = tmp_path / "default.dat"
+    store.write_text("{not json", encoding="utf-8")
+
+    result = ensure_opencode_reasoning_summaries_visible(store)
+
+    assert result["status"] == "unreadable_store"
+    assert result["did_change"] is False
+    assert result["backup_path"] is None
+    assert store.read_text(encoding="utf-8") == "{not json"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["default.dat"]
 
 
 def test_write_opencode_config_installs_session_headers_plugin(tmp_path, monkeypatch):
@@ -283,13 +375,19 @@ def test_write_opencode_config_installs_session_headers_plugin(tmp_path, monkeyp
     assert payload["provider"]["mtplx"]["options"]["headers"]["x-mtplx-client"] == "opencode"
     plugin_path = str(opencode_session_headers_plugin_path(path))
     assert plugin_path in payload["plugin"]
-    assert (path.parent / "mtplx-session-headers.js").exists()
+    package = Path(plugin_path)
+    assert package.parent.name == "plugins"
+    assert json.loads((package / "package.json").read_text())["exports"] == {
+        ".": "./index.js", "./server": "./server.js"
+    }
+    assert (package / "server.js").exists()
+    assert str(path.parent / "mtplx-session-headers.js") not in payload["plugin"]
     assert result["reasoning_visibility"]["path"] == str(settings_store)
     assert result["reasoning_visibility"]["did_change"] is True
     assert payload["provider"]["mtplx"]["models"]
     assert result["session_headers_plugin_path"] == plugin_path
     assert not (path.parent / "package.json").exists()
-    plugin_source = (path.parent / "mtplx-session-headers.js").read_text(
+    plugin_source = (package / "index.js").read_text(
         encoding="utf-8"
     )
     assert 'output.headers["x-mtplx-session-id"]' in plugin_source
@@ -317,6 +415,43 @@ def test_write_opencode_config_installs_session_headers_plugin(tmp_path, monkeyp
     assert "output.topP === mtplxInjectedQwenTopP" in plugin_source
     assert "process.stdout.write" not in plugin_source
     assert "message.updated" not in plugin_source
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_plugin_package_registers_v1_and_provider_scoped_v2_headers(tmp_path):
+    package = write_opencode_session_headers_plugin(tmp_path / "opencode.json")
+    script = f"""
+import plugin from {json.dumps((package / 'server.js').as_uri())};
+import legacy from {json.dumps((package / 'index.js').as_uri())};
+const registrations = [];
+await plugin.setup({{session: {{hook: async (...args) => registrations.push(args)}}}});
+const [name, callback, filter] = registrations[0];
+const event = {{sessionID: 'ses_v2', headers: {{existing: 'kept'}},
+  model: {{providerID: 'mtplx', id: 'flash'}}, kind: 'primary'}};
+await callback(event);
+const hooks = await plugin.server();
+const output = {{headers: {{existing: 'kept'}}}};
+await hooks['chat.headers']({{sessionID: 'ses_v1', model: {{providerID: 'mtplx'}},
+  message: {{id: 'msg_user'}}}}, output);
+console.log(JSON.stringify({{id: plugin.id, name, filter, count: registrations.length,
+  sameLegacy: plugin.server === legacy, event, output}}));
+"""
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        capture_output=True, text=True, check=True,
+    )
+    data = json.loads(result.stdout)
+    assert data["sameLegacy"] is True
+    assert data["count"] == 1
+    assert data["name"] == "model.request"
+    assert data["filter"] == {"providerID": "mtplx"}
+    assert data["event"]["headers"] == {
+        "existing": "kept", "x-mtplx-client": "opencode",
+        "x-mtplx-session-id": "ses_v2",
+    }
+    assert data["output"]["headers"]["x-mtplx-session-id"] == "ses_v1"
+    assert data["output"]["headers"]["x-mtplx-client-turn-id"] == "msg_user"
+    assert set(data["event"]) == {"sessionID", "headers", "model", "kind"}
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
@@ -490,3 +625,32 @@ def test_repair_opencode_desktop_state_prunes_missing_workspace(tmp_path, monkey
     assert "mtplx-opencode-desktop-qa" not in repaired["layout.page"]
     assert "mtplx-opencode-desktop-qa" not in repaired["server"]
     assert str(present) in repaired["layout.page"]
+
+
+def test_opencode_output_limit_keeps_half_the_window():
+    """Issue #480: OpenCode reserves the output limit out of the context before
+    deciding whether the conversation still fits; equal numbers left nothing."""
+    from mtplx.opencode import opencode_output_limit
+
+    assert opencode_output_limit(262_144) == 32_000
+    assert opencode_output_limit(57_344) == 28_672
+    assert opencode_output_limit(8_192) == 4_096
+    assert opencode_output_limit(8_192, 6_000) == 4_096
+    assert opencode_output_limit(262_144, 8_000) == 8_000
+    assert opencode_output_limit(262_144, 0) == 32_000
+
+
+def test_written_config_reserves_half_of_a_small_window(tmp_path):
+    from mtplx.opencode import write_opencode_config
+
+    config_path = tmp_path / "opencode.json"
+    result = write_opencode_config(
+        path=config_path,
+        base_url="http://127.0.0.1:8000/v1",
+        model_id="mtplx-qwen38-27b-optimized-speed-fp16",
+        context_window=8_192,
+    )
+    assert result["output_limit"] == 4_096
+    written = json.loads(config_path.read_text())
+    model = written["provider"]["mtplx"]["models"]["mtplx-qwen38-27b-optimized-speed-fp16"]
+    assert model["limit"] == {"context": 8192, "output": 4096}

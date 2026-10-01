@@ -344,3 +344,18 @@ def test_non_streaming_requests_get_sink_driven_samples(tmp_path):
     assert sample["drf"] == [16, 16, 16]
     assert sample["ctx"] == 540
     assert "tps" not in sample, "no stream window -> no fabricated rate"
+
+
+def test_non_stream_token_callback_feeds_the_flight_recorder():
+    """A non-streaming chat request must drive the recorder's token hook the
+    way the SSE drain loop does, or /v1/mtplx/flight reports it as a
+    never-ending prefill."""
+    import inspect
+    import re
+
+    from mtplx.server import openai as server
+
+    source = inspect.getsource(server)
+    start = source.index("def _nonstream_on_tokens(")
+    body = source[start : source.index("def adopt_forked_session(", start)]
+    assert re.search(r"_flight\(state\)\.on_tokens\(\s*response_id,", body)

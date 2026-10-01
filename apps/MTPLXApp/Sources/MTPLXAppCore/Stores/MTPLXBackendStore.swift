@@ -9,6 +9,36 @@ public enum PendingModelDownloadLaunchAction: String, Equatable, Sendable {
     case restart
 }
 
+/// What the last app-launched daemon actually got on its command line for
+/// scheduling, plus the Settings selection that produced it.
+///
+/// Issue #398: the app logged only `app_stop_all_invoked` around a restart,
+/// so "my pick never reached the daemon" and "my pick ran and the UI forgot
+/// it" were indistinguishable from the outside. Recording the flags read
+/// back out of the built argv makes the answer readable in the app's own
+/// log pane and in the AIME diagnostics file, and it gives Settings a true
+/// "running now" value to compare the picker against.
+public struct DaemonLaunchScheduling: Equatable, Sendable {
+    public var schedulerMode: String
+    public var batchingPreset: String
+    /// Normalized Performance picker selection at launch time.
+    public var selectedPreset: String
+    /// `mtplx start <target>` surface, or "none" for a bare serve.
+    public var target: String
+
+    public init(
+        schedulerMode: String,
+        batchingPreset: String,
+        selectedPreset: String,
+        target: String
+    ) {
+        self.schedulerMode = schedulerMode
+        self.batchingPreset = batchingPreset
+        self.selectedPreset = selectedPreset
+        self.target = target
+    }
+}
+
 public struct PendingModelDownload: Identifiable, Equatable, Sendable {
     public var id: String
     public var repoID: String
@@ -18,6 +48,8 @@ public struct PendingModelDownload: Identifiable, Equatable, Sendable {
     public var launchAction: PendingModelDownloadLaunchAction
     public var totalBytes: Int64?
     public var destinationPath: String
+    /// Immutable write root captured when the operation is presented.
+    public var cacheRoot: String
 
     public init(
         repoID: String,
@@ -26,9 +58,12 @@ public struct PendingModelDownload: Identifiable, Equatable, Sendable {
         target: LaunchTarget?,
         launchAction: PendingModelDownloadLaunchAction,
         totalBytes: Int64?,
-        destinationPath: String
+        destinationPath: String,
+        cacheRoot: String? = nil
     ) {
-        self.id = "\(repoID)|\(target?.rawValue ?? "default")|\(launchAction.rawValue)"
+        let resolvedRoot = cacheRoot
+            ?? URL(fileURLWithPath: destinationPath).deletingLastPathComponent().path
+        self.id = "\(repoID)|\(resolvedRoot)|\(target?.rawValue ?? "default")|\(launchAction.rawValue)"
         self.repoID = repoID
         self.displayName = displayName
         self.shortName = shortName
@@ -36,6 +71,7 @@ public struct PendingModelDownload: Identifiable, Equatable, Sendable {
         self.launchAction = launchAction
         self.totalBytes = totalBytes
         self.destinationPath = destinationPath
+        self.cacheRoot = resolvedRoot
     }
 }
 
@@ -80,11 +116,31 @@ public enum BenchmarkDaemonReadinessError: Error, Equatable, LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .modelDownloadRequired(let model):
-            return "Download \(model) before running the benchmark."
+            return tr("Download %@ before running the benchmark.", model)
         case .startupFailed(let reason):
-            return "Couldn't start MTPLX for the benchmark: \(reason)"
+            return tr("Couldn't start MTPLX for the benchmark: %@", reason)
         case .unreachable(let url):
-            return "Can't reach MTPLX at \(url.absoluteString)."
+            return tr("Can't reach MTPLX at %@.", url.absoluteString)
+        }
+    }
+}
+
+public enum CachedModelRemovalError: Error, Equatable, LocalizedError {
+    case selectedModel
+    case servedByRunningDaemon
+    case transferInProgress
+    case outsideManagedCache
+
+    public var errorDescription: String? {
+        switch self {
+        case .selectedModel:
+            return tr("Switch to another model before removing this download.")
+        case .servedByRunningDaemon:
+            return tr("MTPLX is running this model. Switch models or stop MTPLX first.")
+        case .transferInProgress:
+            return tr("Wait for the current model download or update to finish.")
+        case .outsideManagedCache:
+            return tr("This model is outside the MTPLX download folder and was left untouched.")
         }
     }
 }
@@ -102,19 +158,19 @@ public struct ClientHandoffNotice: Equatable, Sendable {
 
         switch result.action {
         case .unavailable:
-            status = "Needs OpenCode Desktop"
-            detail = "MTPLX is running, but OpenCode Desktop was not found at /Applications/OpenCode.app."
+            status = tr("Needs OpenCode Desktop")
+            detail = tr("MTPLX is running, but OpenCode Desktop was not found at /Applications/OpenCode.app.")
             isWarning = true
         case .opened:
-            status = "OpenCode opened"
+            status = tr("OpenCode opened")
             detail = result.detail
             isWarning = false
         case .relaunched:
-            status = "OpenCode reloaded"
+            status = tr("OpenCode reloaded")
             detail = result.detail
             isWarning = false
         case .focused:
-            status = "OpenCode focused"
+            status = tr("OpenCode focused")
             detail = result.detail
             isWarning = false
         }
@@ -133,10 +189,10 @@ public struct ClientHandoffNotice: Equatable, Sendable {
         }
         let detail = result.action == .unavailable
             ? result.detail
-            : "MTPLX opened Terminal, but no Pi agent process was detected. Install Pi, then pick Pi again."
+            : tr("MTPLX opened Terminal, but no Pi agent process was detected. Install Pi, then pick Pi again.")
         return ClientHandoffNotice(
             target: .pi,
-            status: result.action == .unavailable ? "Pi handoff unavailable" : "Pi not detected",
+            status: result.action == .unavailable ? tr("Pi handoff unavailable") : tr("Pi not detected"),
             detail: detail,
             isWarning: true
         )
@@ -162,6 +218,10 @@ public final class MTPLXBackendStore: ObservableObject {
     @Published public private(set) var connectionState: MetricsConnectionState = .idle
     @Published public private(set) var startupPhase: DaemonStartupPhase = .idle
     @Published public private(set) var health: HealthPayload?
+    /// Seconds the running daemon has gone without answering /health while
+    /// its process and port still look alive (issue #487): "busy", not dead.
+    /// nil whenever the last probe was answered.
+    @Published public private(set) var daemonUnresponsiveFor: TimeInterval?
     @Published public private(set) var capabilities: AppCapabilities?
     @Published public private(set) var snapshot: DashboardSnapshot?
     @Published public private(set) var latest: MetricsLatest?
@@ -179,6 +239,9 @@ public final class MTPLXBackendStore: ObservableObject {
     /// nil until a source-aware (2.10+) daemon reports.
     @Published public private(set) var memoryPressureSource: String?
     @Published public private(set) var memoryPlan: MemoryPlanStatus?
+    /// Scheduling flags the most recent app-owned daemon launch carried
+    /// (issue #398). nil until this app session has launched a daemon.
+    @Published public private(set) var lastLaunchScheduling: DaemonLaunchScheduling?
     /// True when the guard's event ring shows caches actually shed within
     /// the recency window — the banner's "shedding" claim keys off this,
     /// never off the pressure level alone (a warning-level tick during a
@@ -220,9 +283,21 @@ public final class MTPLXBackendStore: ObservableObject {
     @Published public private(set) var piTerminalLaunchCommand: String?
     @Published public private(set) var piTerminalLaunchDetail: String?
     @Published public private(set) var clientHandoffNotice: ClientHandoffNotice?
-    /// One-line banner shown after the configured port was occupied and the
-    /// daemon moved to the next free port (persisted to settings).
+    /// Banner shown while a launch runs on a fallback port because the
+    /// configured one was occupied. Stays until the next user-initiated
+    /// start; the fallback itself is never persisted (issue #503).
     @Published public private(set) var portFallbackNotice: String?
+    /// Issue #503: the configured port while a launch runs on a fallback
+    /// port. A relocated port used to be saved to settings, so one wedged
+    /// daemon at one restart moved every client pinned to the configured
+    /// port for good. Settings keep the configured port, every
+    /// user-initiated start tries it again, and a save made meanwhile
+    /// writes the configured port back unless the user changed the port on
+    /// purpose (see `persistConfiguration`).
+    private var activePortFallback: (configured: Int, fallback: Int)?
+    /// One-line, dismissable banner shown when `settings.json` could not be
+    /// read at launch and was set aside (see `loadPersistedSettings`).
+    @Published public private(set) var settingsRecoveryNotice: SettingsRecoveryNotice?
     @Published public private(set) var pendingModelDownload: PendingModelDownload?
     @Published public private(set) var modelDownloadProgress: DownloadProgressSnapshot?
     @Published public private(set) var modelDownloadFailure: String?
@@ -305,6 +380,8 @@ public final class MTPLXBackendStore: ObservableObject {
     private let settingsStore: MTPLXSettingsStore
     private let commandBuilder: MTPLXCommandBuilder
     private let supervisor: DaemonSupervisor
+    /// See `init(browserAuthSession:)`; nil in production.
+    private let browserAuthSession: URLSession?
     private let openCodeIntegration: OpenCodeIntegration
     private let piIntegration: PiIntegration
     private let hermesIntegration: HermesIntegration
@@ -334,6 +411,9 @@ public final class MTPLXBackendStore: ObservableObject {
     private var modelDownloadTask: Task<Void, Never>?
     private var modelTuneTask: Task<Void, Never>?
     private var lateHealthRecoveryTask: Task<Void, Never>?
+    /// Background refresh of the runtime card; see
+    /// `scheduleRuntimeUpdateStatusRefresh`.
+    private var runtimeUpdateStatusRefreshTask: Task<Void, Never>?
     /// The slow part of stopping the daemon (fan restore + graceful
     /// SIGTERM/reap of the serve child) runs here, detached from the
     /// instant UI flip, so the Stop/Play control isn't frozen for the ~5s
@@ -371,10 +451,14 @@ public final class MTPLXBackendStore: ObservableObject {
         beforeThermalStatusRefresh: (@Sendable () async -> Void)? = nil,
         beforeClientHandoffLaunch: (@Sendable (LaunchTarget) async -> Void)? = nil,
         openCodeDesktopCanceller: ((MTPLXDesktopHandoffIdentity) -> Bool)? = nil,
-        modelUpdateChecker: (@Sendable () async throws -> [ModelUpdateInfo])? = nil
+        modelUpdateChecker: (@Sendable () async throws -> [ModelUpdateInfo])? = nil,
+        // Test seam for the browser sign-in ticket request. Production
+        // uses a fresh short-timeout session per hand-off.
+        browserAuthSession: URLSession? = nil
     ) {
         self.configuration = configuration
         self.settingsStore = settingsStore
+        self.browserAuthSession = browserAuthSession
         self.commandBuilder = commandBuilder
         self.supervisor = supervisor
         self.openCodeIntegration = openCodeIntegration
@@ -408,23 +492,217 @@ public final class MTPLXBackendStore: ObservableObject {
         }
     }
 
+    /// Load `settings.json`. A file with some bad fields loads with those
+    /// fields at their defaults (each one logged); a file that cannot be
+    /// read at all is set aside beside itself and the app starts from
+    /// defaults with `settingsRecoveryNotice` naming the preserved file, so
+    /// the reset is visible and the user's original bytes survive the next
+    /// save.
     public func loadPersistedSettings() {
-        if var loaded = try? settingsStore.load() {
-            if shouldPromoteStaleOpenCodeTarget(loaded) {
-                loaded.lastLaunchTarget = LaunchTarget.openCode.rawValue
-                try? settingsStore.save(loaded)
-            }
-            configuration = loaded
-            seedLiveSettingsFromConfiguration(loaded)
-            supervisor.setAutomaticRestartEnabled(loaded.automaticDaemonRestart)
+        let result = settingsStore.loadWithRecovery()
+        var loaded = result.configuration
+        if shouldPromoteStaleOpenCodeTarget(loaded) {
+            loaded.lastLaunchTarget = LaunchTarget.openCode.rawValue
+            try? settingsStore.save(loaded)
         }
+        configuration = loaded
+        seedLiveSettingsFromConfiguration(loaded)
+        supervisor.setAutomaticRestartEnabled(loaded.automaticDaemonRestart)
+        settingsRecoveryNotice = result.recovery
+        var lines = result.degradedFields.map { issue in
+            "settings: \(issue.path) could not be read (\(issue.reason)); using the default"
+        }
+        switch result.recovery {
+        case .unreadableFileKept(let preservedAt, let reason)?:
+            lines.append(
+                "settings: \(settingsStore.settingsURL.path) could not be read (\(reason)); "
+                    + "kept as \(preservedAt.path) and started from defaults"
+            )
+        case .unreadableFileLeftInPlace(let url, let reason, let moveFailure)?:
+            lines.append(
+                "settings: \(url.path) could not be read (\(reason)) and could not be moved aside "
+                    + "(\(moveFailure)); started from defaults"
+            )
+        case nil:
+            break
+        }
+        guard !lines.isEmpty else { return }
+        Task { [supervisor] in
+            for line in lines {
+                await supervisor.logs.append(line, stream: .system)
+            }
+        }
+    }
+
+    public func dismissSettingsRecoveryNotice() {
+        settingsRecoveryNotice = nil
     }
 
     public func saveSettings(_ next: MTPLXAppConfiguration) throws {
         configuration = next
         seedLiveSettingsFromConfiguration(next)
         supervisor.setAutomaticRestartEnabled(next.automaticDaemonRestart)
-        try settingsStore.save(next)
+        try persistConfiguration(next)
+    }
+
+    /// Whether a live daemon may still be reading the entry. The daemon
+    /// keeps its model's weight files mapped for as long as the process
+    /// lives, so the model `/health` reports stays off limits until the
+    /// daemon is verifiably gone. The selection alone is not enough: a
+    /// switch to a model that still has to download leaves the previous
+    /// daemon serving the old entry while `configuration.model` already
+    /// points at the new one.
+    nonisolated static func runningDaemonReads(
+        installedPath: String,
+        repoID: String,
+        daemonState: DaemonState,
+        healthModel: String?,
+        healthModelPath: String?
+    ) -> Bool {
+        switch daemonState {
+        case .stopped, .crashed:
+            return false
+        case .starting, .warming, .running, .degraded, .stopping:
+            break
+        }
+        let installed = NSString(string: installedPath).expandingTildeInPath
+        let standardizedInstalled = NSString(string: installed).standardizingPath
+        for candidate in [healthModelPath, healthModel].compactMap({ $0 }) {
+            let expanded = NSString(string: candidate).expandingTildeInPath
+            if NSString(string: expanded).standardizingPath == standardizedInstalled {
+                return true
+            }
+            if candidate.caseInsensitiveCompare(repoID) == .orderedSame {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Commit a Performance mode pick straight to settings.json.
+    ///
+    /// Issue #398: Mode used to live in the Settings draft behind a Save
+    /// button in a different card, and the tab's `@State` dies whenever the
+    /// user navigates away, so "pick a mode, go start the model" silently
+    /// threw the pick away and the picker was back on Auto. Mode is one
+    /// discrete global, like Appearance and Language, so it saves on
+    /// selection and the next daemon launch reads it from disk. It stays
+    /// restart-required: the running daemon is not touched here.
+    public func applySchedulingPresetSelection(_ raw: String) throws {
+        var next = configuration
+        next.applySchedulingPreset(MTPLXAppConfiguration.schedulingPresetSelection(raw))
+        guard next != configuration else { return }
+        try saveSettings(next)
+    }
+
+    /// Record the scheduling flags a launch is about to hand the daemon
+    /// (issue #398). Read back out of the built argv so the record is what
+    /// actually ran, never what the resolver meant to run.
+    private func recordLaunchScheduling(
+        command: DaemonCommand,
+        configuration: MTPLXAppConfiguration,
+        target: LaunchTarget?,
+        launchID: String
+    ) async {
+        let scheduling = DaemonLaunchScheduling(
+            schedulerMode: MTPLXCommandBuilder.flagValue("--scheduler-mode", in: command.arguments)
+                ?? "unset",
+            batchingPreset: MTPLXCommandBuilder.flagValue("--batching-preset", in: command.arguments)
+                ?? "unset",
+            selectedPreset: MTPLXAppConfiguration.schedulingPresetSelection(
+                configuration.schedulingPreset
+            ),
+            target: target?.rawValue ?? "none"
+        )
+        lastLaunchScheduling = scheduling
+        AIMEDiagnostics.record(
+            "daemon_launch_scheduling",
+            fields: [
+                "scheduler_mode": .string(scheduling.schedulerMode),
+                "batching_preset": .string(scheduling.batchingPreset),
+                "scheduling_preset": .string(scheduling.selectedPreset),
+                "launch_target": .string(scheduling.target),
+                "launch_id": .string(launchID),
+                "memory_limit_gb": .int(configuration.memoryLimitGB ?? 0),
+                "allow_swap": .bool(configuration.allowSwap)
+            ],
+            flushImmediately: true,
+            force: true
+        )
+        await supervisor.logs.append(
+            "launch scheduling: --scheduler-mode \(scheduling.schedulerMode) "
+                + "--batching-preset \(scheduling.batchingPreset) "
+                + "(Settings mode \(scheduling.selectedPreset), target \(scheduling.target))",
+            stream: .system
+        )
+    }
+
+    /// Return a removable CLI reference only for entries of the primary
+    /// model folder, the one folder the app downloads into. User-selected
+    /// folders, Forge output elsewhere and the additional model folders
+    /// (read-only by contract) never receive the destructive picker action.
+    public func cachedModelReference(forInstalledPath path: String) -> String? {
+        modelDownloader.cachedModelReference(
+            forInstalledPath: path,
+            cacheRoot: primaryModelDirectoryURL
+        )
+    }
+
+    /// The primary model folder exactly as `configuration.modelLibrary`
+    /// resolves it, without canonicalizing the additional folders as well:
+    /// the picker asks once per installed row.
+    private var primaryModelDirectoryURL: URL {
+        ModelLibrary.canonicalURL(for: configuration.primaryModelDirectory)
+    }
+
+    public func removeCachedModel(
+        repoID: String,
+        installedPath: String
+    ) async throws -> CachedModelRemovalResult {
+        let primaryDirectory = primaryModelDirectoryURL
+        guard let entryName = modelDownloader.cachedEntryName(
+                  forInstalledPath: installedPath,
+                  cacheRoot: primaryDirectory
+              ),
+              entryName.replacingOccurrences(of: "--", with: "/")
+                  .caseInsensitiveCompare(repoID) == .orderedSame
+        else {
+            throw CachedModelRemovalError.outsideManagedCache
+        }
+        guard !isModelDownloading, modelPackUpdatingRepoID == nil else {
+            throw CachedModelRemovalError.transferInProgress
+        }
+
+        let expandedSelected = (configuration.model as NSString).expandingTildeInPath
+        let expandedInstalled = (installedPath as NSString).expandingTildeInPath
+        let selectedOption = downloadableModelOption(for: repoID)
+        guard expandedSelected != expandedInstalled,
+              configuration.model.caseInsensitiveCompare(repoID) != .orderedSame,
+              selectedOption?.matches(configuration.model) != true
+        else {
+            throw CachedModelRemovalError.selectedModel
+        }
+        guard !Self.runningDaemonReads(
+            installedPath: installedPath,
+            repoID: repoID,
+            daemonState: daemonState,
+            healthModel: health?.model,
+            healthModelPath: health?.modelPath
+        ) else {
+            throw CachedModelRemovalError.servedByRunningDaemon
+        }
+
+        let result = try await modelDownloader.removeCachedModel(
+            directoryName: entryName,
+            cacheRoot: primaryDirectory
+        )
+        modelUpdates.removeAll {
+            $0.repoID.caseInsensitiveCompare(repoID) == .orderedSame
+        }
+        if modelPackUpdateNeedsRestart?.repoID.caseInsensitiveCompare(repoID) == .orderedSame {
+            modelPackUpdateNeedsRestart = nil
+        }
+        return result
     }
 
     public func applyConfiguration(
@@ -437,7 +715,7 @@ public final class MTPLXBackendStore: ObservableObject {
         let shouldRestart = restartIfRunning && supervisor.isRunning()
         let target = LaunchTarget(rawValue: next.lastLaunchTarget)
         configuration = next
-        try settingsStore.save(next)
+        try persistConfiguration(next)
         supervisor.setAutomaticRestartEnabled(next.automaticDaemonRestart)
         if !shouldRestart, restartIfRunning, wasDegraded {
             // Degraded chrome means the user believes MTPLX is (or should
@@ -516,6 +794,12 @@ public final class MTPLXBackendStore: ObservableObject {
                 clearLiveMetricsState()
             }
             let command = try commandBuilder.buildServeCommand(
+                configuration: next,
+                target: target,
+                launchID: launchID
+            )
+            await recordLaunchScheduling(
+                command: command,
                 configuration: next,
                 target: target,
                 launchID: launchID
@@ -642,6 +926,15 @@ public final class MTPLXBackendStore: ObservableObject {
     public func startDaemon(target: LaunchTarget?) async {
         clientHandoffNotice = nil
         portFallbackNotice = nil
+        if let fallback = activePortFallback {
+            // Issue #503: a fallback lives for one launch. The user pressed
+            // Play again, so the configured port gets another try (the
+            // occupant may be gone) and the notice above goes with it.
+            var next = configuration
+            next.port = fallback.configured
+            configuration = next
+            activePortFallback = nil
+        }
         await startDaemon(target: target, attemptedPortRemediation: false)
     }
 
@@ -677,7 +970,7 @@ public final class MTPLXBackendStore: ObservableObject {
             var next = configuration
             next.lastLaunchTarget = target.rawValue
             configuration = next
-            try? settingsStore.save(next)
+            try? persistConfiguration(next)
         }
         if promptForModelDownloadIfNeeded(
             configuration: configuration,
@@ -732,6 +1025,12 @@ public final class MTPLXBackendStore: ObservableObject {
                 )
             }
             let command = try commandBuilder.buildServeCommand(
+                configuration: configuration,
+                target: target,
+                launchID: launchID
+            )
+            await recordLaunchScheduling(
+                command: command,
                 configuration: configuration,
                 target: target,
                 launchID: launchID
@@ -857,9 +1156,14 @@ public final class MTPLXBackendStore: ObservableObject {
         target: LaunchTarget?,
         launchID: String
     ) async {
-        let occupant = await PortPreflight.classify(
+        // Issue #409: a foreign-looking occupant is re-probed over the
+        // settle window before the port is moved — a draining MTPLX
+        // daemon (stop/start, or the predecessor of an in-app update)
+        // clears on its own and must never cost the user their port.
+        let occupant = await PortPreflight.classifySettled(
             baseURL: baseURL,
-            apiKey: configuration.apiKey
+            apiKey: configuration.apiKey,
+            settleTimeoutSeconds: portSettleTimeoutSeconds
         )
         let occupantDescription: String
         switch occupant {
@@ -888,11 +1192,39 @@ public final class MTPLXBackendStore: ObservableObject {
                 await supervisor.terminateExternalDaemon(rootPID: pid_t(stalePID))
                 return
             }
-            occupantDescription = "an MTPLX server started outside the app"
+            occupantDescription = tr("an MTPLX server started outside the app")
         case .unauthorized:
-            occupantDescription = "a server requiring a different API key"
+            occupantDescription = tr("a server requiring a different API key")
         case .foreign:
-            occupantDescription = "another app"
+            // Issue #503: a daemon this app launched that wedged
+            // mid-inference keeps its listener while /health never answers,
+            // so by probe alone it reads as "another app" and the app moved
+            // off its own port. Process identity settles it: the launch
+            // marker the supervisor puts in every daemon's environment.
+            let port = configuration.port
+            let wedged = await Task.detached(priority: .userInitiated) {
+                PortPreflight.appOwnedListener(port: port)
+            }.value
+            if let wedged {
+                await supervisor.logs.append(
+                    "port preflight: \(port) held by a wedged app-owned daemon "
+                    + "pid \(wedged.pid) (launch \(wedged.launchID)); reaping it and keeping the port",
+                    stream: .system
+                )
+                await supervisor.terminateExternalDaemon(rootPID: wedged.pid)
+                if await PortPreflight.waitUntilBindable(
+                    port,
+                    bindHost: configuration.host,
+                    timeoutSeconds: 5
+                ) {
+                    return
+                }
+                await supervisor.logs.append(
+                    "port preflight: \(port) still held after reaping pid \(wedged.pid)",
+                    stream: .system
+                )
+            }
+            occupantDescription = tr("another app")
         }
         let occupiedPort = configuration.port
         guard
@@ -904,17 +1236,52 @@ public final class MTPLXBackendStore: ObservableObject {
             // No port available; let supervisor.start surface the failure.
             return
         }
-        var next = configuration
-        next.port = freePort
-        configuration = next
-        try? settingsStore.save(next)
-        portFallbackNotice =
-            "Port \(occupiedPort) was in use by \(occupantDescription). MTPLX now uses port \(freePort)."
+        applyPortFallback(from: occupiedPort, to: freePort, occupant: occupantDescription)
         await supervisor.logs.append(
-            "port preflight: \(occupiedPort) occupied by \(occupantDescription); switched to \(freePort)",
+            "port preflight: \(occupiedPort) occupied by \(occupantDescription); "
+            + "using \(freePort) for this launch, settings keep \(occupiedPort)",
             stream: .system
         )
     }
+
+    /// Issue #503: run this launch on `freePort` without touching settings.
+    /// `activePortFallback` remembers the configured port so a save made
+    /// meanwhile writes it back and the next start tries it again.
+    private func applyPortFallback(from occupiedPort: Int, to freePort: Int, occupant: String) {
+        var next = configuration
+        next.port = freePort
+        configuration = next
+        activePortFallback = (
+            configured: activePortFallback?.configured ?? occupiedPort,
+            fallback: freePort
+        )
+        portFallbackNotice = tr(
+            "Port %@ was in use by %@. MTPLX is using port %@ for now; the port in Settings is unchanged and will be tried again at the next start.",
+            String(occupiedPort),
+            occupant,
+            String(freePort)
+        )
+    }
+
+    /// Every settings write goes through here so a port fallback never
+    /// reaches disk (issue #503): while a launch runs on a fallback port the
+    /// configured port is written instead, unless `next` carries a port the
+    /// user chose on purpose, which ends the fallback.
+    private func persistConfiguration(_ next: MTPLXAppConfiguration) throws {
+        var toPersist = next
+        if let fallback = activePortFallback {
+            if next.port == fallback.fallback {
+                toPersist.port = fallback.configured
+            } else {
+                activePortFallback = nil
+            }
+        }
+        try settingsStore.save(toPersist)
+    }
+
+    /// How long a foreign-looking port is re-probed before it is moved
+    /// (issue #409). Tests shorten it; the product keeps the shared default.
+    var portSettleTimeoutSeconds: TimeInterval = PortPreflight.settleTimeoutSeconds
 
     /// Test seam: run the port pre-flight and report the resulting port and
     /// fallback notice as Sendable values.
@@ -938,9 +1305,10 @@ public final class MTPLXBackendStore: ObservableObject {
         launchID: String
     ) async -> Bool {
         let occupiedPort = configuration.port
-        let occupant = await PortPreflight.classify(
+        let occupant = await PortPreflight.classifySettled(
             baseURL: baseURL,
-            apiKey: configuration.apiKey
+            apiKey: configuration.apiKey,
+            settleTimeoutSeconds: portSettleTimeoutSeconds
         )
         switch occupant {
         case .mtplxServer, .unauthorized, .foreign:
@@ -955,14 +1323,10 @@ public final class MTPLXBackendStore: ObservableObject {
             else {
                 return false
             }
-            var next = configuration
-            next.port = freePort
-            configuration = next
-            try? settingsStore.save(next)
-            portFallbackNotice =
-                "Port \(occupiedPort) was busy. MTPLX now uses port \(freePort)."
+            applyPortFallback(from: occupiedPort, to: freePort, occupant: tr("another app"))
             await supervisor.logs.append(
-                "launch hit a port conflict on \(occupiedPort) the probe could not see; switched to \(freePort)",
+                "launch hit a port conflict on \(occupiedPort) the probe could not see; "
+                + "using \(freePort) for this launch, settings keep \(occupiedPort)",
                 stream: .system
             )
             return true
@@ -1002,20 +1366,35 @@ public final class MTPLXBackendStore: ObservableObject {
     nonisolated static func humanizedStartFailure(_ error: Error, port: Int) -> String {
         if case DaemonSupervisorError.portOccupied(_, let launchID) = error {
             if launchID != nil {
-                return "Port \(port) is running another MTPLX server. "
-                    + "Stop it where it was started, or run `mtplx stop --port \(port)` "
-                    + "in Terminal, then press Play."
+                return tr("Port %@ is running another MTPLX server. Stop it where it was started, or run `mtplx stop --port %@` in Terminal, then press Play.", String(port), String(port))
             }
-            return "Port \(port) is held by an MTPLX server started outside the app. "
-                + "Press Ctrl-C in its terminal or run `mtplx stop --port \(port)`, "
-                + "then press Play."
+            return tr("Port %@ is held by an MTPLX server started outside the app. Press Ctrl-C in its terminal or run `mtplx stop --port %@`, then press Play.", String(port), String(port))
         }
         return String(describing: error)
     }
 
+    /// Explicit refresh of the runtime card (About sheet's Check button).
+    /// Reads the installed CLI and the published manifest; the manifest
+    /// fetch is bounded to a few seconds. Nothing on a daemon launch path
+    /// awaits this.
     public func refreshRuntimeUpdateStatus() async {
         runtimeUpdateSnapshot = await runtimeUpdateService.refreshSnapshot()
         runtimeUpdateFailure = nil
+    }
+
+    /// Background refresh of the runtime card. Used at app launch and after
+    /// every launch-path runtime decision so the card reflects the venv the
+    /// launch actually used, without Play, Restart or first launch waiting
+    /// on mtplx.com or on the `mtplx --version` probe. A newer request
+    /// supersedes an in-flight one, and a failure the launch path recorded
+    /// is left in place for the user to read.
+    public func scheduleRuntimeUpdateStatusRefresh() {
+        runtimeUpdateStatusRefreshTask?.cancel()
+        runtimeUpdateStatusRefreshTask = Task { [weak self, runtimeUpdateService] in
+            let snapshot = await runtimeUpdateService.refreshSnapshot()
+            guard !Task.isCancelled, let self else { return }
+            self.runtimeUpdateSnapshot = snapshot
+        }
     }
 
     public func updateRuntimeWithHomebrew() async {
@@ -1045,14 +1424,17 @@ public final class MTPLXBackendStore: ObservableObject {
         }
     }
 
+    /// Make sure a runtime exists before spawning the daemon. The decision
+    /// is local (bundled wheel, app-owned venv); the runtime card's
+    /// manifest comparison and version probe run afterwards in the
+    /// background rather than ahead of the launch.
     private func prepareRuntimeForDaemonStart() async throws {
         startupPhase = .launching
+        defer { scheduleRuntimeUpdateStatusRefresh() }
         do {
             _ = try await runtimeUpdateService.prepareRuntimeForLaunch()
-            runtimeUpdateSnapshot = await runtimeUpdateService.refreshSnapshot()
             runtimeUpdateFailure = nil
         } catch {
-            runtimeUpdateSnapshot = await runtimeUpdateService.refreshSnapshot()
             runtimeUpdateFailure = (error as? LocalizedError)?.errorDescription
                 ?? error.localizedDescription
             throw error
@@ -1072,6 +1454,9 @@ public final class MTPLXBackendStore: ObservableObject {
         )
     }
 
+    /// The key-in-query sign-in URL. This is the fallback only: it lands
+    /// the API key in browser history, so the open path below asks the
+    /// daemon for a one-time ticket first and uses this when it cannot.
     private func authenticatedBrowserURL(nextPath: String, fallback: URL) -> URL {
         guard let apiKey = configuration.apiKey, !apiKey.isEmpty else {
             return fallback
@@ -1089,19 +1474,57 @@ public final class MTPLXBackendStore: ObservableObject {
         return components.url ?? fallback
     }
 
+    /// The URL to hand the browser for `nextPath`. With no key configured
+    /// the plain page URL; with a key, a one-time ticket URL minted by the
+    /// daemon (`POST /mtplx/browser-auth/ticket`, bounded to a few seconds,
+    /// off the main actor) so the key never appears in a URL. If the
+    /// ticket cannot be minted for any reason — an older daemon answering
+    /// 404, a network failure, a timeout — the key-in-query URL is used so
+    /// the button never goes dead.
+    func browserURL(nextPath: String, plain: URL) async -> URL {
+        let fallback = authenticatedBrowserURL(nextPath: nextPath, fallback: plain)
+        guard let apiKey = configuration.apiKey, !apiKey.isEmpty else {
+            return plain
+        }
+        let client = browserAuthSession.map { MTPLXAPIClient(baseURL: baseURL, apiKey: apiKey, session: $0) }
+            ?? MTPLXAPIClient.browserAuthClient(baseURL: baseURL, apiKey: apiKey)
+        do {
+            return try await client.browserAuthTicket(next: nextPath).url
+        } catch {
+            await supervisor.logs.append(
+                "browser sign-in ticket unavailable (\(error)); opening with the key in the URL instead",
+                stream: .system
+            )
+            return fallback
+        }
+    }
+
     /// Open the old browser chat surface in the user's default browser.
     public func openWebChat() {
-        #if canImport(AppKit)
-        AppKit.NSWorkspace.shared.open(webChatURL)
-        #endif
+        Task { [weak self] in
+            guard let self else { return }
+            let url = await self.browserURL(nextPath: "/", plain: self.baseURL)
+            Self.openInBrowser(url)
+        }
     }
 
     /// Open the React live dashboard in the user's default browser.
     /// Exposed for users who explicitly ask for the browser dashboard
     /// (menu bar / About sheet) — no longer wired to a LaunchTarget.
     public func openBrowserDashboard() {
+        Task { [weak self] in
+            guard let self else { return }
+            let url = await self.browserURL(
+                nextPath: "/dashboard/",
+                plain: self.baseURL.appendingPathComponent("dashboard")
+            )
+            Self.openInBrowser(url)
+        }
+    }
+
+    private static func openInBrowser(_ url: URL) {
         #if canImport(AppKit)
-        AppKit.NSWorkspace.shared.open(browserDashboardURL)
+        AppKit.NSWorkspace.shared.open(url)
         #endif
     }
 
@@ -1235,7 +1658,7 @@ public final class MTPLXBackendStore: ObservableObject {
     private let modelUpdateChecker: (@Sendable () async throws -> [ModelUpdateInfo])?
 
     public var availableModelPackUpdates: [ModelUpdateInfo] {
-        modelUpdates.filter(\.isUpdateAvailable)
+        modelUpdates.filter { $0.isUpdateAvailable && $0.canUpdateInPlace }
     }
 
     public func refreshModelUpdates(force: Bool = false) async {
@@ -1250,7 +1673,11 @@ public final class MTPLXBackendStore: ObservableObject {
             if let modelUpdateChecker {
                 rows = try await modelUpdateChecker()
             } else {
-                rows = try await modelDownloader.checkModelUpdates()
+                let library = configuration.modelLibrary
+                rows = try await modelDownloader.checkModelUpdates(
+                    cacheRoot: library.primaryDirectory,
+                    searchRoots: library.additionalDirectories
+                )
             }
             modelUpdates = rows
         } catch {
@@ -1268,68 +1695,109 @@ public final class MTPLXBackendStore: ObservableObject {
     /// and skips size-identical files — a re-published MTP head costs the
     /// head, not the trunk. Serving is untouched until the user restarts.
     public func updateModelPack(_ update: ModelUpdateInfo) {
-        guard modelPackUpdatingRepoID == nil else { return }
+        guard update.isUpdateAvailable,
+              update.canUpdateInPlace,
+              modelPackUpdatingRepoID == nil
+        else { return }
         modelPackUpdatingRepoID = update.repoID
-        modelPackUpdateStatus = "Preparing…"
+        modelPackUpdateStatus = tr("Preparing…")
         let downloader = modelDownloader
-        let startedBytes = update.path.map {
-            Self.directorySizeForUpdateProgress(URL(fileURLWithPath: $0))
-        }
-        modelPackUpdateTask = Task { @MainActor [weak self] in
+        let cacheRoot = update.path
+            .map { URL(fileURLWithPath: $0).deletingLastPathComponent() }
+            ?? configuration.modelLibrary.primaryDirectory
+        // Detached, like every other consumer of `stream`: the baseline
+        // walk stats every file in the pack, and building the stream
+        // resolves the runtime (version probe, wheel fingerprint, a
+        // possible reinstall) and spawns the CLI synchronously inside
+        // AsyncStream's build closure. On the main actor that froze the
+        // window for the Python cold start, or for minutes when the
+        // app-owned venv needed its post-update reinstall.
+        modelPackUpdateTask = Task.detached(priority: .userInitiated) { [weak self, downloader, update, cacheRoot] in
+            let startedBytes = update.path.map {
+                Self.directorySizeForUpdateProgress(URL(fileURLWithPath: $0))
+            }
             let stream = downloader.stream(
                 repo: update.repoID,
                 totalBytes: nil,
                 update: true,
-                sizeProbePath: update.path
+                sizeProbePath: update.path,
+                cacheRoot: cacheRoot
             )
             var completed = false
             for await event in stream {
-                guard let self, self.modelPackUpdatingRepoID == update.repoID else { return }
-                switch event {
-                case .started, .status:
+                guard let self else { return }
+                switch await self.handleModelPackUpdateEvent(event, update: update, startedBytes: startedBytes) {
+                case .proceed:
                     break
-                case .progress(let bytesOnDisk, _, let speed, _):
-                    var line = speed > 1024
-                        ? "\(Self.formatUpdateBytes(Int64(speed)))/s"
-                        : "Syncing…"
-                    if let startedBytes, let total = update.updateBytes, total > 0 {
-                        let done = max(0, bytesOnDisk - startedBytes)
-                        let pct = min(100, Int((Double(done) / Double(total)) * 100))
-                        line = "\(pct)% · " + line
-                    }
-                    self.modelPackUpdateStatus = line
-                case .stalled(let seconds):
-                    self.modelPackUpdateStatus = "Stalled for \(seconds)s — still trying"
-                case .complete:
+                case .completed:
                     completed = true
-                case .failed(_, let stderrTail):
-                    let tail = stderrTail.split(separator: "\n").last.map(String.init)
-                    self.modelPackUpdateStatus = tail ?? "Update failed"
-                case .cancelled:
-                    self.modelPackUpdateStatus = nil
+                case .abandoned:
+                    return
                 }
             }
-            guard let self else { return }
-            self.modelPackUpdatingRepoID = nil
-            if completed {
-                self.modelPackUpdateStatus = nil
-                // The running daemon has the old tensors mapped; flag the
-                // restart affordance when the updated pack is the one it
-                // serves (matched on the served model path).
-                let daemonIsLive: Bool
-                switch self.daemonState {
-                case .running, .warming: daemonIsLive = true
-                default: daemonIsLive = false
-                }
-                if daemonIsLive,
-                   let servedPath = self.health?.modelPath,
-                   let updatedPath = update.path,
-                   servedPath == updatedPath || servedPath.hasPrefix(updatedPath + "/") {
-                    self.modelPackUpdateNeedsRestart = update
-                }
-                await self.refreshModelUpdates(force: true)
-            }
+            await self?.finishModelPackUpdate(update, completed: completed)
         }
+    }
+
+    private enum ModelPackUpdateEventOutcome {
+        case proceed
+        case completed
+        /// The update was cancelled or replaced while the stream was live;
+        /// its state is no longer this task's to touch.
+        case abandoned
+    }
+
+    private func handleModelPackUpdateEvent(
+        _ event: DownloadEvent,
+        update: ModelUpdateInfo,
+        startedBytes: Int64?
+    ) -> ModelPackUpdateEventOutcome {
+        guard modelPackUpdatingRepoID == update.repoID else { return .abandoned }
+        switch event {
+        case .started, .status:
+            break
+        case .progress(let bytesOnDisk, _, let speed, _):
+            var line = speed > 1024
+                ? "\(Self.formatUpdateBytes(Int64(speed)))/s"
+                : "Syncing…"
+            if let startedBytes, let total = update.updateBytes, total > 0 {
+                let done = max(0, bytesOnDisk - startedBytes)
+                let pct = min(100, Int((Double(done) / Double(total)) * 100))
+                line = tr("%lld%% · %@", pct, line)
+            }
+            modelPackUpdateStatus = line
+        case .stalled(let seconds):
+            modelPackUpdateStatus = tr("Stalled for %llds — still trying", Int(seconds))
+        case .complete:
+            return .completed
+        case .failed(_, let stderrTail):
+            let tail = stderrTail.split(separator: "\n").last.map(String.init)
+            modelPackUpdateStatus = tail ?? tr("Update failed")
+        case .cancelled:
+            modelPackUpdateStatus = nil
+        }
+        return .proceed
+    }
+
+    private func finishModelPackUpdate(_ update: ModelUpdateInfo, completed: Bool) async {
+        modelPackUpdatingRepoID = nil
+        guard completed else { return }
+        modelPackUpdateStatus = nil
+        // The running daemon has the old tensors mapped; flag the
+        // restart affordance when the updated pack is the one it
+        // serves (matched on the served model path).
+        let daemonIsLive: Bool
+        switch daemonState {
+        case .running, .warming: daemonIsLive = true
+        default: daemonIsLive = false
+        }
+        if daemonIsLive,
+           let servedPath = health?.modelPath,
+           let updatedPath = update.path,
+           servedPath == updatedPath || servedPath.hasPrefix(updatedPath + "/") {
+            modelPackUpdateNeedsRestart = update
+        }
+        await refreshModelUpdates(force: true)
     }
 
     /// Restart the running daemon so an updated pack's tensors are loaded.
@@ -1344,7 +1812,10 @@ public final class MTPLXBackendStore: ObservableObject {
         return formatter.string(fromByteCount: bytes)
     }
 
-    private static func directorySizeForUpdateProgress(_ url: URL) -> Int64 {
+    /// Baseline byte count for the pack-update progress line. Walks every
+    /// file in the pack, so it is `nonisolated` and only ever called from
+    /// the detached update task.
+    nonisolated private static func directorySizeForUpdateProgress(_ url: URL) -> Int64 {
         (try? FileManager.default.subpathsOfDirectory(atPath: url.path))
             .map { subpaths in
                 subpaths.reduce(Int64(0)) { sum, subpath in
@@ -1420,9 +1891,10 @@ public final class MTPLXBackendStore: ObservableObject {
         guard !trimmed.isEmpty, !isModelDownloading, !isModelTuning else { return }
         let option = MTPLXModelOption.option(matching: trimmed)
             ?? MTPLXModelOption.customHuggingFaceModel(repoID: trimmed)
+        let library = configuration.modelLibrary
         let target = defaultLaunchTarget(for: configuration)
         let launchAction: PendingModelDownloadLaunchAction = supervisor.isRunning() ? .restart : .start
-        if let installedPath = option?.installedLocalPath {
+        if let installedPath = option?.installedLocalPath(in: library) {
             Task { @MainActor [weak self] in
                 do {
                     try await self?.finishModelInstall(
@@ -1442,6 +1914,10 @@ public final class MTPLXBackendStore: ObservableObject {
             if let option, option.sizeBytes > 0 { return option.sizeBytes }
             return nil
         }()
+        let destination = modelDownloader.cachedModelPath(
+            for: trimmed,
+            cacheRoot: library.primaryDirectory
+        )
         pendingModelDownload = PendingModelDownload(
             repoID: trimmed,
             displayName: displayName ?? option?.displayName ?? trimmed,
@@ -1449,7 +1925,8 @@ public final class MTPLXBackendStore: ObservableObject {
             target: target,
             launchAction: launchAction,
             totalBytes: resolvedBytes,
-            destinationPath: modelDownloader.cachedModelPath(for: trimmed).path
+            destinationPath: destination.path,
+            cacheRoot: destination.deletingLastPathComponent().path
         )
         modelDownloadProgress = nil
         modelDownloadFailure = nil
@@ -1464,7 +1941,7 @@ public final class MTPLXBackendStore: ObservableObject {
             snapshot.bytesPerSecond = 0
             snapshot.etaSeconds = nil
             snapshot.stalledSeconds = 0
-            snapshot.statusMessage = "Paused"
+            snapshot.statusMessage = tr("Paused")
             modelDownloadProgress = snapshot
         }
     }
@@ -1516,7 +1993,8 @@ public final class MTPLXBackendStore: ObservableObject {
             for await event in downloader.stream(
                 repo: request.repoID,
                 totalBytes: request.totalBytes,
-                extraEnvironment: extraEnvironment
+                extraEnvironment: extraEnvironment,
+                cacheRoot: URL(fileURLWithPath: request.cacheRoot, isDirectory: true)
             ) {
                 if Task.isCancelled { break }
                 await self?.handleModelDownloadEvent(event, request: request)
@@ -1597,8 +2075,8 @@ public final class MTPLXBackendStore: ObservableObject {
         } catch {
             guard isCurrent?() ?? true else { throw error }
             if markUnreachableOnTransportFailure {
-                markDaemonUnreachableIfNeeded(
-                    reason: "MTPLX lost contact with the model server. Start it again."
+                await markDaemonUnreachableUnlessAlive(
+                    reason: tr("MTPLX lost contact with the model server. Start it again.")
                 )
             }
             throw error
@@ -1611,8 +2089,8 @@ public final class MTPLXBackendStore: ObservableObject {
         } catch is DecodingError {
             throw MTPLXAPIClientError.invalidResponse
         } catch {
-            markDaemonUnreachableIfNeeded(
-                reason: "MTPLX lost contact with live metrics. Start it again."
+            await markDaemonUnreachableUnlessAlive(
+                reason: tr("MTPLX lost contact with live metrics. Start it again.")
             )
             throw error
         }
@@ -1620,7 +2098,7 @@ public final class MTPLXBackendStore: ObservableObject {
 
     public func updateLiveSettings(_ next: MutableSettings) async throws {
         let merged = mergedLiveSettingsPatch(next)
-        let livePatch = Self.liveMutableSettingsPatch(from: next)
+        let livePatch = Self.liveSettingsUpdatePatch(from: next)
         // Only the caller's own patch counts as a depth choice; the
         // merged snapshot always carries the daemon's current depth.
         let depthIsExplicitSelection = next.depth != nil
@@ -1667,6 +2145,17 @@ public final class MTPLXBackendStore: ObservableObject {
         }
     }
 
+    /// The patch a direct live update posts. It is the carried patch plus
+    /// the adaptive depth policy: the policy is live on the daemon that is
+    /// running now, but it is not carried into the next launch (the launch
+    /// arguments own it through `adaptiveDepth`), and a family that owns its
+    /// draft policy rejects the key, so the carry path leaves it out.
+    nonisolated static func liveSettingsUpdatePatch(from settings: MutableSettings) -> MutableSettings {
+        var patch = liveMutableSettingsPatch(from: settings)
+        patch.adaptivePolicy = settings.adaptivePolicy
+        return patch
+    }
+
     nonisolated static func liveMutableSettingsPatch(from settings: MutableSettings) -> MutableSettings {
         MutableSettings(
             generationMode: settings.generationMode,
@@ -1681,6 +2170,7 @@ public final class MTPLXBackendStore: ObservableObject {
             reasoningParser: settings.reasoningParser,
             reasoning: settings.reasoning,
             reasoningEffort: settings.reasoningEffort,
+            managedClientControls: settings.managedClientControls,
             prefillChunkTokens: settings.prefillChunkTokens
         )
     }
@@ -1800,10 +2290,14 @@ public final class MTPLXBackendStore: ObservableObject {
             next.reasoningEffort = reasoningEffort
         }
         if let prefillChunkTokens = settings.prefillChunkTokens {
-            next.prefillChunkTokens = prefillChunkTokens
+            // 0 is the push that hands the chunk back to the engine.
+            next.prefillChunkTokens = prefillChunkTokens > 0 ? prefillChunkTokens : nil
+        }
+        if let policy = settings.managedClientControls, ["app", "client"].contains(policy) {
+            next.controlClientSettings = policy == "app"
         }
         configuration = next
-        try settingsStore.save(next)
+        try persistConfiguration(next)
     }
 
     private func persistDraftControlSelection(
@@ -1851,8 +2345,8 @@ public final class MTPLXBackendStore: ObservableObject {
         target: LaunchTarget? = nil
     ) -> MutableSettings? {
         guard persistedLiveSettingsCompatible(with: configuration) else { return nil }
-        var persisted = MutableSettings()
-        var hasValue = false
+        var persisted = MutableSettings(managedClientControls: configuration.controlClientSettings ? "app" : "client")
+        var hasValue = true
         if let generationMode = normalizedGenerationMode(configuration.generationMode),
            generationMode == "ar" || configuration.liveSettingsModelFamily != nil
         {
@@ -2043,6 +2537,7 @@ public final class MTPLXBackendStore: ObservableObject {
         if let reasoningParser = patch.reasoningParser { merged.reasoningParser = reasoningParser }
         if let reasoning = patch.reasoning { merged.reasoning = reasoning }
         if let reasoningEffort = patch.reasoningEffort { merged.reasoningEffort = reasoningEffort }
+        if let policy = patch.managedClientControls { merged.managedClientControls = policy }
         if let prefillChunkTokens = patch.prefillChunkTokens {
             merged.prefillChunkTokens = prefillChunkTokens
         }
@@ -2063,18 +2558,54 @@ public final class MTPLXBackendStore: ObservableObject {
         self.sessions = try await apiClient.sessions()
     }
 
-    public func startMetricsStream() {
+    /// Snapshot cadence floor while a chat turn streams. Every snapshot
+    /// is built inside the serving process and fanned out to each
+    /// dashboard observer on the main actor, while the chat surface reads
+    /// its own progress frames; the README's native 500 ms is plenty
+    /// under a live turn.
+    private static let chatStreamingSnapshotIntervalMs = 500
+    private var chatTurnStreaming = false
+
+    private var metricsSnapshotIntervalMs: Int {
+        if configuration.performanceLock { return 1000 }
+        let configured = configuration.streamSnapshotIntervalMs
+        return chatTurnStreaming
+            ? max(configured, Self.chatStreamingSnapshotIntervalMs)
+            : configured
+    }
+
+    /// Chat turn lifecycle hook. Reopens the metrics stream at the
+    /// slower cadence while a turn streams and at the configured cadence
+    /// once it settles; only an open stream is reopened, and it keeps
+    /// `.open` throughout so the status dot never blinks for it.
+    public func setChatTurnStreaming(_ streaming: Bool) {
+        guard chatTurnStreaming != streaming else { return }
+        let previousInterval = metricsSnapshotIntervalMs
+        chatTurnStreaming = streaming
+        guard streamTask != nil,
+              connectionState == .open,
+              metricsSnapshotIntervalMs != previousInterval
+        else { return }
+        startMetricsStream(retainingOpenState: true)
+    }
+
+    public func startMetricsStream(retainingOpenState: Bool = false) {
         streamTask?.cancel()
         daemonTransportGeneration &+= 1
         let transportGeneration = daemonTransportGeneration
         let client = MetricsStreamClient(apiClient: apiClient)
-        let interval = configuration.performanceLock ? 1000 : configuration.streamSnapshotIntervalMs
+        let interval = metricsSnapshotIntervalMs
+        // A cadence-only reopen of a healthy stream must not report
+        // `.connecting`: the chrome would flip to "Connecting" and pulse
+        // for a reconnect the user never saw fail.
+        let keepOpen = retainingOpenState && connectionState == .open
         streamTask = Task { [weak self] in
             await client.connect(
                 snapshotIntervalMs: interval,
                 onState: { state in
                     await MainActor.run {
                         guard self?.daemonTransportGeneration == transportGeneration else { return }
+                        if keepOpen, state == .connecting { return }
                         self?.connectionState = state
                     }
                 },
@@ -2133,9 +2664,9 @@ public final class MTPLXBackendStore: ObservableObject {
                 lifecycleEpoch: snapshot.lifecycleEpoch,
                 terminalState: .crashed(status),
                 terminalStartupPhase: .failed(
-                    "MTPLX crashed repeatedly; automatic recovery stopped after \(attempts) attempts."
+                    tr("MTPLX crashed repeatedly; automatic recovery stopped after %lld attempts.", attempts)
                 ),
-                terminalConnectionState: .failed("Automatic restart circuit breaker is open.")
+                terminalConnectionState: .failed(tr("Automatic restart circuit breaker is open."))
             )
         case .idle:
             // Normal startup phases remain owned by the explicit start path.
@@ -2353,7 +2884,9 @@ public final class MTPLXBackendStore: ObservableObject {
     }
 
     public func markDaemonUnreachable(reason: String) {
-        markDaemonUnreachableIfNeeded(reason: reason)
+        Task { @MainActor [weak self] in
+            await self?.markDaemonUnreachableUnlessAlive(reason: reason)
+        }
     }
 
     private var shouldProbeDaemonHealth: Bool {
@@ -2372,6 +2905,70 @@ public final class MTPLXBackendStore: ObservableObject {
     /// merely slow.
     private static let watchdogProbeDeadlineSeconds: TimeInterval = 10
 
+    /// Issue #487: a daemon inside a long generation-final prefix commit
+    /// answered nothing on /health for 19-25 s and was reaped on the second
+    /// missed probe while its commit succeeded. A daemon whose process is
+    /// alive and whose port still accepts a TCP connection is "busy", never
+    /// dead; it is reaped only after this much unbroken silence, or the
+    /// moment its process is gone or its port closes.
+    private static let watchdogBusyGraceSeconds: TimeInterval = 90
+    /// TCP handshake budget for the port half of the liveness evidence.
+    private static let watchdogPortProbeSeconds: TimeInterval = 1
+
+    private static func describe(_ reason: DaemonReapReason) -> String {
+        switch reason {
+        case .processGone:
+            return "the daemon process is gone"
+        case .portClosed:
+            return "the daemon port no longer accepts connections"
+        case .unresponsiveGraceExpired(let seconds):
+            return "no /health answer for \(Int(seconds)) s with the process still alive"
+        }
+    }
+
+    /// Process + port truth for the watchdog and the single-failure paths,
+    /// gathered off the main actor. The daemon's own reported pid wins over
+    /// the supervisor's root (the wrapper), an adopted daemon has neither
+    /// and is judged by its port alone.
+    private func gatherDaemonLivenessEvidence() async -> DaemonLivenessEvidence {
+        let pid = health?.startup?.pid.map(pid_t.init) ?? supervisor.daemonProcessIdentifier()
+        let processAlive = pid.map(DaemonSupervisor.processIsAlive)
+        let url = baseURL
+        // Read the main-actor constant here; the detached probe must not
+        // touch actor-isolated state.
+        let portProbeSeconds = Self.watchdogPortProbeSeconds
+        let portAccepting = await Task.detached(priority: .utility) {
+            TCPConnectProbe.accepts(url: url, timeoutSeconds: portProbeSeconds)
+        }.value
+        return DaemonLivenessEvidence(processAlive: processAlive, portAccepting: portAccepting)
+    }
+
+    /// Liveness gate for the single-failure paths (a refresh that timed out,
+    /// a chat stream that lost its connection). Those callers used to reap
+    /// on ONE failed request; a daemon mid-commit fails exactly that way
+    /// while alive. When process and port say alive the daemon is treated
+    /// as busy and the watchdog keeps the decision; otherwise the old reap
+    /// runs unchanged.
+    private func markDaemonUnreachableUnlessAlive(reason: String) async {
+        switch daemonState {
+        case .running, .warming, .starting:
+            break
+        case .stopped, .degraded, .stopping, .crashed:
+            return
+        }
+        let transportGeneration = daemonTransportGeneration
+        let evidence = await gatherDaemonLivenessEvidence()
+        guard daemonTransportGeneration == transportGeneration else { return }
+        if evidence.indicatesLiveDaemon {
+            await supervisor.logs.append(
+                "daemon did not answer (\(reason)) but its process is alive and the port accepts connections; treating it as busy, the watchdog reaps only after \(Int(Self.watchdogBusyGraceSeconds)) s of silence",
+                stream: .system
+            )
+            return
+        }
+        markDaemonUnreachableIfNeeded(reason: reason)
+    }
+
     private func startDaemonHealthWatchdog() {
         healthWatchTask?.cancel()
         let watchdogTransportGeneration = daemonTransportGeneration
@@ -2381,14 +2978,18 @@ public final class MTPLXBackendStore: ObservableObject {
         )
         healthWatchTask = Task { @MainActor [weak self] in
             defer { probeClient.session.finishTasksAndInvalidate() }
-            var consecutiveMisses = 0
+            var tracker = DaemonLivenessTracker(
+                missesBeforeReap: 2,
+                busyGraceSeconds: Self.watchdogBusyGraceSeconds
+            )
             var loggedUndecodable = false
+            var loggedBusy = false
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
                 guard let self, !Task.isCancelled else { return }
                 guard self.daemonTransportGeneration == watchdogTransportGeneration else { return }
                 guard self.shouldProbeDaemonHealth else {
-                    consecutiveMisses = 0
+                    tracker.recordAnswer()
                     continue
                 }
                 let liveness = await probeClient.livenessWithinDeadline(
@@ -2399,7 +3000,9 @@ public final class MTPLXBackendStore: ObservableObject {
                 else { return }
                 switch liveness {
                 case .healthy(let health) where health.ok:
-                    consecutiveMisses = 0
+                    tracker.recordAnswer()
+                    loggedBusy = false
+                    self.daemonUnresponsiveFor = nil
                     self.health = health
                     // Keep the last-known mode when a probe can't verify:
                     // blanking here flipped the fan toggle to the "smart"
@@ -2418,7 +3021,8 @@ public final class MTPLXBackendStore: ObservableObject {
                     // to kill a serving process (2026-07-06: the watchdog
                     // reaped a healthy daemon 95 s after an OpenCode run
                     // because one /health field stopped matching Codable).
-                    consecutiveMisses = 0
+                    tracker.recordAnswer()
+                    self.daemonUnresponsiveFor = nil
                     if !loggedUndecodable {
                         guard self.daemonTransportGeneration == watchdogTransportGeneration else { return }
                         loggedUndecodable = true
@@ -2432,7 +3036,8 @@ public final class MTPLXBackendStore: ObservableObject {
                 case .aliveUnauthorized:
                     // 401/403 proves a live daemon; an API-key mismatch is a
                     // configuration problem, never grounds to reap.
-                    consecutiveMisses = 0
+                    tracker.recordAnswer()
+                    self.daemonUnresponsiveFor = nil
                     if !loggedUndecodable {
                         guard self.daemonTransportGeneration == watchdogTransportGeneration else { return }
                         loggedUndecodable = true
@@ -2445,13 +3050,40 @@ public final class MTPLXBackendStore: ObservableObject {
                 case .unreachable:
                     break
                 }
-                consecutiveMisses += 1
-                guard consecutiveMisses >= 2 else { continue }
-                guard self.daemonTransportGeneration == watchdogTransportGeneration else { return }
-                self.markDaemonUnreachableIfNeeded(
-                    reason: "MTPLX lost contact with the model server. Start it again."
+                // A miss. Process + port truth decides (issue #487): a daemon
+                // mid-commit is silent on /health for 20 s but alive.
+                let evidence = await self.gatherDaemonLivenessEvidence()
+                guard !Task.isCancelled,
+                      self.daemonTransportGeneration == watchdogTransportGeneration
+                else { return }
+                let verdict = tracker.recordMiss(
+                    evidence: evidence,
+                    now: ProcessInfo.processInfo.systemUptime
                 )
-                return
+                switch verdict {
+                case .waiting:
+                    continue
+                case .busy(let unresponsiveFor):
+                    self.daemonUnresponsiveFor = unresponsiveFor
+                    if !loggedBusy {
+                        loggedBusy = true
+                        await self.supervisor.logs.append(
+                            "daemon has not answered /health for \(Int(unresponsiveFor)) s but its process is alive and the port accepts connections; treating it as busy (reap only after \(Int(Self.watchdogBusyGraceSeconds)) s of silence)",
+                            stream: .system
+                        )
+                    }
+                    continue
+                case .reap(let why):
+                    guard self.daemonTransportGeneration == watchdogTransportGeneration else { return }
+                    await self.supervisor.logs.append(
+                        "daemon watchdog reaping: \(Self.describe(why))",
+                        stream: .system
+                    )
+                    self.markDaemonUnreachableIfNeeded(
+                        reason: tr("MTPLX lost contact with the model server. Start it again.")
+                    )
+                    return
+                }
             }
         }
     }
@@ -2474,6 +3106,7 @@ public final class MTPLXBackendStore: ObservableObject {
         connectionState = .failed(reason)
         daemonState = .degraded(reason)
         startupPhase = .failed(reason)
+        daemonUnresponsiveFor = nil
         clearLiveMetricsState()
 
         let previousTeardown = daemonTeardownTask
@@ -2507,16 +3140,21 @@ public final class MTPLXBackendStore: ObservableObject {
         {
             return false
         }
-        if let installedPath = option.installedLocalPath {
+        let library = configuration.modelLibrary
+        if let installedPath = option.installedLocalPath(in: library) {
             var next = configuration
             if next.model != installedPath {
                 next.model = installedPath
                 self.configuration = next
-                try? settingsStore.save(next)
+                try? persistConfiguration(next)
             }
             return false
         }
 
+        let destination = modelDownloader.cachedModelPath(
+            for: option.hfModelID,
+            cacheRoot: library.primaryDirectory
+        )
         pendingModelDownload = PendingModelDownload(
             repoID: option.hfModelID,
             displayName: option.displayName,
@@ -2524,7 +3162,8 @@ public final class MTPLXBackendStore: ObservableObject {
             target: target,
             launchAction: launchAction,
             totalBytes: option.sizeBytes > 0 ? option.sizeBytes : nil,
-            destinationPath: modelDownloader.cachedModelPath(for: option.hfModelID).path
+            destinationPath: destination.path,
+            cacheRoot: destination.deletingLastPathComponent().path
         )
         modelDownloadProgress = nil
         modelDownloadFailure = nil
@@ -2536,7 +3175,8 @@ public final class MTPLXBackendStore: ObservableObject {
     private func downloadableModelOption(for model: String) -> MTPLXModelOption? {
         let rows = MTPLXModelOption.pickerCatalog(
             customModels: configuration.customModels,
-            currentModel: model
+            currentModel: model,
+            modelLibrary: configuration.modelLibrary
         )
         if let match = rows.first(where: { $0.matches(model) }) {
             return match
@@ -2596,7 +3236,7 @@ public final class MTPLXBackendStore: ObservableObject {
                 snapshot.stalledSeconds = seconds
                 snapshot.bytesPerSecond = 0
                 snapshot.etaSeconds = nil
-                snapshot.statusMessage = "Waiting on Hugging Face"
+                snapshot.statusMessage = tr("Waiting on Hugging Face")
                 modelDownloadProgress = snapshot
             }
         case .complete(let bytes, let path):
@@ -2611,7 +3251,7 @@ public final class MTPLXBackendStore: ObservableObject {
                     isComplete: false,
                     statusMessage: "Incomplete"
                 )
-                modelDownloadFailure = "Download finished, but files the source repo ships are still missing from the model folder. Press Retry to resume the Hugging Face download."
+                modelDownloadFailure = tr("Download finished, but files the source repo ships are still missing from the model folder. Press Retry to resume the Hugging Face download.")
                 isModelDownloading = false
                 modelDownloadTask = nil
                 return
@@ -2654,7 +3294,7 @@ public final class MTPLXBackendStore: ObservableObject {
                 snapshot.bytesPerSecond = 0
                 snapshot.etaSeconds = nil
                 snapshot.stalledSeconds = 0
-                snapshot.statusMessage = "Paused"
+                snapshot.statusMessage = tr("Paused")
                 modelDownloadProgress = snapshot
             }
         }
@@ -2665,7 +3305,7 @@ public final class MTPLXBackendStore: ObservableObject {
         modelTuneTask?.cancel()
         modelTuneFailure = nil
         modelTuneResult = nil
-        modelTuneStatusMessage = "Preparing max fans and loading model"
+        modelTuneStatusMessage = tr("Preparing max fans and loading model")
         modelTuneCandidatesLanded = [:]
         isModelTuning = true
         let tuner = autoTuner
@@ -2719,12 +3359,12 @@ public final class MTPLXBackendStore: ObservableObject {
         case .installingFanControl(let message):
             modelTuneStatusMessage = message
         case .started:
-            modelTuneStatusMessage = "Preparing max fans and loading model"
+            modelTuneStatusMessage = tr("Preparing max fans and loading model")
         case .candidateLanded(let result):
             modelTuneStatusMessage = nil
             modelTuneCandidatesLanded[result.candidate] = result
         case .completed(let result):
-            modelTuneStatusMessage = "Saved"
+            modelTuneStatusMessage = tr("Saved")
             modelTuneResult = result
             for entry in result.allCandidates {
                 modelTuneCandidatesLanded[entry.candidate] = entry
@@ -2743,7 +3383,7 @@ public final class MTPLXBackendStore: ObservableObject {
             }
         case .failed(_, let stderrTail):
             modelTuneStatusMessage = nil
-            modelTuneFailure = stderrTail.isEmpty ? "Tuning failed." : stderrTail
+            modelTuneFailure = stderrTail.isEmpty ? tr("Tuning failed.") : stderrTail
             isModelTuning = false
             modelTuneTask = nil
         case .cancelled:
@@ -2861,20 +3501,18 @@ public final class MTPLXBackendStore: ObservableObject {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let lower = trimmed.lowercased()
         if lower.contains("401") || lower.contains("403") || lower.contains("gated") || lower.contains("private") {
-            return "This Hugging Face repo is private or gated. Set HF_TOKEN or HUGGING_FACE_HUB_TOKEN, then try again."
+            return tr("This Hugging Face repo is private or gated. Set HF_TOKEN or HUGGING_FACE_HUB_TOKEN, then try again.")
         }
         if lower.contains("no space left") || lower.contains("not enough free disk") {
-            return "There is not enough free disk space to finish this download."
+            return tr("There is not enough free disk space to finish this download.")
         }
         if lower.contains("timed out") || lower.contains("network") || lower.contains("connection") {
             if MTPLXAppConfiguration.hfMirrorEnvironment(configuration.hfEndpoint) == nil {
-                return "The download could not reach Hugging Face. Check the network connection and try again. "
-                    + "If huggingface.co is blocked on your network, set an HF download mirror in "
-                    + "Settings under Advanced, for example https://hf-mirror.com."
+                return tr("The download could not reach Hugging Face. Check the network connection and try again. If huggingface.co is blocked on your network, set an HF download mirror in Settings under Advanced, for example https://hf-mirror.com.")
             }
-            return "The download could not reach Hugging Face. Check the network connection and try again."
+            return tr("The download could not reach Hugging Face. Check the network connection and try again.")
         }
-        return trimmed.isEmpty ? "Download failed. Try again." : trimmed
+        return trimmed.isEmpty ? tr("Download failed. Try again.") : trimmed
     }
 
     private func fanMode(for configuration: MTPLXAppConfiguration) -> MTPLXFanMode {
@@ -4241,6 +4879,7 @@ private extension MutableSettings {
             || reasoningParser != nil
             || reasoning != nil
             || reasoningEffort != nil
+            || managedClientControls != nil
             || prefillChunkTokens != nil
     }
 }

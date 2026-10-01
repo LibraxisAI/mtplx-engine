@@ -10,19 +10,21 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+
+from mtplx.jsonc import load_config_file
 
 PI_PROVIDER_ID = "mtplx"
 PI_LOCAL_API_KEY = "mtplx-local"
 PI_NPM_PACKAGE = "@earendil-works/pi-coding-agent"
 PI_DEFAULT_CONTEXT_WINDOW = 131_072
 PI_DEFAULT_MAX_TOKENS: int | None = None
-# Pi serializes a 16,384 output ceiling for models whose metadata omits
-# maxTokens. The extension strips exactly this value; any other cap is a
-# deliberate client choice and must reach MTPLX intact.
+# Legacy Pi fallback when model metadata omits maxTokens. Configured models
+# pass their advertised value to the bridge instead of assuming this value.
 PI_INJECTED_DEFAULT_MAX_TOKENS = 16_384
 PI_REQUEST_POLICY_EXTENSION_NAME = "mtplx-request-policy.ts"
 # Connection identity MTPLX must keep correct for the integration to work at
@@ -57,15 +59,93 @@ def pi_request_policy_extension_path(path: str | Path | None = None) -> Path:
     return pi_models_json_path(path).parent / "extensions" / PI_REQUEST_POLICY_EXTENSION_NAME
 
 
+def build_pi_settings_extension_source() -> str:
+    """Independent of the user-owned request bridge; never overwrite customization."""
+    return r'''// MTPLX-managed settings mirror. Remove this marker to take ownership.
+export default function (pi: any) {
+  let timer: any;
+  let syncInFlight: any;
+  let clientThinking: any;
+  let sessionKey: any;
+
+  const readSettings = async (ctx: any) => {
+    const model = ctx.model;
+    if (model?.provider !== "mtplx") {
+      ctx.ui.setStatus("mtplx-controls", undefined);
+      return;
+    }
+    try {
+      const key = String(ctx.sessionManager.getSessionId()) + ":" + model.id;
+      if (sessionKey !== key) {
+        sessionKey = key;
+        clientThinking = undefined;
+      }
+      const registry = ctx.modelRegistry;
+      const auth = registry.getApiKeyAndHeaders
+        ? await registry.getApiKeyAndHeaders(model)
+        : { ok: true, apiKey: await registry.getApiKey(model) };
+      if (!auth.ok) throw new Error(auth.error);
+      const headers: any = {};
+      for (const [name, value] of Object.entries({ ...model.headers, ...auth.headers })) {
+        if (typeof value === "string") headers[name] = value;
+      }
+      if (auth.apiKey) headers.Authorization = "Bearer " + auth.apiKey;
+      // Pi installs a global HTTP dispatcher whose idle connection reuse can
+      // delay these small polls. Keep control-plane reads off pooled sockets.
+      headers.Connection = "close";
+      const base = String(auth.baseUrl || model.baseUrl).replace(/[/]+$/, "");
+      const response = await fetch(base + "/mtplx/settings", {
+        headers, signal: AbortSignal.timeout(5000),
+      });
+      if (!response.ok) throw new Error("settings HTTP " + response.status);
+      const settings = await response.json();
+      if (settings.managed_client_controls === "app") {
+        const effort = settings.enable_thinking === false ? "off" : settings.reasoning_effort;
+        if (!["off", "low", "medium", "high", "xhigh"].includes(effort)) {
+          throw new Error("unsupported MTPLX reasoning effort: " + effort);
+        }
+        clientThinking ??= pi.getThinkingLevel();
+        if (pi.getThinkingLevel() !== effort) pi.setThinkingLevel(effort);
+        ctx.ui.setStatus("mtplx-controls", "MTPLX controls reasoning: " + effort);
+      } else {
+        if (clientThinking !== undefined) pi.setThinkingLevel(clientThinking);
+        clientThinking = undefined;
+        ctx.ui.setStatus("mtplx-controls", undefined);
+      }
+    } catch (error) {
+      ctx.ui.setStatus("mtplx-controls", "MTPLX settings sync failed: " + String(error));
+    }
+  };
+  const syncThinking = (ctx: any) => {
+    syncInFlight ??= readSettings(ctx).finally(() => { syncInFlight = undefined; });
+    return syncInFlight;
+  };
+  const startSync = async (_event: any, ctx: any) => {
+    if (timer) clearInterval(timer);
+    await syncThinking(ctx);
+    timer = setInterval(() => { if (ctx.isIdle()) void syncThinking(ctx); }, 3000);
+    timer.unref?.();
+  };
+  pi.on("session_start", startSync);
+  pi.on("session_switch", startSync);
+  pi.on("model_select", startSync);
+  pi.on("before_agent_start", async (_event: any, ctx: any) => { await syncThinking(ctx); });
+  pi.on("session_shutdown", () => { if (timer) clearInterval(timer); });
+
+}
+'''
+
+
 def build_pi_request_policy_extension_source(
     model_id: str,
     *,
     uncapped: bool,
+    injected_max_tokens: int = PI_INJECTED_DEFAULT_MAX_TOKENS,
 ) -> str:
     """Build Pi's request/session bridge for the configured MTPLX model.
 
-    Pi defaults omitted ``maxTokens`` metadata to 16,384 and serializes that
-    default on every request. The extension removes only Pi's generated output
+    Pi serializes the model's advertised ``maxTokens`` (or its legacy default)
+    on every request. The extension removes only Pi's generated output
     ceiling for the exact MTPLX model while leaving explicit user caps alone.
     It also gives MTPLX Pi's real session id so prompt-cache reuse is stable.
     """
@@ -78,7 +158,7 @@ def build_pi_request_policy_extension_source(
 // the mtplx identifiers below are gone from it.
 const mtplxModelID = {model_literal};
 const mtplxUncapped = {uncapped_literal};
-const mtplxPiInjectedDefaultMaxTokens = {PI_INJECTED_DEFAULT_MAX_TOKENS};
+const mtplxPiInjectedDefaultMaxTokens = {int(injected_max_tokens)};
 
 export default function (pi: any) {{
   pi.on("before_provider_headers", (event: any, ctx: any) => {{
@@ -91,6 +171,8 @@ export default function (pi: any) {{
     event.headers["x-mtplx-session-id"] = String(
       ctx.sessionManager.getSessionId(),
     );
+    const leaf = ctx.sessionManager.getLeafId();
+    if (leaf) event.headers["x-mtplx-client-entry-id"] = String(leaf);
   }});
 
   pi.on("before_provider_request", (event: any) => {{
@@ -120,12 +202,24 @@ def write_pi_request_policy_extension(
     *,
     model_id: str,
     uncapped: bool,
+    injected_max_tokens: int = PI_INJECTED_DEFAULT_MAX_TOKENS,
     path: str | Path | None = None,
 ) -> Path:
     """Install the small Pi bridge owned by the MTPLX provider config."""
 
     extension_path = pi_request_policy_extension_path(path)
-    source = build_pi_request_policy_extension_source(model_id, uncapped=uncapped)
+    source = build_pi_request_policy_extension_source(
+        model_id, uncapped=uncapped, injected_max_tokens=injected_max_tokens,
+    )
+    return _write_pi_managed_extension(extension_path, source)
+
+
+def write_pi_settings_extension(path: str | Path | None = None) -> Path:
+    extension_path = pi_models_json_path(path).parent / "extensions" / "mtplx-settings-sync.ts"
+    return _write_pi_managed_extension(extension_path, build_pi_settings_extension_source())
+
+
+def _write_pi_managed_extension(extension_path: Path, source: str) -> Path:
     if extension_path.exists():
         try:
             current = extension_path.read_text(encoding="utf-8")
@@ -271,14 +365,13 @@ def build_pi_provider_config(
     }
 
 
-def _backup_invalid_config(path: Path) -> Path:
+def _unique_backup(path: Path, reason: str) -> Path:
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
-    backup = path.with_name(f"{path.name}.invalid-{stamp}.bak")
+    backup = path.with_name(f"{path.name}.{reason}-{stamp}.bak")
     counter = 1
     while backup.exists():
-        backup = path.with_name(f"{path.name}.invalid-{stamp}-{counter}.bak")
+        backup = path.with_name(f"{path.name}.{reason}-{stamp}-{counter}.bak")
         counter += 1
-    path.replace(backup)
     return backup
 
 
@@ -435,12 +528,11 @@ def write_pi_models_config(
     backup_path: Path | None = None
     existing: dict[str, Any] | None = None
     if config_path.exists():
-        try:
-            parsed = json.loads(config_path.read_text(encoding="utf-8"))
-            existing = parsed if isinstance(parsed, dict) else {}
-        except (OSError, json.JSONDecodeError):
-            backup_path = _backup_invalid_config(config_path)
-            existing = {}
+        # Pi strips // comments and trailing commas from models.json, so MTPLX
+        # reads it the same way. A file that still does not parse is the
+        # user's to fix: InvalidConfigFile propagates and nothing here is
+        # moved or written.
+        existing, _existing_text = load_config_file(config_path)
 
     provider_config = build_pi_provider_config(
         base_url=base_url,
@@ -457,7 +549,14 @@ def write_pi_models_config(
         provider_id=provider_id,
     )
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+    # Unchanged content leaves the file exactly as the user wrote it. A
+    # rewrite keeps the previous file next to it and reports the copy's path.
+    written = existing is None or merged != existing
+    if written:
+        if existing is not None:
+            backup_path = _unique_backup(config_path, "before-mtplx")
+            shutil.copy2(config_path, backup_path)
+        config_path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
     try:
         config_path.chmod(0o600)
     except OSError:
@@ -465,8 +564,10 @@ def write_pi_models_config(
     request_policy_extension_path = write_pi_request_policy_extension(
         model_id=model_id,
         uncapped=max_tokens is None,
+        injected_max_tokens=int(provider_config["models"][0]["maxTokens"]),
         path=config_path,
     )
+    settings_extension_path = write_pi_settings_extension(config_path)
     return {
         "config_path": str(config_path),
         "backup_path": str(backup_path) if backup_path is not None else None,
@@ -480,6 +581,7 @@ def write_pi_models_config(
         "max_tokens": None if max_tokens is None else int(max_tokens),
         "no_hidden_max_tokens": max_tokens is None,
         "request_policy_extension_path": str(request_policy_extension_path),
+        "settings_extension_path": str(settings_extension_path),
         "uncapped_request_policy": max_tokens is None,
-        "written": True,
+        "written": written,
     }

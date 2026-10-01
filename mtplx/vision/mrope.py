@@ -23,6 +23,19 @@ from typing import Sequence
 
 import numpy as np
 
+# The tag that keys banked image prefixes roped through this table and delta
+# (see mtplx.vision.splice.vision_bank_key_ids). It names how the ROWS of a
+# banked entry were positioned, so it changes whenever that changes.
+#
+# v1 was implicit: builds 2.10.1 to 2.11.3 wrote these entries under the same
+# unsalted key as sequentially roped ones. Those builds opened the position
+# scope around the main verify forward only, so the rows their copy rounds,
+# repairs, lazy bonus commits and final commits wrote sit |delta| positions
+# off, inside entries nothing else tells apart. v2 entries are written with
+# every trunk forward inside the scope. A v1 entry can no longer match at or
+# past an image; nothing is deleted, it ages out through normal eviction.
+BANK_KEY_SCHEME = "qwen4_mrope_v2"
+
 
 def build_mrope_positions(
     input_ids: Sequence[int],

@@ -1087,3 +1087,45 @@ def test_repetition_guard_stops_armed_row_and_spares_unarmed_peer(monkeypatch):
     assert peer.finish_reason == "length"
     assert len(peer.tokens) == 48
     assert peer.repetition_stop is None
+
+
+def test_long_cycle_stop_ends_armed_row_without_trimming(monkeypatch):
+    """The same period-16 loop with the short-block stop capped at 8 tokens:
+    only the long-cycle stop can see it. The armed row stops once three whole
+    copies are committed and keeps every token (the wire already has them);
+    the unarmed peer runs to its budget."""
+    monkeypatch.setenv("MTPLX_REPETITION_STOP_MIN_TOKENS", "40")
+    monkeypatch.setenv("MTPLX_REPETITION_STOP_MAX_BLOCK_TOKENS", "8")
+    monkeypatch.setenv("MTPLX_REPETITION_STOP_MAX_CYCLE_TOKENS", "64")
+    monkeypatch.setenv("MTPLX_REPETITION_STOP_MIN_CYCLE_COPIES", "3")
+    monkeypatch.setenv("MTPLX_REPETITION_STOP_MIN_CYCLE_SPAN_TOKENS", "32")
+    streamed: list[int] = []
+    result = generate_a3b_mtp_batch(
+        _FakeLane(),
+        [
+            _request(
+                "armed",
+                [1, 2, 3],
+                max_tokens=96,
+                callback=streamed.append,
+                repetition_stop=True,
+            ),
+            _request("peer", [7], max_tokens=64),
+        ],
+    )
+
+    armed, peer = result.streams
+    assert armed.finish_reason == "stop"
+    hit = armed.repetition_stop
+    assert hit is not None
+    assert hit.reason == "long_cycle"
+    assert hit.block_tokens == 16
+    assert hit.repeats == 3
+    assert hit.repeated_tokens == 0
+    assert hit.trim_start == len(armed.tokens)
+    assert tuple(streamed) == armed.tokens
+    # Three copies are whole at 48 tokens; the check runs once per cycle.
+    assert 48 <= len(armed.tokens) <= 50
+    assert peer.finish_reason == "length"
+    assert len(peer.tokens) == 64
+    assert peer.repetition_stop is None

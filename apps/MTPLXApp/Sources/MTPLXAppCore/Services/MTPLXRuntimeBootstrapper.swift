@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import OSLog
 
 public enum MTPLXRuntimeBootstrapperError: Error, LocalizedError, Sendable {
     case homebrewNotFound
@@ -10,27 +11,28 @@ public enum MTPLXRuntimeBootstrapperError: Error, LocalizedError, Sendable {
     public var errorDescription: String? {
         switch self {
         case .homebrewNotFound:
-            return "Homebrew was not found, so MTPLX could not install its command-line runtime automatically. Install Homebrew from brew.sh, then press Retry."
+            return tr("Homebrew was not found, so MTPLX could not install its command-line runtime automatically. Install Homebrew from brew.sh, then press Retry.")
         case .pythonNotFound:
-            return "Python 3.11 or newer was not found, so MTPLX could not prepare its command-line runtime. Install Homebrew from brew.sh, then press Retry."
+            return tr("Python 3.11 or newer was not found, so MTPLX could not prepare its command-line runtime. Install Homebrew from brew.sh, then press Retry.")
         case .commandFailed(let command, let exitCode, let output):
             let detail = output.trimmingCharacters(in: .whitespacesAndNewlines)
             if detail.isEmpty {
-                return "\(command) failed with exit code \(exitCode)."
+                return tr("%@ failed with exit code %@.", command, String(exitCode))
             }
-            return "\(command) failed with exit code \(exitCode): \(detail)"
+            return tr("%@ failed with exit code %@: %@", command, String(exitCode), detail)
         case .runtimeStillMissing(let output):
             let detail = output.trimmingCharacters(in: .whitespacesAndNewlines)
             if detail.isEmpty {
-                return "Homebrew finished, but MTPLX still was not available on PATH."
+                return tr("Homebrew finished, but MTPLX still was not available on PATH.")
             }
-            return "Homebrew finished, but MTPLX still was not available on PATH: \(detail)"
+            return tr("Homebrew finished, but MTPLX still was not available on PATH: %@", detail)
         }
     }
 }
 
 public struct MTPLXRuntimeBootstrapper: Sendable {
     public static let formula = "youssofal/mtplx/mtplx"
+    private static let logger = Logger(subsystem: "com.mtplx.app", category: "RuntimeBootstrapper")
 
     public init(environment: [String: String] = ProcessInfo.processInfo.environment) {
         self.environment = environment
@@ -38,6 +40,7 @@ public struct MTPLXRuntimeBootstrapper: Sendable {
 
     private let environment: [String: String]
 
+    /// Status callbacks carry English localization keys, never rendered text.
     public func installOrUpdate(status: (@Sendable (String) -> Void)? = nil) throws -> URL {
         status?("Checking MTPLX runtime")
         let minimumVersion = minimumRuntimeVersion()
@@ -112,10 +115,11 @@ public struct MTPLXRuntimeBootstrapper: Sendable {
         guard isAppManagedRuntime(installedExecutable) else {
             return true
         }
-        guard let bundled = try? Self.wheelFingerprint(
-            of: URL(fileURLWithPath: wheelPath)
-        ) else {
-            return true
+        guard let selected = try? selectedBundledRuntimeWheel(
+            fallback: URL(fileURLWithPath: wheelPath),
+            python: runtimeDir.appendingPathComponent("bin/python")
+        ), let bundled = try? Self.wheelFingerprint(of: selected) else {
+            return false
         }
         return bundled == Self.recordedWheelFingerprint(runtimeDir: runtimeDir)
     }
@@ -235,6 +239,20 @@ public struct MTPLXRuntimeBootstrapper: Sendable {
     /// Exit-0 iff the venv's python can import the native stack. `-I`
     /// (isolated mode) ignores PYTHONPATH and user site-packages, so the
     /// probe sees exactly what the daemon's hermetic launch sees.
+    /// What a failed import check tells the user. MLX's macOS 26 wheels need
+    /// 26.2 or later, so on 26.0 and 26.1 the import fails however good the
+    /// network is.
+    static func importCheckFailureDetail(
+        os: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion
+    ) -> String {
+        if os.majorVersion == 26 && os.minorVersion < 2 {
+            return "The engine needs macOS 26.2 or later; its MLX libraries do not load on "
+                + "macOS 26.\(os.minorVersion). Update macOS, then press Retry."
+        }
+        return "Bundled runtime installed, but the engine failed its import check "
+            + "(mlx native libraries). Check network access to PyPI, then press Retry."
+    }
+
     func runtimeImportProbeSucceeds(runtimeDir: URL) -> Bool {
         let venvPython = runtimeDir
             .appendingPathComponent("bin")
@@ -267,7 +285,11 @@ public struct MTPLXRuntimeBootstrapper: Sendable {
         let runtimeDir = URL(
             fileURLWithPath: MTPLXCommandBuilder.appRuntimeDirectory(environment: environment)
         )
-        let fingerprint = try? Self.wheelFingerprint(of: URL(fileURLWithPath: wheelPath))
+        guard let selected = try? selectedBundledRuntimeWheel(
+            fallback: URL(fileURLWithPath: wheelPath),
+            python: runtimeDir.appendingPathComponent("bin/python")
+        ) else { return false }
+        let fingerprint = try? Self.wheelFingerprint(of: selected)
         let recheckRequested = FileManager.default.fileExists(
             atPath: Self.importRecheckRequestURL(environment: environment).path
         )
@@ -446,7 +468,52 @@ public struct MTPLXRuntimeBootstrapper: Sendable {
         return env
     }
 
-    private func installBundledRuntime(wheel: URL, rebuildFromScratch: Bool = false) throws -> URL {
+    func selectedBundledRuntimeWheel(fallback: URL, python: URL) throws -> URL {
+        var isDirectory: ObjCBool = false
+        guard fallback.pathExtension == "whl",
+              FileManager.default.fileExists(atPath: fallback.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue else {
+            throw MTPLXRuntimeBootstrapperError.runtimeStillMissing(
+                output: "Bundled fallback runtime wheel was not found: \(fallback.path)"
+            )
+        }
+        let resources = fallback.deletingLastPathComponent()
+        let native = resources.appendingPathComponent("Native", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: native.path) else { return fallback }
+        do {
+            let contents = try FileManager.default.contentsOfDirectory(
+                at: native, includingPropertiesForKeys: nil
+            )
+            guard contents.contains(where: { $0.pathExtension == "whl" }) else {
+                return fallback
+            }
+            // Run against the actual venv, so pip's tags cover its Python ABI,
+            // CPU and macOS version. Unsupported cells retain the pure wheel.
+            let output = try run(
+                executable: python,
+                arguments: ["-I", "-B", resources.appendingPathComponent("select_runtime_wheel.py").path,
+                            fallback.path, native.path],
+                displayCommand: "Selecting compatible bundled MTPLX runtime"
+            )
+            let selected = URL(fileURLWithPath: output.trimmingCharacters(in: .whitespacesAndNewlines))
+            guard selected.pathExtension == "whl",
+                  FileManager.default.fileExists(atPath: selected.path, isDirectory: &isDirectory),
+                  !isDirectory.boolValue else {
+                throw MTPLXRuntimeBootstrapperError.runtimeStillMissing(
+                    output: "Compatible bundled runtime was not found: \(output)"
+                )
+            }
+            return selected
+        } catch {
+            // Native selection is optional. Keep the known bundled runtime
+            // usable while recording the failure; installation/import errors
+            // still propagate, and fingerprinting uses this exact fallback.
+            Self.logger.error("Native wheel selection failed; using bundled pure wheel: \(error.localizedDescription, privacy: .public)")
+            return fallback
+        }
+    }
+
+    private func installBundledRuntime(wheel fallback: URL, rebuildFromScratch: Bool = false) throws -> URL {
         let runtimeDir = URL(fileURLWithPath: MTPLXCommandBuilder.appRuntimeDirectory(environment: environment))
         try FileManager.default.createDirectory(
             at: runtimeDir.deletingLastPathComponent(),
@@ -464,6 +531,7 @@ public struct MTPLXRuntimeBootstrapper: Sendable {
             arguments: ["-m", "pip", "install", "-U", "pip"],
             displayCommand: "runtime python -m pip install -U pip"
         )
+        let wheel = try selectedBundledRuntimeWheel(fallback: fallback, python: venvPython)
         _ = try run(
             executable: venvPython,
             arguments: ["-m", "pip", "install", "-U", "\(wheel.path)[server]"],
@@ -503,8 +571,7 @@ public struct MTPLXRuntimeBootstrapper: Sendable {
         // a daemon that dies before /health with no explanation.
         guard runtimeImportProbeSucceeds(runtimeDir: runtimeDir) else {
             throw MTPLXRuntimeBootstrapperError.runtimeStillMissing(
-                output: "Bundled runtime installed, but the engine failed its import check "
-                    + "(mlx native libraries). Check network access to PyPI, then press Retry."
+                output: Self.importCheckFailureDetail()
             )
         }
         Self.recordWheelFingerprint(for: wheel, runtimeDir: runtimeDir)

@@ -14,6 +14,7 @@ actually builds. They cover:
 
 from __future__ import annotations
 
+import json
 import sys
 import time
 from threading import Event, Thread
@@ -29,6 +30,7 @@ from mtplx.benchmarks.runners.aime import AIMEProblem
 from mtplx.server import openai
 from mtplx.server.dashboard_state import (
     InFlightHandle,
+    PrefillHistory,
     ProgressEventGate,
     RollingMetrics,
 )
@@ -409,6 +411,38 @@ def test_settings_post_mutates_mutable_keys():
     assert state.args.prefill_chunk_tokens == 4096
     assert body["prefill_chunk_tokens"] == 4096
     assert body["generation_mode"] == "ar"
+
+
+def test_settings_get_reports_an_unpinned_prefill_chunk_as_none(monkeypatch):
+    # The served default is not a pin: echoing it back from the app pinned
+    # 2,048 on every Flash-Next launch and skipped the family's wide chunk.
+    monkeypatch.delenv("MTPLX_PREFILL_CHUNK_SIZE_DENSE", raising=False)
+    monkeypatch.delenv("MTPLX_PREFILL_CHUNK_SIZE", raising=False)
+    monkeypatch.setenv("MTPLX_QWEN4_PREFILL_WIDE_CHUNK", "4096")
+    state = _fake_state()
+    state.args.prefill_chunk_tokens = None
+    body = TestClient(create_app(state)).get("/v1/mtplx/settings").json()
+    assert body["prefill_chunk_tokens"] is None
+    assert body["prefill_chunk_tokens_default"] == 4096
+
+
+def test_settings_post_zero_or_auto_unpins_the_prefill_chunk(monkeypatch):
+    monkeypatch.delenv("MTPLX_QWEN4_PREFILL_WIDE_CHUNK", raising=False)
+    for unpin in (0, "auto"):
+        state = _fake_state()
+        client = TestClient(create_app(state))
+        assert client.post(
+            "/v1/mtplx/settings", json={"prefill_chunk_tokens": 2048}
+        ).status_code == 200
+        assert state.args.prefill_chunk_tokens == 2048
+        response = client.post(
+            "/v1/mtplx/settings", json={"prefill_chunk_tokens": unpin}
+        )
+        assert response.status_code == 200
+        assert state.args.prefill_chunk_tokens is None
+        body = response.json()
+        assert body["prefill_chunk_tokens"] is None
+        assert body["prefill_chunk_tokens_default"] == 2048
 
 
 def test_settings_post_rejects_restart_required_keys():
@@ -976,6 +1010,38 @@ def test_dashboard_prefill_chunk_exposes_live_and_cumulative_rates():
     assert handle.prefill_state["live_prefill_tok_s"] == 512.0
 
 
+def test_prefill_card_summarizes_live_work_without_polling_duplicates():
+    state = _fake_state()
+    state.dashboard.in_flight.register(InFlightHandle(
+        request_id="prefill-card", cancel_event=Event(), started_s=time.time(),
+    ))
+    for size, seconds in [(2048, 1.0), (4096, 3.0)]:
+        openai._dashboard_publish_prefill(
+            state, request_id="prefill-card", session_id="session",
+            payload={"phase": "chunk", "chunk_size": size,
+                     "chunk_elapsed_s": seconds, "tokens_done": 106144,
+                     "cached_tokens": 100000, "elapsed_s": 15.0},
+        )
+    # Non-compute phases and repeated reads cannot inflate work or dilute it
+    # with cache restoration, MTP history, queueing or the model's output.
+    openai._dashboard_publish_prefill(
+        state, request_id="prefill-card", session_id="session",
+        payload={"phase": "completed", "prefill_tok_s": 400, "elapsed_s": 20.0},
+    )
+    first = openai._mtplx_dashboard_snapshot(state)["prefill_rates"]
+    assert first == openai._mtplx_dashboard_snapshot(state)["prefill_rates"]
+    assert first == {"tokens": 6144, "compute_time_s": 4.0,
+                     "peak_tok_s": 2048.0, "samples": 2, "capacity": 100}
+
+
+def test_prefill_chunk_window_is_bounded_and_ignores_invalid_samples():
+    history = PrefillHistory(capacity=2)
+    for size, seconds in [(100, 1), (200, 1), (300, 1), (1, 0), (1, float("nan"))]:
+        history.record_chunk(size, seconds)
+    assert history.rates() == {"tokens": 500, "compute_time_s": 2,
+                              "peak_tok_s": 300, "samples": 2, "capacity": 2}
+
+
 def test_dashboard_prompt_preview_truncates_long_messages():
     long_text = "abcdefghij" * 20
     request = type(
@@ -1005,3 +1071,161 @@ def test_rolling_metrics_per_session_map_is_lru_bounded():
     # Most-recent sessions survive; the oldest were evicted.
     assert "session-199" in per_session
     assert "session-0" not in per_session
+
+
+def test_settings_post_toggles_adaptive_depth_policy_live():
+    state = _fake_state()
+    client = TestClient(create_app(state))
+    supported = client.get("/v1/mtplx/settings").json()["adaptive_depth_supported"]
+    off = client.post("/v1/mtplx/settings", json={"adaptive_policy": "none"})
+    assert off.status_code == 200
+    assert off.json()["adaptive_policy"] == "none"
+    assert state.args.adaptive_policy == "none"
+    on = client.post("/v1/mtplx/settings", json={"adaptive_policy": "expected_value"})
+    if supported:
+        assert on.status_code == 200
+        assert state.args.adaptive_policy == "expected_value"
+        assert on.json()["adaptive_policy"] == "expected_value"
+    else:
+        assert on.status_code == 400
+        assert state.args.adaptive_policy == "none"
+    assert client.post("/v1/mtplx/settings", json={"adaptive_policy": "always"}).status_code == 400
+
+
+# ---- request-log row contract (issue #401) --------------------------------
+
+
+def _request_envelope(stats: dict) -> dict:
+    return openai._metrics_envelope(
+        stats=stats,
+        prompt_tokens=64,
+        completion_tokens=32,
+        request_elapsed_s=2.0,
+        token_times=[],
+        request_started_s=0.0,
+        lock_wait_time_s=0.0,
+        session_id="session-1",
+        session_cache_hit=True,
+        cache_miss_reason=None,
+        session_restore_mode="near_prefix_clone",
+        mtp_depth=3,
+        generation_limits={},
+    )
+
+
+def test_request_envelope_carries_the_aggregate_draft_counters():
+    """The dashboard's "N accepted of M drafted" line reads these two keys.
+
+    They existed on GenerationStats and in the public stats block, but the
+    dashboard envelope carried only the per-depth breakdown, so both cells
+    rendered as dashes.
+    """
+    envelope = _request_envelope(
+        {
+            "verify_calls": 12,
+            "accepted_drafts": 27,
+            "rejected_drafts": 9,
+            "drafted_tokens": 36,
+            "accepted_by_depth": [12, 9, 6],
+            "drafted_by_depth": [12, 12, 12],
+        }
+    )
+    assert envelope["accepted_drafts"] == 27
+    assert envelope["rejected_drafts"] == 9
+    assert envelope["drafted_tokens"] == 36
+    # The per-depth breakdown still has to agree with the aggregate.
+    assert sum(envelope["accepted_by_depth"]) == envelope["accepted_drafts"]
+    assert sum(envelope["drafted_by_depth"]) == envelope["drafted_tokens"]
+
+
+def test_request_envelope_draft_counters_default_to_zero():
+    envelope = _request_envelope({"verify_calls": 0})
+    assert envelope["accepted_drafts"] == 0
+    assert envelope["rejected_drafts"] == 0
+    assert envelope["drafted_tokens"] == 0
+
+
+def test_every_recorded_request_carries_a_wall_clock(monkeypatch, tmp_path):
+    """The request log's `when` column needs an absolute time on every row."""
+    state = _fake_state()
+    state.last_metrics = []
+    before = time.time()
+    openai._record_request_metrics(state, {"request_id": "r1", "prompt_tokens": 1})
+    after = time.time()
+
+    row = state.last_metrics[-1]
+    assert before <= row["completed_at_s"] <= after
+
+
+def test_a_producer_supplied_wall_clock_is_kept():
+    state = _fake_state()
+    state.last_metrics = []
+    openai._record_request_metrics(
+        state, {"request_id": "r1", "completed_at_s": 1234.5}
+    )
+    assert state.last_metrics[-1]["completed_at_s"] == 1234.5
+
+
+def test_metrics_endpoint_rows_carry_the_wall_clock_and_the_draft_totals():
+    """Wire contract for the request log (issue #401): the dashboard reads
+    `recent` rows from GET /metrics, so the row served there, not only the
+    envelope helper, has to carry `completed_at_s` and the draft totals."""
+    state = _fake_state()
+    state.last_metrics = []
+    before = time.time()
+    openai._record_request_metrics(
+        state,
+        _request_envelope(
+            {
+                "verify_calls": 12,
+                "accepted_drafts": 27,
+                "rejected_drafts": 9,
+                "drafted_tokens": 36,
+                "accepted_by_depth": [12, 9, 6],
+                "drafted_by_depth": [12, 12, 12],
+            }
+        ),
+    )
+    after = time.time()
+
+    payload = TestClient(create_app(state)).get("/metrics").json()
+    row = payload["recent"][-1]
+    assert before <= row["completed_at_s"] <= after
+    assert row["accepted_drafts"] == 27
+    assert row["drafted_tokens"] == 36
+    assert payload["latest"]["completed_at_s"] == row["completed_at_s"]
+
+
+# ---- strict JSON on the SSE stream (found while checking issue #481) -------
+
+
+def test_json_safe_turns_non_finite_floats_into_null():
+    """JSON has no inf or nan. FastAPI's encoder already turns them into
+    null on the routes; `_json_safe` feeds the SSE stream and the request
+    log, which serialize with json.dumps directly, so it has to do the same
+    or a browser's JSON.parse rejects the whole event."""
+    assert openai._json_safe(float("inf")) is None
+    assert openai._json_safe(float("-inf")) is None
+    assert openai._json_safe(float("nan")) is None
+    assert openai._json_safe(1.5) == 1.5
+    assert openai._json_safe(0) == 0
+    assert openai._json_safe(True) is True
+    assert openai._json_safe({"a": [float("inf"), 2.0]}) == {"a": [None, 2.0]}
+
+
+def test_dashboard_stream_snapshot_is_strict_json_with_the_idle_sweep_off(monkeypatch):
+    """MTPLX_SESSION_BANK_IDLE_TTL_S=0 (issue #481, "keep entries until
+    memory needs them") makes the bank's idle_ttl_s infinite. /health already
+    rendered that as null; the dashboard stream serialized the same snapshot
+    with a bare `Infinity` token, which JSON.parse in the browser rejects, so
+    every snapshot event on the live dashboard was unparseable."""
+    monkeypatch.setenv("MTPLX_SESSION_BANK_IDLE_TTL_S", "0")
+    state = _fake_state()
+    state.sessions = openai.EngineSessionManager()
+    assert state.sessions.bank.idle_ttl_s == float("inf")
+
+    snapshot = openai._mtplx_dashboard_snapshot(state)
+    # Exactly what the SSE handler writes after "data: "; allow_nan=False is
+    # the strict-JSON check a browser applies.
+    wire = json.dumps(openai._json_safe(snapshot), allow_nan=False)
+    assert json.loads(wire)["session_bank"]["idle_ttl_s"] is None

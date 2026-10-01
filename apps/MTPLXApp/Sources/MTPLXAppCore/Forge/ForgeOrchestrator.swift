@@ -88,6 +88,7 @@ public final class ForgeOrchestrator: ObservableObject {
     private let hfPublisher: HFPublisher
     private let hfTokenStore: HFTokenStore
     private let feasibility: ModelFeasibility
+    private var modelLibrary: ModelLibrary = .default
 
     // MARK: Task handles (cancel surface)
 
@@ -165,12 +166,14 @@ public final class ForgeOrchestrator: ObservableObject {
         }
     }
 
-    public func evaluateFeasibility() -> ModelFeasibilityVerdict? {
+    public func evaluateFeasibility(
+        modelLibrary: ModelLibrary? = nil
+    ) -> ModelFeasibilityVerdict? {
         guard let probe = state.sourceProbe, probe.verdict == .forgeable else { return nil }
         let hw = state.hardware
         let chipTier = hw?.tier ?? .unknown
         let ramGiB = hw?.unifiedMemoryGiB ?? 0
-        let diskFreeGiB = freeDiskGiB()
+        let diskFreeGiB = freeDiskGiB(modelLibrary: modelLibrary)
         // Use the probe's estimates if available, otherwise fall
         // back to a generous default that won't false-positive on
         // small models.
@@ -196,11 +199,9 @@ public final class ForgeOrchestrator: ObservableObject {
         )
     }
 
-    public func freeDiskGiB() -> Double {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let values = try? home.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-        let bytes = values?.volumeAvailableCapacityForImportantUsage ?? 0
-        return Double(bytes) / 1_073_741_824.0
+    public func freeDiskGiB(modelLibrary: ModelLibrary? = nil) -> Double {
+        let library = modelLibrary ?? self.modelLibrary
+        return ModelStoreVolume.freeGiB(at: ModelStoreVolume.measurementURL(for: library.primaryDirectory))
     }
 
     // MARK: - Plan step
@@ -215,10 +216,13 @@ public final class ForgeOrchestrator: ObservableObject {
 
     // MARK: - Build (drives convert + calibrate + verify + brand)
 
-    public func startBuild() {
+    public func startBuild(modelLibrary: ModelLibrary? = nil) {
         guard !isBuilding else { return }
         guard let probe = state.sourceProbe, probe.verdict == .forgeable else { return }
         guard !(state.recipe.degradesMtp && !state.hasAcknowledgedDegradedMTP) else { return }
+        if let modelLibrary {
+            self.modelLibrary = modelLibrary
+        }
 
         // Reset per-build live signals before launching.
         convertPhases = [:]
@@ -259,7 +263,8 @@ public final class ForgeOrchestrator: ObservableObject {
             outputDir: outputDir.path,
             runID: String(runID),
             maxFans: true,
-            allowDegradedMtp: state.recipe.degradesMtp
+            allowDegradedMtp: state.recipe.degradesMtp,
+            modelDirectory: self.modelLibrary.primaryDirectory.path
         )
 
         let builder = forgeBuilder
@@ -369,14 +374,14 @@ public final class ForgeOrchestrator: ObservableObject {
             completedLocalPath = nil
             brandedRuntimeMetadata = nil
             buildFailure = outcome.message.isEmpty
-                ? (stderrTail.isEmpty ? "MTP did not accelerate this model." : stderrTail)
+                ? (stderrTail.isEmpty ? tr("MTP did not accelerate this model.") : stderrTail)
                 : outcome.message
             buildPhase = .verify
             isBuilding = false
             state.step = .verify
 
         case .failed(_, let phase, let stderrTail):
-            buildFailure = stderrTail.isEmpty ? "Forge build failed." : stderrTail
+            buildFailure = stderrTail.isEmpty ? tr("Forge build failed.") : stderrTail
             buildPhase = phase
             isBuilding = false
 
@@ -385,7 +390,7 @@ public final class ForgeOrchestrator: ObservableObject {
 
         case .backendNotAvailable:
             backendUnavailable = true
-            buildFailure = "Forge backend not available. Install or update MTPLX 1.x to use this tab."
+            buildFailure = tr("Forge backend not available. Install or update MTPLX 1.x to use this tab.")
             isBuilding = false
         }
     }
@@ -418,11 +423,11 @@ public final class ForgeOrchestrator: ObservableObject {
 
     public func openPublishStage() {
         guard state.hasSpeedWinningVerification else {
-            publishFailure = "Forge only publishes models that proved an MTP speed win on this Mac."
+            publishFailure = tr("Forge only publishes models that proved an MTP speed win on this Mac.")
             return
         }
         guard let path = completedLocalPath, !path.isEmpty else {
-            publishFailure = "No completed forge to publish."
+            publishFailure = tr("No completed forge to publish.")
             return
         }
         publishFailure = nil
@@ -446,7 +451,7 @@ public final class ForgeOrchestrator: ObservableObject {
         if state.hasSpeedWinningVerification {
             publishFailure = nil
         } else {
-            publishFailure = "Forge only publishes models that proved an MTP speed win on this Mac."
+            publishFailure = tr("Forge only publishes models that proved an MTP speed win on this Mac.")
         }
     }
 
@@ -465,7 +470,7 @@ public final class ForgeOrchestrator: ObservableObject {
                 hfRepo: provenance.sourceRepo,
                 sourceFormat: provenance.sourceFormat,
                 hasMtpWeights: true,
-                message: "Loaded from local Forge metadata."
+                message: tr("Loaded from local Forge metadata.")
             )
             state.recipe = provenance.forgeRecipe
         }
@@ -473,20 +478,20 @@ public final class ForgeOrchestrator: ObservableObject {
 
     public func startPublish() {
         guard state.hasSpeedWinningVerification else {
-            publishFailure = "Forge only publishes models that proved an MTP speed win on this Mac."
+            publishFailure = tr("Forge only publishes models that proved an MTP speed win on this Mac.")
             return
         }
         guard let path = completedLocalPath, !path.isEmpty else {
-            publishFailure = "No completed forge to publish."
+            publishFailure = tr("No completed forge to publish.")
             return
         }
         let trimmedRepo = state.publish.repoName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedRepo.isEmpty else {
-            publishFailure = "Repository name (owner/name) is required."
+            publishFailure = tr("Repository name (owner/name) is required.")
             return
         }
         guard let token = hfTokenStore.load(), !token.isEmpty else {
-            publishFailure = "Hugging Face token missing. Paste a write token to publish."
+            publishFailure = tr("Hugging Face token missing. Paste a write token to publish.")
             return
         }
         isPublishing = true
@@ -524,7 +529,7 @@ public final class ForgeOrchestrator: ObservableObject {
     private func handlePublishEvent(_ event: HFPublishEvent) {
         switch event {
         case .started:
-            publishProgress = ForgePhaseProgress(phase: .publish, progress: 0, label: "uploading")
+            publishProgress = ForgePhaseProgress(phase: .publish, progress: 0, label: tr("uploading"))
         case .progress(let bytes, let total, let mbps):
             let fraction: Double
             if let total, total > 0 {
@@ -542,20 +547,20 @@ public final class ForgeOrchestrator: ObservableObject {
             // server-side creation worked even before the first byte
             // of the upload completes.
             if var current = publishProgress {
-                current.label = "repo created — uploading"
+                current.label = tr("repo created — uploading")
                 publishProgress = current
             }
         case .completed(_, _):
-            publishProgress = ForgePhaseProgress(phase: .publish, progress: 1, label: "uploaded", finished: true)
+            publishProgress = ForgePhaseProgress(phase: .publish, progress: 1, label: tr("uploaded"), finished: true)
             isPublishing = false
         case .failed(_, let stderrTail):
-            publishFailure = stderrTail.isEmpty ? "Publish failed." : stderrTail
+            publishFailure = stderrTail.isEmpty ? tr("Publish failed.") : stderrTail
             isPublishing = false
         case .cancelled:
             isPublishing = false
         case .backendNotAvailable:
             backendUnavailable = true
-            publishFailure = "Forge backend not available — install MTPLX 1.x to publish."
+            publishFailure = tr("Forge backend not available — install MTPLX 1.x to publish.")
             isPublishing = false
         }
     }

@@ -1,3 +1,8 @@
 include CITATION.cff
 include CHANGELOG.md
 recursive-include scripts *.py *.sh
+
+# Historical developer-only benchmark/profiling runs contain private checkout paths.
+prune scripts/ocspeed-20260703
+prune scripts/prodqa-20260703
+exclude scripts/streamscope_run.py

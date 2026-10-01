@@ -29,6 +29,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from mtplx.constants import DEFAULT_TEMPERATURE, DEFAULT_TOP_K, DEFAULT_TOP_P
+from mtplx.reasoning_effort import REASONING_EFFORT_LEVELS
 from mtplx.sampling import SamplerConfig
 
 
@@ -52,6 +53,32 @@ def _srv() -> Any:
     return openai
 
 
+def _responses_reasoning_observability(
+    metadata: dict[str, Any], effective_effort: str | None
+) -> dict[str, Any]:
+    """Report Responses effort only after loaded-family policy resolves it."""
+
+    requested_raw = metadata.get("responses_reasoning_effort_requested")
+    if requested_raw is None:
+        return {}
+    requested = str(requested_raw)
+    if requested not in {"auto", *REASONING_EFFORT_LEVELS}:
+        return {}
+    downgraded = False
+    if requested != "auto" and effective_effort != requested:
+        if effective_effort not in REASONING_EFFORT_LEVELS:
+            downgraded = True
+        else:
+            requested_rank = REASONING_EFFORT_LEVELS.index(requested)
+            effective_rank = REASONING_EFFORT_LEVELS.index(effective_effort)
+            downgraded = effective_rank < requested_rank
+    return {
+        "request_responses_reasoning_effort_requested": requested,
+        "request_responses_reasoning_effort_effective": effective_effort,
+        "request_responses_reasoning_effort_downgraded": downgraded,
+    }
+
+
 @dataclass(frozen=True)
 class RequestPolicy:
     """Resolved per-request policy, immutable for the request's lifetime.
@@ -69,6 +96,7 @@ class RequestPolicy:
     requested_tool_specs: list[dict[str, Any]] = field(default_factory=list)
     tool_specs: list[dict[str, Any]] = field(default_factory=list)
     tools_active: bool = False
+    prompt_tool_specs: list[dict[str, Any]] | None = None
     agent_transcript_tools_active: bool = False
     postcommit_tool_specs: list[dict[str, Any]] | None = None
 
@@ -189,6 +217,7 @@ def _resolve_sampler(
     telemetry and identical draft-sampler resolution inputs.
     """
     srv = _srv()
+    observability["managed_client_controls"] = srv._managed_client_controls(state)
     if client_controls_allowed:
         srv._reject_non_finite_sampler_controls(request)
     sampler_temperature = request.temperature if client_controls_allowed else None
@@ -223,17 +252,19 @@ def _resolve_sampler(
     ]
     if ignored_sampler_fields:
         observability["client_sampler_fields_ignored"] = ignored_sampler_fields
-    target_sampler_override = srv._opencode_default_sampler_override(
-        messages=messages_for_generation,
-        tools_active=tools_active,
-        request_temperature=request.temperature,
-        request_top_p=request.top_p,
-        request_top_k=request.top_k,
-        request_observability=observability,
-        default_temperature=getattr(state.args, "temperature", DEFAULT_TEMPERATURE),
-        default_top_p=getattr(state.args, "top_p", DEFAULT_TOP_P),
-        default_top_k=getattr(state.args, "top_k", DEFAULT_TOP_K),
-    )
+    target_sampler_override = None
+    if srv._managed_client_controls(state) != "client":
+        target_sampler_override = srv._opencode_default_sampler_override(
+            messages=messages_for_generation,
+            tools_active=tools_active,
+            request_temperature=request.temperature,
+            request_top_p=request.top_p,
+            request_top_k=request.top_k,
+            request_observability=observability,
+            default_temperature=getattr(state.args, "temperature", DEFAULT_TEMPERATURE),
+            default_top_p=getattr(state.args, "top_p", DEFAULT_TOP_P),
+            default_top_k=getattr(state.args, "top_k", DEFAULT_TOP_K),
+        )
     # The OpenCode normalization overrides the TARGET sampler only. The
     # draft sampler is deliberately NOT injected as a request value:
     # server-injected values are launch_default ownership, not
@@ -319,7 +350,7 @@ def _resolve_completions_policy(
 ) -> RequestPolicy:
     srv = _srv()
     observability: dict[str, Any] = {}
-    client_controls_allowed = srv._client_controls_allowed(headers, metadata)
+    client_controls_allowed = srv._client_controls_allowed(headers, metadata, state=state)
     request_generation_mode = srv._request_generation_mode_for_generation(
         state,
         request,
@@ -491,6 +522,15 @@ def resolve_request_policy(
             # message carries the "answer now, no more tools" conditioning;
             # prefix stability owns the toolset bytes.
             pass
+    # A per-turn tool prohibition controls execution, not the declared
+    # schema prefix. Keep the same prompt tools on auto -> none -> auto;
+    # the existing trailing no-tool contract closes the tool phase, and
+    # tools_active still governs parsing/emission of calls.
+    prompt_tool_specs = (
+        tool_specs
+        if tools_active or srv._tool_choice_disables_tools(request.tool_choice)
+        else None
+    )
     no_tools_contract_applies = bool(
         chat
         and not read_only_force_answer_contract_active
@@ -511,9 +551,9 @@ def resolve_request_policy(
     no_tools_contract_active = bool(
         no_tools_contract_applies and not post_tool_answer_contract_active
     )
-    client_controls_allowed = srv._client_controls_allowed(headers, metadata)
+    client_controls_allowed = srv._client_controls_allowed(headers, metadata, state=state)
     thinking_controls_allowed = srv._client_thinking_controls_allowed(
-        headers, metadata
+        headers, metadata, state=state
     )
     pi_convergence_contract_active = bool(
         chat
@@ -562,6 +602,10 @@ def resolve_request_policy(
             messages_for_generation,
         )
     )
+    # The client never echoes our request-only closing instructions. Keep
+    # the unsteered history for postcommit, rather than banking a suffix
+    # that moves the next turn's divergence ahead of the entire answer.
+    messages_before_turn_contract = list(messages_for_generation)
     if chat:
         if read_only_force_answer_contract_active:
             messages_for_generation = (
@@ -594,7 +638,7 @@ def resolve_request_policy(
         list(request.messages)
         if read_only_force_answer_contract_active
         else (
-            list(messages_for_generation)
+            messages_before_turn_contract
             if (
                 no_tools_contract_active
                 or post_tool_answer_contract_active
@@ -606,8 +650,8 @@ def resolve_request_policy(
         )
     )
     postcommit_tool_specs = (
-        tool_specs
-        if tools_active
+        prompt_tool_specs
+        if prompt_tool_specs
         else (requested_tool_specs if agent_transcript_tools_active else None)
     )
     background = bool(
@@ -652,7 +696,7 @@ def resolve_request_policy(
         state.args,
         headers=headers,
         metadata=metadata,
-        tools_active=tools_active,
+        tools_active=bool(prompt_tool_specs),
         backend=srv._backend_descriptor(state),
     )
     template_tool_prompt_mode = tool_prompt_mode
@@ -685,6 +729,7 @@ def resolve_request_policy(
             requested_tool_specs=requested_tool_specs,
             tool_specs=tool_specs,
             tools_active=tools_active,
+            prompt_tool_specs=prompt_tool_specs,
             agent_transcript_tools_active=agent_transcript_tools_active,
             postcommit_tool_specs=postcommit_tool_specs,
             backend_chat_policy_active=backend_chat_policy_active,
@@ -746,6 +791,9 @@ def resolve_request_policy(
     observability["request_reasoning_mode"] = request_reasoning_mode
     observability["request_enable_thinking"] = bool(thinking_enabled)
     observability["request_reasoning_effort"] = reasoning_effort
+    observability.update(
+        _responses_reasoning_observability(metadata, reasoning_effort)
+    )
     observability["request_enable_thinking_override"] = (
         request.enable_thinking is not None and thinking_controls_allowed
     )
@@ -861,6 +909,7 @@ def resolve_request_policy(
         requested_tool_specs=requested_tool_specs,
         tool_specs=tool_specs,
         tools_active=tools_active,
+        prompt_tool_specs=prompt_tool_specs,
         agent_transcript_tools_active=agent_transcript_tools_active,
         postcommit_tool_specs=postcommit_tool_specs,
         read_only_force_answer_contract_active=read_only_force_answer_contract_active,

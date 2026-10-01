@@ -218,6 +218,42 @@ def test_launcher_gate_probe_and_isinstance():
 
 
 def test_advance_memory_flat_50k():
+    """Runs :func:`_advance_memory_flat_50k_body` in a fresh interpreter.
+
+    The measurement reads the process's PEAK RSS, which is a high-water mark:
+    once any earlier test in the same process has peaked higher (a tokenizer
+    audit, a big synthetic model), every later growth reads 0 bytes. The
+    stock class's 257 MiB leak then measured 0 and this test failed, and the
+    bound on the fixed class passed without measuring anything. A fresh
+    process owns its own high-water mark.
+    """
+    _skip_unless_stock()
+    import os
+    import subprocess
+
+    here = os.path.abspath(__file__)
+    root = os.path.dirname(os.path.dirname(here))
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        item for item in (root, env.get("PYTHONPATH", "")) if item
+    )
+    done = subprocess.run(
+        [sys.executable, here, "--isolated", "_advance_memory_flat_50k_body"],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    print(done.stdout)
+    assert done.returncode == 0, (
+        f"isolated measurement failed (rc {done.returncode}):\n"
+        f"{done.stdout}\n{done.stderr}"
+    )
+    assert "[stock]" in done.stdout and "[fixed]" in done.stdout, done.stdout
+
+
+def _advance_memory_flat_50k_body():
     _skip_unless_stock()
     _ensure_installed()
     n = 50_000
@@ -514,6 +550,15 @@ def test_behavioral_equivalence_stock_vs_fixed():
 
 
 def _main() -> int:
+    if len(sys.argv) == 3 and sys.argv[1] == "--isolated":
+        # One measured body in this fresh process (see
+        # test_advance_memory_flat_50k). A skip is a pass: the parent made
+        # the same skip decision before it got here.
+        try:
+            globals()[sys.argv[2]]()
+        except _SKIP_EXCEPTIONS as exc:
+            print(f"SKIP {sys.argv[2]}: {exc}")
+        return 0
     tests = [
         (name, fn)
         for name, fn in list(globals().items())

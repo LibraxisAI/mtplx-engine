@@ -18,9 +18,11 @@ import Foundation
 //   1. Memory:  needed = `model.peakMemoryGiB * safetyFactor`. Below
 //      `model.peakMemoryGiB`: insufficientMemory. Between peak and
 //      `peak * 1.5`: tightFit. Above: recommended (modulo disk).
-//   2. Disk:    needed = `model.sizeBytes * 2.5` (mirrors
-//      `mtplx/diagnostics.py:required_download_free_bytes`). Below:
-//      insufficientDisk.
+//   2. Disk:    needed = bytes still to download + 5 GiB, the rule
+//      `mtplx pull` enforces (`hf_loader._require_download_disk_headroom`).
+//      The app downloads through `mtplx pull`, which writes each file as
+//      `.incomplete` beside its final name and renames it in place, so no
+//      second copy needs room. Below: insufficientDisk.
 //   3. Intel:   every model returns insufficientMemory regardless —
 //      MTPLX has no first-class Intel support. The user can still
 //      proceed via the Other path with a smaller model.
@@ -28,9 +30,9 @@ import Foundation
 // Returns a single, exhaustive verdict so the UI never has to combine
 // multiple flags.
 //
-// SYNC PAIR: mtplx/model_catalog.py (MEMORY_SAFETY_FACTOR, DISK_MULTIPLIER,
-// evaluate_feasibility) mirrors these rules for the CLI. Update both sides
-// together.
+// SYNC PAIR: mtplx/model_catalog.py (MEMORY_SAFETY_FACTOR,
+// DOWNLOAD_HEADROOM_GIB, evaluate_feasibility) mirrors these rules for the
+// CLI. Update both sides together.
 
 public enum ModelFeasibilityVerdict: Equatable, Sendable {
     /// Safe to download and run at the daemon's defaults.
@@ -50,9 +52,15 @@ public struct ModelFeasibility: Sendable {
     /// `peakMemoryGiB * memorySafetyFactor` is the floor for
     /// `.recommended`. Above peak but below this floor → `.tightFit`.
     public static let memorySafetyFactor: Double = 1.5
-    /// Mirrors the daemon's `required_download_free_bytes` heuristic
-    /// at `mtplx/diagnostics.py:202`.
-    public static let diskMultiplier: Double = 2.5
+    /// Free space `mtplx pull` keeps beyond the bytes it still has to fetch.
+    public static let downloadHeadroomGiB: Double = 5
+
+    /// Free GiB a download of `sizeBytes` needs when `downloadedBytes` of it
+    /// already sit in the model folder; 0 when the size is unknown.
+    public static func requiredFreeDiskGiB(sizeBytes: Int64, downloadedBytes: Int64 = 0) -> Double {
+        guard sizeBytes > 0 else { return 0 }
+        return Double(max(0, sizeBytes - downloadedBytes)) / 1_073_741_824.0 + downloadHeadroomGiB
+    }
 
     public init() {}
 
@@ -60,10 +68,14 @@ public struct ModelFeasibility: Sendable {
         model: MTPLXModelOption,
         chipTier: ChipTier,
         ramGiB: Double,
-        diskFreeGiB: Double
+        diskFreeGiB: Double,
+        downloadedBytes: Int64 = 0
     ) -> ModelFeasibilityVerdict {
         let safeMemoryFloor = model.peakMemoryGiB * Self.memorySafetyFactor
-        let diskRequired = Double(model.sizeBytes) / 1_073_741_824.0 * Self.diskMultiplier
+        let diskRequired = Self.requiredFreeDiskGiB(
+            sizeBytes: model.sizeBytes,
+            downloadedBytes: downloadedBytes
+        )
 
         // Disk pre-flight ahead of memory: a download blocker takes
         // priority over a runtime blocker.

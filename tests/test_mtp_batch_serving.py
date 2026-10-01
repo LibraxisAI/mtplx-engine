@@ -1016,6 +1016,74 @@ def test_cohort_repetition_stop_trims_job_tokens_and_stamps_receipt():
         assert job.test_emitted == [5] * 12
 
 
+def test_cohort_long_cycle_stop_keeps_job_tokens_and_stamps_its_reason():
+    """A long_cycle stop trims nothing: its trim_start is the row length, so
+    the finalizer leaves job.tokens whole and the receipt names the reason,
+    the period, and the copies."""
+    from mtplx.generation import RepetitionStopResult
+
+    cycle = tuple(range(1, 17))
+
+    class _LongCycleDriver(_Driver):
+        def __call__(self, lane, requests):
+            del lane
+            self.widths.append(len(requests))
+            streams = []
+            for request in requests:
+                assert request.repetition_stop is True
+                for token in cycle * 3:
+                    request.on_token(token)
+                streams.append(
+                    A3BMTPBatchStreamResult(
+                        request_id=request.request_id,
+                        tokens=cycle * 3,
+                        finish_reason="stop",
+                        cycles=24,
+                        accepted_drafts=24,
+                        rejected_drafts=0,
+                        repetition_stop=RepetitionStopResult(
+                            trim_start=48,
+                            block_tokens=16,
+                            repeats=3,
+                            repeated_tokens=0,
+                            reason="long_cycle",
+                        ),
+                    )
+                )
+            return A3BMTPBatchResult(
+                streams=tuple(streams),
+                cycles=24,
+                accepted_drafts=24 * len(requests),
+                rejected_drafts=0,
+                route_id="fake-b8-t2",
+                width_histogram=MappingProxyType({8: 24}),
+            )
+
+    service = _service(_LongCycleDriver())
+    jobs = [_job(0), _job(1)]
+    for job in jobs:
+        job.generation_limits["uncapped_repetition_stop_enabled"] = True
+        job.max_tokens = 64
+        service.submit(job)
+
+    service.pump_once()
+
+    for job in jobs:
+        result = job.future.result(timeout=1)
+        assert result["tokens"] == list(cycle * 3)
+        assert result["completion_tokens"] == 48
+        assert len(result["_token_times"]) == 48
+        stats = result["stats"]
+        assert stats["repetition_stop_triggered"] is True
+        assert stats["repetition_stop_reason"] == "long_cycle"
+        assert stats["repetition_stop_block_tokens"] == 16
+        assert stats["repetition_stop_repeats"] == 3
+        assert stats["repetition_stop_trimmed_tokens"] == 0
+        assert stats["repetition_stop_raw_tokens"] == 48
+        # The wire and the response agree: nothing was retracted.
+        assert job.test_emitted == list(cycle * 3)
+
+
 def test_cohort_rows_stay_unarmed_without_the_generation_limit_flag():
     service = _service(_Driver())
     seen = []

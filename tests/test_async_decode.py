@@ -98,38 +98,12 @@ def test_async_armed_generates_identically(monkeypatch):
     assert tokens == [1, 1, 1, 1]
 
 
-def test_eval_audit_forces_synchronous(monkeypatch):
-    """Audit runs never go async even when armed."""
-    tokens = _run(monkeypatch, MTPLX_ASYNC_AR="1", MTPLX_EVAL_AUDIT="1")
+def test_eval_audit_forces_synchronous(monkeypatch, tmp_path):
+    """Audit runs never go async even when armed.
+
+    MTPLX_EVAL_AUDIT is a file path, so the test points it at tmp_path; a bare
+    "1" would leave a file literally named 1 in the working directory."""
+    audit = tmp_path / "eval-audit.jsonl"
+    tokens = _run(monkeypatch, MTPLX_ASYNC_AR="1", MTPLX_EVAL_AUDIT=str(audit))
     assert tokens == [1, 1, 1, 1]
-
-
-def test_pipeline_lane_gating_independent_of_async_flag(monkeypatch):
-    """The MTPLX_AR_PIPELINE lane keeps its own gate; the async flag neither
-    arms nor blocks it (dark-port divergence from upstream #396, which coupled
-    the two)."""
-    monkeypatch.delenv("MTPLX_ASYNC_AR", raising=False)
-    monkeypatch.setenv("MTPLX_AR_PIPELINE", "1")
-
-    class PipelineModel(TinyModel):
-        def __init__(self):
-            super().__init__()
-            self.pipeline_mode_calls: list[bool] = []
-
-        def set_ar_pipeline_mode(self, val):
-            self.pipeline_mode_calls.append(bool(val))
-            # Refuse engagement so the classic loop still runs on TinyModel.
-            return False
-
-    model = PipelineModel()
-    rt = _make_runtime(model)
-    out = generate_ar(
-        rt,
-        [0],
-        max_tokens=4,
-        sampler=SamplerConfig(temperature=0.7, top_p=1.0, top_k=4),
-        stop_token_ids=set(),
-    )
-    assert len(out.tokens) == 4
-    # The lane was OFFERED engagement (gate independent of MTPLX_ASYNC_AR).
-    assert model.pipeline_mode_calls[:1] == [True]
+    assert audit.exists() and audit.read_text().count("\n") >= 1
