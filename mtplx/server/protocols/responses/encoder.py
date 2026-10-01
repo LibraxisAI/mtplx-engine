@@ -40,7 +40,8 @@ def _usage(chat_usage: dict[str, Any] | None) -> dict[str, Any]:
     return {
         "input_tokens": prompt,
         "input_tokens_details": {
-            "cached_tokens": int(prompt_details.get("cached_tokens") or 0)
+            "cached_tokens": int(prompt_details.get("cached_tokens") or 0),
+            "cache_write_tokens": int(prompt_details.get("cache_write_tokens") or 0),
         },
         "output_tokens": output,
         "output_tokens_details": {

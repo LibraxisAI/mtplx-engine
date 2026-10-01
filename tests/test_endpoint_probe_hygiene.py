@@ -72,12 +72,10 @@ def test_responses_endpoint_probe_is_registered_without_inference(monkeypatch):
     assert response.status_code == 400
     assert response.json() == {
         "error": {
-            "message": (
-                "Responses API: input must be a non-empty text string or item list"
-            ),
+            "message": "input must not be empty",
             "type": "invalid_request_error",
-            "code": "HTTPException",
-            "param": None,
+            "code": "invalid_value",
+            "param": "input",
         }
     }
     assert inference_called is False

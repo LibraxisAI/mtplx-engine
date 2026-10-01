@@ -31,27 +31,24 @@ Legacy OpenAI completions.
 
 ## `POST /v1/responses`
 
-Codex Responses compatibility with hosted tools disabled, through the same
-chat inference path. The adapter is stateless and text-only, supports
-structured text input, instructions, streaming lifecycle events, JSON-schema
-text formats, client-executed function/custom tools, and namespace-grouped
-function tools.
-Namespace tools are flattened only for local chat rendering; returned
-`function_call` items restore the official original `name` plus `namespace`.
-OpenAI Python 2.52's explicit function `tool_choice` selector has only `type`
-and `name`, so it cannot unambiguously qualify a nested namespace function;
-use `auto` or `required` when namespace tools are present. MTPLX rejects an
-ambiguous nested-function selector instead of silently selecting the wrong
-tool.
+This branch mounts the native adapter in `mtplx/server/protocols/responses`,
+using the existing `GenerationTurn` lifecycle and chat inference owner. It
+accepts text and URL/data-URL image inputs, instructions, client-executed
+function tools and their outputs, and JSON or SSE responses.
 
-MTPLX does not execute hosted Responses tools. Requests containing
-`web_search`, `tool_search`, MCP, code-interpreter, or similar hosted tool types
-return `400` naming the unavailable type. `previous_response_id`, background
-jobs, and server-side Response storage are also outside this stateless route;
-send the full conversation and matching tool calls/outputs in `input`.
-Codex 0.146 sends `web_search` in its default Responses request, so that default
-is intentionally rejected unless hosted tools are disabled or removed from the
-client request.
+With `store=true`, responses and their conversation lineage are retained in a
+bounded, process-local registry. `previous_response_id` continues a stored
+turn. The registry is ephemeral: eviction, expiry or process restart removes
+continuation state. `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}` and
+`POST /v1/responses/{id}/cancel` share that registry and the existing generation
+cancellation handle. Omitting storage keeps the explicit full-history replay
+path available.
+
+Custom/namespace tools, hosted Responses tool declarations, structured text
+formats, background jobs and file IDs are rejected with parameter-specific
+errors. Server-hosted web execution via `--web` is a separate chat-tool
+mechanism; it does not admit `web_search` as a Responses tool declaration.
+Disable unsupported hosted tools in clients such as Codex.
 
 Running Codex against MTPLX (measured with Codex 0.144.1 on 2026-09-06): Codex
 also sends a hosted `image_generation` tool by default, and with Codex apps
@@ -77,18 +74,16 @@ wire_api = "responses"
 through `/v1/responses`; `--disable image_generation` on the command line is
 the same as the `[features]` entry.
 
-Codex `reasoning.effort: "xhigh"` is accepted as request vocabulary and resolved
-against the loaded model. Qwen 3.8 preserves `xhigh`, Step 3.5 clamps it to
-`high`, and Qwen 3.6 has no effective reasoning-effort tier. Request
-observability records the requested and effective values plus whether the
-request was downgraded. The Responses payload echoes the client's requested
-reasoning configuration.
+The native Responses translator accepts `low`, `medium`, `high` and `xhigh`
+reasoning efforts. `none`, `off`, `disable` and `disabled` explicitly disable
+thinking on this route. That differs from the chat route's effort normalization
+below.
 
 ## Reasoning effort
 
 Thinking depth is a request-level setting with a server-level default.
 
-- Per request: `reasoning_effort` in the chat completions body (`"reasoning_effort": "high"`), or `reasoning.effort` on the Responses API. Accepted values are `low`, `medium`, `high` and `xhigh`. OpenAI's `minimal` and `none` (and `off`, `disable`, `disabled`) are accepted and map to `low`; they do not switch thinking off.
+- Per chat request: `reasoning_effort` in the chat completions body (`"reasoning_effort": "high"`). Native Responses uses the distinct controls described above. Accepted values are `low`, `medium`, `high` and `xhigh`. OpenAI's `minimal` and `none` (and `off`, `disable`, `disabled`) are accepted and map to `low`; they do not switch thinking off.
 - Server default: `mtplx start --reasoning-effort high` (or `mtplx serve`) applies to every request that carries no value. `auto` (the default) uses the loaded model family's own default.
 - App: the effort picker in the chat settings lists the levels the loaded model supports.
 
