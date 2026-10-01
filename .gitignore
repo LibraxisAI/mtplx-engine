@@ -45,3 +45,4 @@ benchmark_outputs/
 .claude/
 .devspace/
 /.loctree
+/libraxis-probe-*

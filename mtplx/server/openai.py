@@ -128,6 +128,21 @@ from mtplx.server.request_policy import (
     BackgroundBusyBypass,
     resolve_request_policy,
 )
+from mtplx.server.web_tools import (
+    HOSTED_WEB_CONTRACT,
+    MAX_HOSTED_WEB_ROUNDS,
+    AccumulatedToolCall,
+    ToolSessionState,
+    accumulate_tool_call_delta,
+    add_web_argument,
+    dispatch_hosted_web_tool,
+    hosted_tool_call_arguments,
+    hosted_tool_call_name,
+    hosted_web_tool_definitions,
+    should_host_web_tools,
+    tool_calls_from_accumulator,
+    usable_hosted_tool_calls,
+)
 from mtplx.server.core import (
     GenerationTurn,
     OutputItemStarted,
@@ -712,6 +727,22 @@ async def _monitor_request_disconnect(
             return True
         await asyncio.sleep(max(0.01, float(poll_s)))
     return False
+
+
+class _HostedWebTurnStream:
+    """Composite turn that hides hosted web tool rounds from the wire."""
+
+    def __init__(self, factory: Callable[[], AsyncIterator[TurnEvent]]) -> None:
+        self._factory = factory
+
+    async def events(self) -> AsyncIterator[TurnEvent]:
+        async for event in self._factory():
+            yield event
+
+
+def _is_turn_stream(value: Any) -> bool:
+    events = getattr(value, "events", None)
+    return callable(events)
 
 
 class _GenerationTurnStream:
@@ -1306,6 +1337,305 @@ class ChatCompletionRequest(BaseModel):
     # logprobs as "model returned none" rather than "server ignored me".
     logprobs: Any = None
     top_logprobs: int | None = None
+    mtplx_hosted_web_round: bool = False
+
+
+def _prepare_hosted_web_request(
+    request: ChatCompletionRequest,
+) -> ChatCompletionRequest:
+    updates: dict[str, Any] = {}
+    if not request.tools:
+        updates["tools"] = hosted_web_tool_definitions()
+        updates["tool_choice"] = (
+            request.tool_choice if request.tool_choice is not None else "auto"
+        )
+    messages = list(request.messages)
+    already = any(
+        getattr(message, "role", None) == "system"
+        and HOSTED_WEB_CONTRACT in str(getattr(message, "content", "") or "")
+        for message in messages
+    )
+    if not already:
+        updates["messages"] = [
+            ChatMessage(role="system", content=HOSTED_WEB_CONTRACT),
+            *messages,
+        ]
+    if not updates:
+        return request
+    return request.model_copy(update=updates)
+
+
+def _assistant_message_from_tool_round(
+    *,
+    content: str,
+    tool_calls: list[dict[str, Any]],
+) -> ChatMessage:
+    return ChatMessage(
+        role="assistant",
+        content=content or None,
+        tool_calls=tool_calls,
+    )
+
+
+def _tool_result_message(*, call_id: str, content: str) -> ChatMessage:
+    return ChatMessage(role="tool", content=content, tool_call_id=call_id)
+
+
+def _rebinding_cancel_binder(
+    bind_cancel: Callable[[Callable[[], Any]], Any] | None,
+) -> Callable[[Callable[[], Any]], Any] | None:
+    """One Responses cancel slot can cover sequential hosted-web generations."""
+
+    if bind_cancel is None:
+        return None
+    current: dict[str, Any] = {"cancel": None, "registered": False}
+
+    def forward() -> None:
+        cancel = current["cancel"]
+        if cancel is not None:
+            cancel()
+
+    def bind(cancel: Callable[[], Any]) -> Any:
+        current["cancel"] = cancel
+        if current["registered"]:
+            return True
+        current["registered"] = True
+        return bind_cancel(forward)
+
+    return bind
+
+
+def _execute_hosted_web_calls(
+    tool_calls: list[dict[str, Any]],
+    *,
+    session: ToolSessionState,
+) -> list[ChatMessage]:
+    messages: list[ChatMessage] = []
+    for tool_call in tool_calls:
+        name = hosted_tool_call_name(tool_call)
+        call_id = str(tool_call.get("id") or f"call_{uuid.uuid4().hex[:24]}")
+        result = dispatch_hosted_web_tool(
+            name,
+            hosted_tool_call_arguments(tool_call),
+            session=session,
+        )
+        messages.append(_tool_result_message(call_id=call_id, content=result))
+    return messages
+
+
+def _json_choice_payload(response: Any) -> dict[str, Any] | None:
+    if not isinstance(response, JSONResponse):
+        return None
+    try:
+        payload = json.loads(response.body)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    choice = choices[0]
+    return choice if isinstance(choice, dict) else None
+
+
+async def _run_hosted_web_chat_completions(
+    impl: Callable[..., Awaitable[Any]],
+    raw_request: Request,
+    request: ChatCompletionRequest,
+    *,
+    return_turn: bool,
+    bind_cancel: Callable[[Callable[[], Any]], Any] | None = None,
+) -> Any:
+    bind_cancel = _rebinding_cancel_binder(bind_cancel)
+    prepared = _prepare_hosted_web_request(request)
+    if not should_host_web_tools(prepared.tools):
+        prepared = prepared.model_copy(update={"mtplx_hosted_web_round": True})
+        return await impl(
+            raw_request,
+            prepared,
+            return_turn=return_turn,
+            bind_cancel=bind_cancel,
+        )
+    if prepared.stream or return_turn:
+        stream = _HostedWebTurnStream(
+            lambda: _hosted_web_turn_events(
+                impl,
+                raw_request,
+                prepared,
+                bind_cancel=bind_cancel,
+            )
+        )
+        if return_turn:
+            return stream
+        return StreamingResponse(
+            _chat_stream_from_turn_events(stream.events()),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    return await _hosted_web_json_loop(
+        impl,
+        raw_request,
+        prepared,
+        bind_cancel=bind_cancel,
+    )
+
+
+async def _hosted_web_json_loop(
+    impl: Callable[..., Awaitable[Any]],
+    raw_request: Request,
+    request: ChatCompletionRequest,
+    *,
+    bind_cancel: Callable[[Callable[[], Any]], Any] | None,
+) -> Any:
+    messages = list(request.messages)
+    session = ToolSessionState()
+    last_response: Any = None
+    for round_index in range(MAX_HOSTED_WEB_ROUNDS + 1):
+        tool_choice: Any = "none" if round_index == MAX_HOSTED_WEB_ROUNDS else request.tool_choice
+        round_request = request.model_copy(
+            update={
+                "messages": messages,
+                "stream": False,
+                "tool_choice": tool_choice,
+                "mtplx_hosted_web_round": True,
+            }
+        )
+        last_response = await impl(
+            raw_request,
+            round_request,
+            return_turn=False,
+            bind_cancel=bind_cancel,
+        )
+        choice = _json_choice_payload(last_response)
+        if choice is None:
+            return last_response
+        message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+        raw_tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
+        tool_calls = usable_hosted_tool_calls(
+            raw_tool_calls,
+            fallback_query=_last_user_text(messages),
+            saw_tool_attempt=bool(raw_tool_calls),
+            finish_reason=str(choice.get("finish_reason") or ""),
+        )
+        if not (round_index < MAX_HOSTED_WEB_ROUNDS and tool_calls):
+            return last_response
+        assistant_content = str(message.get("content") or "")
+        messages = [
+            *messages,
+            _assistant_message_from_tool_round(
+                content=assistant_content,
+                tool_calls=tool_calls,
+            ),
+            *_execute_hosted_web_calls(tool_calls, session=session),
+        ]
+    return last_response
+
+
+async def _hosted_web_turn_events(
+    impl: Callable[..., Awaitable[Any]],
+    raw_request: Request,
+    request: ChatCompletionRequest,
+    *,
+    bind_cancel: Callable[[Callable[[], Any]], Any] | None,
+) -> AsyncIterator[TurnEvent]:
+    request = _prepare_hosted_web_request(request)
+    messages = list(request.messages)
+    session = ToolSessionState()
+    started_emitted = False
+    for round_index in range(MAX_HOSTED_WEB_ROUNDS + 1):
+        tool_choice: Any = "none" if round_index == MAX_HOSTED_WEB_ROUNDS else request.tool_choice
+        round_request = request.model_copy(
+            update={
+                "messages": messages,
+                "stream": True,
+                "tool_choice": tool_choice,
+                "mtplx_hosted_web_round": True,
+            }
+        )
+        inner = await impl(
+            raw_request,
+            round_request,
+            return_turn=True,
+            bind_cancel=bind_cancel,
+        )
+        if not _is_turn_stream(inner):
+            detail = "hosted web generation failed"
+            if isinstance(inner, JSONResponse):
+                try:
+                    payload = json.loads(inner.body)
+                    detail = str(payload.get("detail") or payload.get("error") or detail)
+                except Exception:
+                    pass
+            yield TurnFailed(error=detail, code="hosted_web_generation_failed")
+            return
+        acc: list[AccumulatedToolCall] = []
+        text_parts: list[str] = []
+        completed: TurnCompleted | None = None
+        saw_tool_attempt = False
+        async for event in inner.events():
+            if isinstance(event, TurnStarted):
+                if not started_emitted:
+                    started_emitted = True
+                    yield event
+                continue
+            if isinstance(event, OutputItemStarted) and event.kind == "tool":
+                # Responses treats this as an empty function_call. Hide it
+                # until we either execute the hosted tool or finish.
+                saw_tool_attempt = True
+                continue
+            if isinstance(event, ToolCallDelta):
+                saw_tool_attempt = True
+                accumulate_tool_call_delta(
+                    acc,
+                    index=event.index,
+                    call_id=event.call_id,
+                    name=event.name,
+                    arguments_delta=event.arguments_delta,
+                )
+                continue
+            if isinstance(event, TextDelta):
+                text_parts.append(event.delta)
+                if round_index == 0:
+                    continue
+                yield event
+                continue
+            if isinstance(event, TurnCompleted):
+                completed = event
+                continue
+            if isinstance(event, (TurnFailed, TurnCancelled)):
+                yield event
+                return
+            yield event
+        tool_calls = usable_hosted_tool_calls(
+            tool_calls_from_accumulator(acc),
+            fallback_query=_last_user_text(messages),
+            saw_tool_attempt=saw_tool_attempt,
+            finish_reason=completed.finish_reason if completed is not None else None,
+        )
+        if round_index < MAX_HOSTED_WEB_ROUNDS and tool_calls:
+            yield TurnHeartbeat(payload={"web": True, "phase": "tools"})
+            messages = [
+                *messages,
+                _assistant_message_from_tool_round(
+                    content="".join(text_parts),
+                    tool_calls=tool_calls,
+                ),
+                *await asyncio.to_thread(
+                    _execute_hosted_web_calls, tool_calls, session=session
+                ),
+            ]
+            continue
+        if round_index == 0 and text_parts:
+            # Round 0 held its text back in case a hosted tool call followed;
+            # no tool ran, so that text is the answer and must reach the wire.
+            yield TextDelta(delta="".join(text_parts))
+        if completed is not None:
+            yield completed
+        return
 
 
 @dataclass
@@ -15791,6 +16121,7 @@ def _mtplx_app_capabilities() -> dict[str, Any]:
             "parse_tools_at_completion": True,
             "early_tool_cancel_default": False,
             "hidden_generation_repair_default": False,
+            "web_search": False,
         },
         "openai_bridge": {
             "mode": "omlx_style",
@@ -27528,6 +27859,7 @@ def create_app(state: ServerState) -> FastAPI:
             },
             "generation_mode": state.args.generation_mode,
             "default_generation_mode": state.args.generation_mode,
+            "web": bool(getattr(state.args, "web", False)),
             "runtime_mode": runtime_mode,
             "parent_runtime_released_for_aime": bool(
                 getattr(state, "aime_parent_runtime_released", False)
@@ -27847,7 +28179,9 @@ def create_app(state: ServerState) -> FastAPI:
 
     @app.get("/v1/mtplx/app/capabilities")
     def mtplx_app_capabilities() -> dict[str, Any]:
-        return _mtplx_app_capabilities()
+        payload = _mtplx_app_capabilities()
+        payload["features"]["web_search"] = bool(getattr(state.args, "web", False))
+        return payload
 
     @app.post("/v1/mtplx/thermal/fan_mode")
     @app.post("/mtplx/thermal/fan_mode")
@@ -28891,6 +29225,17 @@ def create_app(state: ServerState) -> FastAPI:
     ) -> Any:
         if not request.messages:
             raise HTTPException(status_code=400, detail="messages must not be empty")
+        if (
+            bool(getattr(state.args, "web", False))
+            and not bool(request.mtplx_hosted_web_round)
+        ):
+            return await _run_hosted_web_chat_completions(
+                _chat_completions_impl,
+                raw_request,
+                request,
+                return_turn=return_turn,
+                bind_cancel=bind_cancel,
+            )
         if bool(request.logprobs) or int(request.top_logprobs or 0) > 0:
             raise HTTPException(
                 status_code=400,
@@ -33504,7 +33849,7 @@ def create_app(state: ServerState) -> FastAPI:
             except BaseException as exc:
                 commit_bridge_failure(exc)
                 raise
-            if not isinstance(chat_response, _GenerationTurnStream):
+            if not _is_turn_stream(chat_response):
                 commit_bridge_failure(chat_response)
                 return chat_response
             async def response_events() -> AsyncIterator[str]:
@@ -33623,7 +33968,7 @@ def create_app(state: ServerState) -> FastAPI:
             response = await _chat_completions_impl(
                 raw_request, chat_request, return_turn=True
             )
-            if not isinstance(response, _GenerationTurnStream):
+            if not _is_turn_stream(response):
                 return response
             return StreamingResponse(
                 _anthropic_stream_from_turn_events(
@@ -35012,6 +35357,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="stats_footer",
         help="Do not append the visible MTPLX TPS footer to returned text.",
     )
+    add_web_argument(parser)
     parser.add_argument(
         "--session-postcommit-mode",
         choices=["inline", "async"],
@@ -35483,6 +35829,8 @@ def main(argv: list[str] | None = None) -> None:
         _startup_line("Chat UI: " + chat_url)
         _startup_line("OpenAI API Base URL: " + _startup_openai_base_url(args))
     _startup_line("Model: " + str(args.model_id))
+    if getattr(args, "web", False):
+        _startup_line("Web tools: hosted web_search + fetch_url")
     _startup_line(
         "Reasoning history: "
         + {

@@ -9773,6 +9773,8 @@ def cmd_serve_public(args: Any) -> int:
         cmd.extend(["--reasoning-effort", str(args.reasoning_effort)])
     if not getattr(args, "stats_footer", True):
         cmd.append("--no-stats-footer")
+    if bool(getattr(args, "web", False)):
+        cmd.append("--web")
     if getattr(args, "strict_warmup", False):
         cmd.append("--strict-warmup")
     child_env_base = os.environ.copy()

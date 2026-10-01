@@ -27,6 +27,7 @@ from .profiles import (
 )
 from .reasoning_effort import REASONING_EFFORT_CHOICES
 from .runtime_options import canonicalize_flag_tokens, normalize_paged_kv_quantization
+from .server.web_tools import add_web_argument
 from .version import DISPLAY_VERSION, __version__
 
 # Help/usage advertises only the canonical profiles; the parser itself
@@ -2627,6 +2628,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="stats_footer",
         help="Keep returned text clean for UI clients. This is the default for quickstart.",
     )
+    add_web_argument(quickstart_server_p)
     _add_fan_mode_args(
         quickstart_server_p,
         max_help=(
@@ -3612,6 +3614,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Do not append the visible MTPLX TPS footer to returned text.",
     )
+    add_web_argument(serve_p)
     _add_fan_mode_args(
         serve_p,
         max_help="Compatibility alias for --fan-mode max for the server lifetime",
