@@ -43,6 +43,7 @@ import uuid
 import weakref
 import webbrowser
 from collections import Counter, OrderedDict, deque
+from collections.abc import AsyncIterator
 from concurrent.futures import Future
 from contextlib import asynccontextmanager, contextmanager, nullcontext, suppress
 from dataclasses import asdict, dataclass, is_dataclass, replace
@@ -50,7 +51,7 @@ from enum import Enum
 from pathlib import Path
 from queue import Empty
 from threading import Condition, Event, Lock, Thread, Timer
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -134,6 +135,47 @@ from mtplx.server.request_policy import (
     BackgroundBusyBypass,
     resolve_request_policy,
 )
+from mtplx.server.web_tools import (
+    HOSTED_WEB_CONTRACT,
+    MAX_HOSTED_WEB_ROUNDS,
+    AccumulatedToolCall,
+    ToolSessionState,
+    accumulate_tool_call_delta,
+    add_web_argument,
+    dispatch_hosted_web_tool,
+    hosted_tool_call_arguments,
+    hosted_tool_call_name,
+    hosted_web_tool_definitions,
+    should_host_web_tools,
+    tool_calls_from_accumulator,
+    usable_hosted_tool_calls,
+)
+from mtplx.server.core import (
+    GenerationTurn,
+    OutputItemStarted,
+    ReasoningDelta,
+    TextDelta,
+    ToolCallDelta,
+    TurnCancelled,
+    TurnCompleted,
+    TurnEvent,
+    TurnFailed,
+    TurnHeartbeat,
+    TurnKeepAlive,
+    TurnStarted,
+    UsageUpdate,
+)
+from mtplx.server.protocols.responses import (
+    ResponseRegistry,
+    ResponseStoreError,
+    ResponsesProtocolError,
+    ResponsesRequest,
+    response_failure_envelope,
+    response_from_chat_completion,
+    response_output_to_chat_messages,
+    responses_request_to_chat,
+    responses_stream_from_turn_events,
+)
 from mtplx.server.response_envelope import build_generation_result
 from mtplx.profiles import (
     DEFAULT_HF_MODEL_ID,
@@ -199,7 +241,6 @@ from mtplx.server.mtp_batch import (
     MTPBatchGenerationService,
     MTPBatchJob,
 )
-from mtplx.server import responses as responses_api
 from mtplx.server.omlx_bridge import (
     ToolCallStreamFilter as OMLXToolCallStreamFilter,
     extract_thinking as omlx_extract_thinking,
@@ -792,6 +833,209 @@ async def _monitor_request_disconnect(
             return True
         await asyncio.sleep(max(0.01, float(poll_s)))
     return False
+
+
+class _HostedWebTurnStream:
+    """Composite turn that hides hosted web tool rounds from the wire."""
+
+    def __init__(self, factory: Callable[[], AsyncIterator[TurnEvent]]) -> None:
+        self._factory = factory
+
+    async def events(self) -> AsyncIterator[TurnEvent]:
+        async for event in self._factory():
+            yield event
+
+
+def _is_turn_stream(value: Any) -> bool:
+    events = getattr(value, "events", None)
+    return callable(events)
+
+
+class _GenerationTurnStream:
+    """One protocol-neutral driver observed by exactly one wire renderer."""
+
+    def __init__(
+        self,
+        turn: GenerationTurn,
+        driver_factory: Callable[[], Awaitable[None]],
+    ) -> None:
+        self.turn = turn
+        self._driver_factory = driver_factory
+
+    async def events(self) -> AsyncIterator[TurnEvent]:
+        subscriber = self.turn.subscribe()
+        driver = self._driver_factory()
+        driver_task = asyncio.create_task(driver)
+        self.turn.attach_driver(driver_task)
+
+        def close_unterminated_driver(task: asyncio.Task[None]) -> None:
+            if getattr(getattr(self.turn, "state", None), "value", None) == "terminal":
+                return
+            if task.cancelled():
+                terminal: TurnEvent = TurnCancelled(reason="generation_driver_cancelled")
+            else:
+                exception = task.exception()
+                terminal = TurnFailed(
+                    error=(
+                        str(exception)
+                        if exception is not None
+                        else "generation driver ended without a terminal event"
+                    ),
+                    code=(
+                        "generation_driver_error"
+                        if exception is not None
+                        else "driver_eof_without_terminal"
+                    ),
+                )
+            with suppress(RuntimeError):
+                if isinstance(terminal, TurnCancelled):
+                    if getattr(self.turn.state, "value", None) == "idle":
+                        self.turn.fail(
+                            TurnFailed(
+                                error=terminal.reason,
+                                code="generation_driver_cancelled",
+                            )
+                        )
+                    else:
+                        self.turn.cancel(terminal)
+                else:
+                    self.turn.fail(terminal)
+
+        driver_task.add_done_callback(close_unterminated_driver)
+        try:
+            async for event in subscriber:
+                yield event
+        finally:
+            if getattr(getattr(self.turn, "state", None), "value", None) != "terminal":
+                with suppress(RuntimeError):
+                    self.turn.cancel(TurnCancelled(reason="renderer_disconnected"))
+            self.turn.cancel_driver()
+            with suppress(asyncio.CancelledError):
+                await driver_task
+
+
+async def _chat_stream_from_turn_events(
+    events: AsyncIterator[TurnEvent],
+) -> AsyncIterator[str]:
+    """Project the common turn lifecycle onto Chat Completions SSE."""
+
+    started: TurnStarted | None = None
+    terminal_seen = False
+
+    def payload(delta: dict[str, Any], *, finish_reason: str | None = None) -> dict[str, Any]:
+        if started is None:
+            raise RuntimeError("turn delta arrived before TurnStarted")
+        return {
+            "id": started.response_id,
+            "object": "chat.completion.chunk",
+            "created": started.created,
+            "model": started.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": finish_reason,
+                }
+            ],
+        }
+
+    async for event in events:
+        if isinstance(event, TurnStarted):
+            if started is not None:
+                raise RuntimeError("duplicate TurnStarted")
+            started = event
+            yield f"data: {json.dumps(payload({'role': 'assistant'}))}\n\n"
+            continue
+        if isinstance(event, OutputItemStarted):
+            continue
+        if isinstance(event, TurnKeepAlive):
+            # Comment frame: invisible to SSE parsers, cannot disturb chunk
+            # layout, and _iter_sse_data forwards it to the Anthropic path.
+            yield SSE_KEEPALIVE_COMMENT
+            continue
+        if isinstance(event, TurnHeartbeat):
+            heartbeat = payload({})
+            heartbeat["mtplx_progress"] = _json_safe(event.payload or {})
+            yield f"data: {json.dumps(heartbeat)}\n\n"
+            continue
+        if isinstance(event, ReasoningDelta):
+            yield f"data: {json.dumps(payload({'reasoning_content': event.delta}))}\n\n"
+            continue
+        if isinstance(event, TextDelta):
+            yield f"data: {json.dumps(payload({'content': event.delta}))}\n\n"
+            continue
+        if isinstance(event, ToolCallDelta):
+            function: dict[str, Any] = {}
+            if event.name is not None:
+                function["name"] = event.name
+                function["arguments"] = event.arguments_delta
+            elif event.arguments_delta:
+                function["arguments"] = event.arguments_delta
+            tool_call: dict[str, Any] = {
+                "index": event.index,
+                "type": "function",
+                "function": function,
+            }
+            if event.call_id is not None:
+                tool_call["id"] = event.call_id
+            yield f"data: {json.dumps(payload({'tool_calls': [tool_call]}))}\n\n"
+            continue
+        if isinstance(event, UsageUpdate):
+            continue
+        if isinstance(event, TurnCompleted):
+            terminal_seen = True
+            completed = payload({}, finish_reason=event.finish_reason)
+            usage = event.usage
+            completed["usage"] = {
+                "prompt_tokens": int(usage.prompt_tokens if usage else 0),
+                "completion_tokens": int(usage.completion_tokens if usage else 0),
+                "total_tokens": int(
+                    (usage.prompt_tokens + usage.completion_tokens) if usage else 0
+                ),
+            }
+            completed["mtplx_stats"] = event.mtplx_stats or {}
+            completed["timings"] = event.timings or {}
+            yield f"data: {json.dumps(completed)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+        if isinstance(event, TurnFailed):
+            terminal_seen = True
+            failed = payload({}, finish_reason="error")
+            failed.update(
+                _openai_error_content(
+                    event.error,
+                    status_code=event.status_code,
+                    code=event.code or "server_error",
+                )
+            )
+            yield f"data: {json.dumps(failed)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+        if isinstance(event, TurnCancelled):
+            terminal_seen = True
+            cancelled = payload({}, finish_reason="error")
+            cancelled.update(
+                _openai_error_content(
+                    event.reason,
+                    status_code=499,
+                    code="request_cancelled",
+                )
+            )
+            yield f"data: {json.dumps(cancelled)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+    if not terminal_seen and started is not None:
+        failed = payload({}, finish_reason="error")
+        failed.update(
+            _openai_error_content(
+                "generation event stream ended without a terminal event",
+                status_code=500,
+                code="driver_eof_without_terminal",
+            )
+        )
+        yield f"data: {json.dumps(failed)}\n\n"
+        yield "data: [DONE]\n\n"
 
 
 def _comma_floats(value: str) -> tuple[float, ...]:
@@ -1639,6 +1883,305 @@ class ChatCompletionRequest(BaseModel):
     # Internal adapter control: Responses clients must never receive the
     # browser-facing MTPLX TPS footer as model output.
     suppress_stats_footer: bool = False
+    mtplx_hosted_web_round: bool = False
+
+
+def _prepare_hosted_web_request(
+    request: ChatCompletionRequest,
+) -> ChatCompletionRequest:
+    updates: dict[str, Any] = {}
+    if not request.tools:
+        updates["tools"] = hosted_web_tool_definitions()
+        updates["tool_choice"] = (
+            request.tool_choice if request.tool_choice is not None else "auto"
+        )
+    messages = list(request.messages)
+    already = any(
+        getattr(message, "role", None) == "system"
+        and HOSTED_WEB_CONTRACT in str(getattr(message, "content", "") or "")
+        for message in messages
+    )
+    if not already:
+        updates["messages"] = [
+            ChatMessage(role="system", content=HOSTED_WEB_CONTRACT),
+            *messages,
+        ]
+    if not updates:
+        return request
+    return request.model_copy(update=updates)
+
+
+def _assistant_message_from_tool_round(
+    *,
+    content: str,
+    tool_calls: list[dict[str, Any]],
+) -> ChatMessage:
+    return ChatMessage(
+        role="assistant",
+        content=content or None,
+        tool_calls=tool_calls,
+    )
+
+
+def _tool_result_message(*, call_id: str, content: str) -> ChatMessage:
+    return ChatMessage(role="tool", content=content, tool_call_id=call_id)
+
+
+def _rebinding_cancel_binder(
+    bind_cancel: Callable[[Callable[[], Any]], Any] | None,
+) -> Callable[[Callable[[], Any]], Any] | None:
+    """One Responses cancel slot can cover sequential hosted-web generations."""
+
+    if bind_cancel is None:
+        return None
+    current: dict[str, Any] = {"cancel": None, "registered": False}
+
+    def forward() -> None:
+        cancel = current["cancel"]
+        if cancel is not None:
+            cancel()
+
+    def bind(cancel: Callable[[], Any]) -> Any:
+        current["cancel"] = cancel
+        if current["registered"]:
+            return True
+        current["registered"] = True
+        return bind_cancel(forward)
+
+    return bind
+
+
+def _execute_hosted_web_calls(
+    tool_calls: list[dict[str, Any]],
+    *,
+    session: ToolSessionState,
+) -> list[ChatMessage]:
+    messages: list[ChatMessage] = []
+    for tool_call in tool_calls:
+        name = hosted_tool_call_name(tool_call)
+        call_id = str(tool_call.get("id") or f"call_{uuid.uuid4().hex[:24]}")
+        result = dispatch_hosted_web_tool(
+            name,
+            hosted_tool_call_arguments(tool_call),
+            session=session,
+        )
+        messages.append(_tool_result_message(call_id=call_id, content=result))
+    return messages
+
+
+def _json_choice_payload(response: Any) -> dict[str, Any] | None:
+    if not isinstance(response, JSONResponse):
+        return None
+    try:
+        payload = json.loads(response.body)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    choice = choices[0]
+    return choice if isinstance(choice, dict) else None
+
+
+async def _run_hosted_web_chat_completions(
+    impl: Callable[..., Awaitable[Any]],
+    raw_request: Request,
+    request: ChatCompletionRequest,
+    *,
+    return_turn: bool,
+    bind_cancel: Callable[[Callable[[], Any]], Any] | None = None,
+) -> Any:
+    bind_cancel = _rebinding_cancel_binder(bind_cancel)
+    prepared = _prepare_hosted_web_request(request)
+    if not should_host_web_tools(prepared.tools):
+        prepared = prepared.model_copy(update={"mtplx_hosted_web_round": True})
+        return await impl(
+            raw_request,
+            prepared,
+            return_turn=return_turn,
+            bind_cancel=bind_cancel,
+        )
+    if prepared.stream or return_turn:
+        stream = _HostedWebTurnStream(
+            lambda: _hosted_web_turn_events(
+                impl,
+                raw_request,
+                prepared,
+                bind_cancel=bind_cancel,
+            )
+        )
+        if return_turn:
+            return stream
+        return StreamingResponse(
+            _chat_stream_from_turn_events(stream.events()),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    return await _hosted_web_json_loop(
+        impl,
+        raw_request,
+        prepared,
+        bind_cancel=bind_cancel,
+    )
+
+
+async def _hosted_web_json_loop(
+    impl: Callable[..., Awaitable[Any]],
+    raw_request: Request,
+    request: ChatCompletionRequest,
+    *,
+    bind_cancel: Callable[[Callable[[], Any]], Any] | None,
+) -> Any:
+    messages = list(request.messages)
+    session = ToolSessionState()
+    last_response: Any = None
+    for round_index in range(MAX_HOSTED_WEB_ROUNDS + 1):
+        tool_choice: Any = "none" if round_index == MAX_HOSTED_WEB_ROUNDS else request.tool_choice
+        round_request = request.model_copy(
+            update={
+                "messages": messages,
+                "stream": False,
+                "tool_choice": tool_choice,
+                "mtplx_hosted_web_round": True,
+            }
+        )
+        last_response = await impl(
+            raw_request,
+            round_request,
+            return_turn=False,
+            bind_cancel=bind_cancel,
+        )
+        choice = _json_choice_payload(last_response)
+        if choice is None:
+            return last_response
+        message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+        raw_tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
+        tool_calls = usable_hosted_tool_calls(
+            raw_tool_calls,
+            fallback_query=_last_user_text(messages),
+            saw_tool_attempt=bool(raw_tool_calls),
+            finish_reason=str(choice.get("finish_reason") or ""),
+        )
+        if not (round_index < MAX_HOSTED_WEB_ROUNDS and tool_calls):
+            return last_response
+        assistant_content = str(message.get("content") or "")
+        messages = [
+            *messages,
+            _assistant_message_from_tool_round(
+                content=assistant_content,
+                tool_calls=tool_calls,
+            ),
+            *_execute_hosted_web_calls(tool_calls, session=session),
+        ]
+    return last_response
+
+
+async def _hosted_web_turn_events(
+    impl: Callable[..., Awaitable[Any]],
+    raw_request: Request,
+    request: ChatCompletionRequest,
+    *,
+    bind_cancel: Callable[[Callable[[], Any]], Any] | None,
+) -> AsyncIterator[TurnEvent]:
+    request = _prepare_hosted_web_request(request)
+    messages = list(request.messages)
+    session = ToolSessionState()
+    started_emitted = False
+    for round_index in range(MAX_HOSTED_WEB_ROUNDS + 1):
+        tool_choice: Any = "none" if round_index == MAX_HOSTED_WEB_ROUNDS else request.tool_choice
+        round_request = request.model_copy(
+            update={
+                "messages": messages,
+                "stream": True,
+                "tool_choice": tool_choice,
+                "mtplx_hosted_web_round": True,
+            }
+        )
+        inner = await impl(
+            raw_request,
+            round_request,
+            return_turn=True,
+            bind_cancel=bind_cancel,
+        )
+        if not _is_turn_stream(inner):
+            detail = "hosted web generation failed"
+            if isinstance(inner, JSONResponse):
+                try:
+                    payload = json.loads(inner.body)
+                    detail = str(payload.get("detail") or payload.get("error") or detail)
+                except Exception:
+                    pass
+            yield TurnFailed(error=detail, code="hosted_web_generation_failed")
+            return
+        acc: list[AccumulatedToolCall] = []
+        text_parts: list[str] = []
+        completed: TurnCompleted | None = None
+        saw_tool_attempt = False
+        async for event in inner.events():
+            if isinstance(event, TurnStarted):
+                if not started_emitted:
+                    started_emitted = True
+                    yield event
+                continue
+            if isinstance(event, OutputItemStarted) and event.kind == "tool":
+                # Responses treats this as an empty function_call. Hide it
+                # until we either execute the hosted tool or finish.
+                saw_tool_attempt = True
+                continue
+            if isinstance(event, ToolCallDelta):
+                saw_tool_attempt = True
+                accumulate_tool_call_delta(
+                    acc,
+                    index=event.index,
+                    call_id=event.call_id,
+                    name=event.name,
+                    arguments_delta=event.arguments_delta,
+                )
+                continue
+            if isinstance(event, TextDelta):
+                text_parts.append(event.delta)
+                if round_index == 0:
+                    continue
+                yield event
+                continue
+            if isinstance(event, TurnCompleted):
+                completed = event
+                continue
+            if isinstance(event, (TurnFailed, TurnCancelled)):
+                yield event
+                return
+            yield event
+        tool_calls = usable_hosted_tool_calls(
+            tool_calls_from_accumulator(acc),
+            fallback_query=_last_user_text(messages),
+            saw_tool_attempt=saw_tool_attempt,
+            finish_reason=completed.finish_reason if completed is not None else None,
+        )
+        if round_index < MAX_HOSTED_WEB_ROUNDS and tool_calls:
+            yield TurnHeartbeat(payload={"web": True, "phase": "tools"})
+            messages = [
+                *messages,
+                _assistant_message_from_tool_round(
+                    content="".join(text_parts),
+                    tool_calls=tool_calls,
+                ),
+                *await asyncio.to_thread(
+                    _execute_hosted_web_calls, tool_calls, session=session
+                ),
+            ]
+            continue
+        if round_index == 0 and text_parts:
+            # Round 0 held its text back in case a hosted tool call followed;
+            # no tool ran, so that text is the answer and must reach the wire.
+            yield TextDelta(delta="".join(text_parts))
+        if completed is not None:
+            yield completed
+        return
 
 
 @dataclass
@@ -6652,6 +7195,268 @@ async def _anthropic_stream_from_openai_sse(body_iterator: Any, *, model: str):
     if mtplx_stats is not None:
         delta_payload["mtplx_stats"] = mtplx_stats
     yield _anthropic_sse("message_delta", delta_payload)
+    yield _anthropic_sse("message_stop", {"type": "message_stop"})
+
+
+async def _anthropic_stream_from_turn_events(
+    events: AsyncIterator[TurnEvent], *, model: str
+) -> AsyncIterator[str]:
+    message_id = "msg_" + uuid.uuid4().hex
+    next_block_index = 0
+    active_text_index: int | None = None
+    active_thinking_index: int | None = None
+    opened_any_block = False
+    opened_tool_block = False
+    stop_reason = "end_turn"
+    usage = _anthropic_usage_from_openai_usage(None)
+    tool_blocks: dict[int, dict[str, Any]] = {}
+    terminal_seen = False
+
+    yield _anthropic_sse(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": usage,
+            },
+        },
+    )
+
+    def start_content_block(index: int, block: dict[str, Any]) -> str:
+        return _anthropic_sse(
+            "content_block_start",
+            {"type": "content_block_start", "index": index, "content_block": block},
+        )
+
+    def stop_content_block(index: int) -> str:
+        return _anthropic_sse(
+            "content_block_stop", {"type": "content_block_stop", "index": index}
+        )
+
+    async for ev in events:
+        if isinstance(ev, TurnStarted):
+            continue
+
+        if isinstance(ev, (OutputItemStarted, TurnHeartbeat)):
+            continue
+
+        if isinstance(ev, TurnKeepAlive):
+            # Pre-first-token liveness (#358). Neither raw SSE comments nor
+            # protocol `ping` events reset Claude Code's stream watchdog (its
+            # SDK loop drops pings before the watchdog sees them), so a long
+            # prefill died client-side at exactly 300s. Only message events
+            # count: pre-open the thinking block and tick it with EMPTY
+            # thinking_deltas — real events on the wire, zero content, and
+            # the model's own reasoning continues in the same block.
+            if active_thinking_index is None and active_text_index is None:
+                active_thinking_index = next_block_index
+                next_block_index += 1
+                opened_any_block = True
+                yield start_content_block(
+                    active_thinking_index,
+                    {"type": "thinking", "thinking": "", "signature": "mtplx-reasoning"},
+                )
+            if active_thinking_index is not None:
+                yield _anthropic_sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": active_thinking_index,
+                        "delta": {"type": "thinking_delta", "thinking": ""},
+                    },
+                )
+            continue
+
+        if isinstance(ev, ReasoningDelta):
+            if active_text_index is not None:
+                yield stop_content_block(active_text_index)
+                active_text_index = None
+            if active_thinking_index is None:
+                active_thinking_index = next_block_index
+                next_block_index += 1
+                opened_any_block = True
+                yield start_content_block(
+                    active_thinking_index,
+                    {"type": "thinking", "thinking": "", "signature": "mtplx-reasoning"},
+                )
+            yield _anthropic_sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": active_thinking_index,
+                    "delta": {"type": "thinking_delta", "thinking": ev.delta},
+                },
+            )
+            continue
+
+        if isinstance(ev, TextDelta):
+            if active_thinking_index is not None:
+                yield stop_content_block(active_thinking_index)
+                active_thinking_index = None
+            if active_text_index is None:
+                active_text_index = next_block_index
+                next_block_index += 1
+                opened_any_block = True
+                yield start_content_block(
+                    active_text_index, {"type": "text", "text": ""}
+                )
+            yield _anthropic_sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": active_text_index,
+                    "delta": {"type": "text_delta", "text": ev.delta},
+                },
+            )
+            continue
+
+        if isinstance(ev, ToolCallDelta):
+            if active_text_index is not None:
+                yield stop_content_block(active_text_index)
+                active_text_index = None
+            if active_thinking_index is not None:
+                yield stop_content_block(active_thinking_index)
+                active_thinking_index = None
+            tool = tool_blocks.get(ev.index)
+            if tool is None:
+                tool = {
+                    "id": ev.call_id,
+                    "name": ev.name,
+                    "block_index": None,
+                    "pending_arguments": "",
+                }
+                tool_blocks[ev.index] = tool
+            if ev.call_id:
+                tool["id"] = ev.call_id
+            if ev.name:
+                tool["name"] = ev.name
+            if tool["block_index"] is None:
+                if not tool.get("name"):
+                    tool["pending_arguments"] += ev.arguments_delta
+                    continue
+                tool["block_index"] = next_block_index
+                next_block_index += 1
+                opened_any_block = True
+                opened_tool_block = True
+                yield start_content_block(
+                    int(tool["block_index"]),
+                    {
+                        "type": "tool_use",
+                        "id": tool.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                        "name": tool["name"],
+                        "input": {},
+                    },
+                )
+                pending = str(tool.get("pending_arguments") or "")
+                if pending:
+                    yield _anthropic_sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": tool["block_index"],
+                            "delta": {"type": "input_json_delta", "partial_json": pending},
+                        },
+                    )
+                    tool["pending_arguments"] = ""
+            if ev.arguments_delta:
+                yield _anthropic_sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": tool["block_index"],
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": ev.arguments_delta,
+                        },
+                    },
+                )
+            continue
+
+        if isinstance(ev, UsageUpdate):
+            usage = _anthropic_usage_from_openai_usage(
+                {"prompt_tokens": ev.prompt_tokens, "completion_tokens": ev.completion_tokens}
+            )
+            continue
+
+        if isinstance(ev, TurnCompleted):
+            terminal_seen = True
+            if ev.usage is not None:
+                usage = _anthropic_usage_from_openai_usage(
+                    {
+                        "prompt_tokens": ev.usage.prompt_tokens,
+                        "completion_tokens": ev.usage.completion_tokens,
+                    }
+                )
+            stop_reason = _anthropic_stop_reason(
+                ev.finish_reason, has_tool_calls=opened_tool_block
+            )
+            break
+
+        if isinstance(ev, TurnFailed):
+            terminal_seen = True
+            yield _anthropic_sse(
+                "error",
+                {
+                    "type": "error",
+                    "error": {
+                        "type": ev.code or "api_error",
+                        "message": ev.error,
+                    },
+                },
+            )
+            return
+
+        if isinstance(ev, TurnCancelled):
+            terminal_seen = True
+            yield _anthropic_sse(
+                "error",
+                {
+                    "type": "error",
+                    "error": {"type": "api_error", "message": ev.reason},
+                },
+            )
+            return
+
+    if not terminal_seen:
+        yield _anthropic_sse(
+            "error",
+            {
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": "generation event stream ended without a terminal event",
+                },
+            },
+        )
+        return
+
+    if active_text_index is not None:
+        yield stop_content_block(active_text_index)
+    if active_thinking_index is not None:
+        yield stop_content_block(active_thinking_index)
+    for tool_state in tool_blocks.values():
+        block_index = tool_state.get("block_index")
+        if block_index is not None:
+            yield stop_content_block(int(block_index))
+    if not opened_any_block:
+        empty_index = next_block_index
+        yield start_content_block(empty_index, {"type": "text", "text": ""})
+        yield stop_content_block(empty_index)
+    yield _anthropic_sse(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+            "usage": dict(usage),
+        },
+    )
     yield _anthropic_sse("message_stop", {"type": "message_stop"})
 
 
@@ -17465,6 +18270,7 @@ def _mtplx_app_capabilities() -> dict[str, Any]:
             "parse_tools_at_completion": True,
             "early_tool_cancel_default": False,
             "hidden_generation_repair_default": False,
+            "web_search": False,
         },
         "openai_bridge": {
             "mode": "omlx_style",
@@ -30604,6 +31410,11 @@ def _as_text_list(value: Any, *, field: str) -> list[str]:
 
 
 def create_app(state: ServerState) -> FastAPI:
+    response_registry = getattr(state, "response_registry", None)
+    if not isinstance(response_registry, ResponseRegistry):
+        response_registry = ResponseRegistry.from_env()
+        state.response_registry = response_registry
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         # Bind the running asyncio loop to the dashboard bus so generation
@@ -30641,6 +31452,7 @@ def create_app(state: ServerState) -> FastAPI:
                 await _aime_runner.stop_runs()
             except Exception:
                 pass
+            await asyncio.to_thread(response_registry.shutdown, 1.0)
             for task in bg_tasks:
                 task.cancel()
             # Issue #290: BEFORE the scheduler shutdown cancels queued
@@ -30882,6 +31694,7 @@ def create_app(state: ServerState) -> FastAPI:
             },
             "generation_mode": state.args.generation_mode,
             "default_generation_mode": state.args.generation_mode,
+            "web": bool(getattr(state.args, "web", False)),
             "runtime_mode": runtime_mode,
             "parent_runtime_released_for_aime": bool(
                 getattr(state, "aime_parent_runtime_released", False)
@@ -30943,6 +31756,7 @@ def create_app(state: ServerState) -> FastAPI:
             "dashboard_active_requests": dashboard_active,
             "active_requests": active_requests,
             "scheduler": scheduler_state,
+            "response_store": response_registry.stats(),
             "session_bank": (
                 state.sessions.bank.to_dict()
                 if hasattr(getattr(state, "sessions", None), "bank")
@@ -31207,7 +32021,9 @@ def create_app(state: ServerState) -> FastAPI:
 
     @app.get("/v1/mtplx/app/capabilities")
     def mtplx_app_capabilities() -> dict[str, Any]:
-        return _mtplx_app_capabilities()
+        payload = _mtplx_app_capabilities()
+        payload["features"]["web_search"] = bool(getattr(state.args, "web", False))
+        return payload
 
     @app.post("/v1/mtplx/thermal/fan_mode")
     @app.post("/mtplx/thermal/fan_mode")
@@ -32006,6 +32822,7 @@ def create_app(state: ServerState) -> FastAPI:
             "tool_parse_counters": dict(
                 getattr(state, "tool_parse_counters", {}) or {}
             ),
+            "response_store": response_registry.stats(),
         }
 
     @app.get("/admin/sessions")
@@ -32251,13 +33068,27 @@ def create_app(state: ServerState) -> FastAPI:
             "usage": {"total_tokens": prompt_tokens},
         }
 
-    @app.post("/v1/chat/completions")
-    async def chat_completions(
-        raw_request: Request, request: ChatCompletionRequest
+    async def _chat_completions_impl(
+        raw_request: Request,
+        request: ChatCompletionRequest,
+        *,
+        return_turn: bool,
+        bind_cancel: Callable[[Callable[[], Any]], Any] | None = None,
     ) -> Any:
         request_received_monotonic_s = time.perf_counter()
         if not request.messages:
             raise HTTPException(status_code=400, detail="messages must not be empty")
+        if (
+            bool(getattr(state.args, "web", False))
+            and not bool(request.mtplx_hosted_web_round)
+        ):
+            return await _run_hosted_web_chat_completions(
+                _chat_completions_impl,
+                raw_request,
+                request,
+                return_turn=return_turn,
+                bind_cancel=bind_cancel,
+            )
         if bool(request.logprobs) or int(request.top_logprobs or 0) > 0:
             raise HTTPException(
                 status_code=400,
@@ -33427,48 +34258,25 @@ def create_app(state: ServerState) -> FastAPI:
                     pass
 
         if request.stream:
+            _generation_turn = GenerationTurn()
 
-            async def event_stream():
+            async def drive_turn():
                 stream_started_s = time.perf_counter()
-                last_sse_sent_s = stream_started_s
+                last_event_sent_s = stream_started_s
                 last_token_s: float | None = None
-                # Enqueue stamp of the token item currently being drained
-                # (generation-thread perf_counter). The census subtracts it
-                # to expose queue residency — the direct starvation receipt.
-                latest_token_enqueue_s: float | None = None
                 next_silence_warn_s = stream_started_s + STREAM_SILENCE_WARN_S
                 owner_stall_probe = _OwnerStallProbe(deadline_s=STREAM_STALL_DEADLINE_S)
                 sse_keepalive_interval_s = _sse_keepalive_interval_s()
 
-                def mark_sse_sent(chunk: str) -> str:
-                    nonlocal last_sse_sent_s
-                    last_sse_sent_s = time.perf_counter()
-                    if _STREAM_CENSUS_DIR is not None:
-                        _stream_census_record(
-                            response_id,
-                            chunk,
-                            queue_age_ms=(
-                                (last_sse_sent_s - latest_token_enqueue_s) * 1000
-                                if latest_token_enqueue_s is not None
-                                else None
-                            ),
-                        )
-                    return chunk
+                def mark_stream_activity(_event: object = None) -> None:
+                    nonlocal last_event_sent_s
+                    last_event_sent_s = time.perf_counter()
 
-                first = {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"role": "assistant"},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
-                yield mark_sse_sent(f"data: {json.dumps(first)}\n\n")
+                _generation_turn.start(TurnStarted(
+                    response_id=response_id,
+                    model=model,
+                    created=created,
+                ))
 
                 queue = _LoopFedStreamQueue(asyncio.get_running_loop())
                 cancel_event = _AttributedCancelEvent()
@@ -33488,6 +34296,8 @@ def create_app(state: ServerState) -> FastAPI:
                     prompt_tokens=len(prompt_ids),
                 )
                 state.dashboard.in_flight.register(in_flight_handle)
+                if bind_cancel is not None:
+                    bind_cancel(cancel_event.set)
                 _flight(state).begin(
                     response_id,
                     session_id=session_id,
@@ -34716,48 +35526,20 @@ def create_app(state: ServerState) -> FastAPI:
                     daemon=True,
                 ).start()
 
-                # The envelope around each delta is constant for the whole
-                # stream; serialize it once instead of rebuilding and
-                # re-serializing the full payload dict per token chunk.
-                # Byte-identical to json.dumps of the equivalent dict
-                # (default separators and key order).
-                _delta_envelope_prefix = (
-                    'data: {"id": '
-                    + json.dumps(response_id)
-                    + ', "object": "chat.completion.chunk", "created": '
-                    + json.dumps(created)
-                    + ', "model": '
-                    + json.dumps(model)
-                    + ', "choices": [{"index": 0, "delta": '
-                )
-                _delta_envelope_suffix = ', "finish_reason": null}]}\n\n'
+                # Helpers return semantic deltas only. Wire serialization is
+                # owned exclusively by the selected protocol renderer.
+                def delta_payload_chunk(delta: dict[str, Any]) -> dict[str, Any]:
+                    return delta
 
-                def delta_payload_chunk(delta: dict[str, Any]) -> str:
-                    return (
-                        _delta_envelope_prefix
-                        + json.dumps(delta)
-                        + _delta_envelope_suffix
-                    )
-
-                def delta_chunk(field: str, text: str) -> str:
+                def delta_chunk(field: str, text: str) -> dict[str, Any]:
                     return delta_payload_chunk({field: text})
 
-                def progress_chunk(progress: dict[str, Any]) -> str:
-                    payload = {
-                        "id": response_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": None,
-                            }
-                        ],
-                        "mtplx_progress": _json_safe(progress),
-                    }
-                    return f"data: {json.dumps(payload)}\n\n"
+                def progress_chunk(progress: dict[str, Any]) -> dict[str, Any]:
+                    with suppress(RuntimeError):
+                        _generation_turn.emit(
+                            TurnHeartbeat(payload=_json_safe(progress))
+                        )
+                    return progress
 
                 def error_chunk(exc: BaseException) -> str:
                     if _is_allocation_failure(exc):
@@ -34789,6 +35571,14 @@ def create_app(state: ServerState) -> FastAPI:
                         message = str(exc)
                         status_code = 500
                         error_code = type(exc).__name__
+                    with suppress(RuntimeError):
+                        _generation_turn.fail(
+                            TurnFailed(
+                                error=message,
+                                code=error_code,
+                                status_code=int(status_code),
+                            )
+                        )
                     payload = {
                         "id": response_id,
                         "object": "chat.completion.chunk",
@@ -34879,8 +35669,13 @@ def create_app(state: ServerState) -> FastAPI:
                 streamed_token_times: list[float] = []
                 streamed_progress_tokens = 0
                 streamed_decode_started_s: float | None = None
+                # Last liveness byte the renderer could have sent before the
+                # first token (#358): the role delta at TurnStarted, then each
+                # keep-alive event. Decode start retires the mechanism.
+                last_sse_sent_s = stream_started_s
                 streamed_assistant_tool_calls: list[dict[str, Any]] | None = None
                 streamed_tool_deltas_emitted = False
+                turn_tool_deltas_emitted = False
                 early_tool_cancel_used = False
                 pending_tool_cancel_started_s: float | None = None
                 hidden_tool_guard_started_s: float | None = None
@@ -34891,14 +35686,48 @@ def create_app(state: ServerState) -> FastAPI:
                 read_only_force_answer_stream_buffer = ""
                 read_only_force_answer_stream_started = False
                 read_only_force_answer_stream_marker_stripped_chars = 0
+                turn_output_items_started: set[tuple[str, int]] = set()
+
+                def start_turn_output_item(kind: str, index: int = 0) -> None:
+                    key = (kind, int(index))
+                    if key in turn_output_items_started:
+                        return
+                    turn_output_items_started.add(key)
+                    with suppress(RuntimeError):
+                        _generation_turn.emit(
+                            OutputItemStarted(kind=kind, index=int(index))
+                        )
+
+                def remember_tool_call_delta(delta: dict[str, Any]) -> None:
+                    nonlocal turn_tool_deltas_emitted
+                    for _tc_delta in delta.get("tool_calls", []):
+                        _tc_fn = _tc_delta.get("function") or {}
+                        _tc_index = int(_tc_delta.get("index") or 0)
+                        start_turn_output_item("tool", _tc_index)
+                        with suppress(RuntimeError):
+                            _generation_turn.emit(ToolCallDelta(
+                                index=_tc_index,
+                                call_id=_tc_delta.get("id"),
+                                name=_tc_fn.get("name"),
+                                arguments_delta=str(
+                                    _tc_fn.get("arguments") or ""
+                                ),
+                            ))
+                            turn_tool_deltas_emitted = True
 
                 def remember_stream_delta(delta: dict[str, Any]) -> None:
                     reasoning = delta.get("reasoning_content")
                     if isinstance(reasoning, str) and reasoning:
                         history_reasoning_chunks.append(reasoning)
+                        start_turn_output_item("reasoning")
+                        with suppress(RuntimeError):
+                            _generation_turn.emit(ReasoningDelta(delta=reasoning))
                     content = delta.get("content")
                     if isinstance(content, str) and content:
                         history_content_chunks.append(content)
+                        start_turn_output_item("text")
+                        with suppress(RuntimeError):
+                            _generation_turn.emit(TextDelta(delta=content))
 
                 def reset_orphan_stream_guards() -> None:
                     nonlocal orphan_reasoning_stream_guard
@@ -34931,7 +35760,7 @@ def create_app(state: ServerState) -> FastAPI:
                     use_orphan_guard: bool = True,
                     use_tool_translator: bool = True,
                     monitor_stop: bool = True,
-                ) -> list[str]:
+                ) -> list[dict[str, Any]]:
                     nonlocal streamed_assistant_tool_calls
                     nonlocal streamed_tool_deltas_emitted
                     nonlocal early_tool_cancel_used
@@ -34963,7 +35792,7 @@ def create_app(state: ServerState) -> FastAPI:
                     ):
                         if early_tool_cancel_used and streamed_assistant_tool_calls:
                             return []
-                        chunks: list[str] = []
+                        chunks: list[dict[str, Any]] = []
                         for delta in content_tool_translator.feed(field, text):
                             if not delta:
                                 continue
@@ -34999,6 +35828,7 @@ def create_app(state: ServerState) -> FastAPI:
                                 if single_tool_call_stream and parsed_calls:
                                     parsed_calls = parsed_calls[:1]
                                 streamed_assistant_tool_calls = parsed_calls
+                                remember_tool_call_delta(delta)
                             chunks.append(delta_payload_chunk(delta))
                         if (
                             single_tool_call_stream
@@ -35060,11 +35890,11 @@ def create_app(state: ServerState) -> FastAPI:
                     remember_stream_delta(delta)
                     return [delta_payload_chunk(delta)]
 
-                def finish_orphan_stream_guards() -> list[str]:
+                def finish_orphan_stream_guards() -> list[dict[str, Any]]:
                     nonlocal stream_orphan_tool_markup_suppressed
                     if not orphan_stream_guard_enabled:
                         return []
-                    chunks: list[str] = []
+                    chunks: list[dict[str, Any]] = []
                     for field, guard in (
                         ("reasoning_content", orphan_reasoning_stream_guard),
                         ("content", orphan_content_stream_guard),
@@ -35104,11 +35934,11 @@ def create_app(state: ServerState) -> FastAPI:
                     text: str,
                     *,
                     force: bool = False,
-                ) -> list[str]:
+                ) -> list[dict[str, Any]]:
                     nonlocal read_only_force_answer_stream_buffer
                     nonlocal read_only_force_answer_stream_started
                     nonlocal read_only_force_answer_stream_marker_stripped_chars
-                    chunks: list[str] = []
+                    chunks: list[dict[str, Any]] = []
                     emit_text = ""
                     if read_only_force_answer_stream_started:
                         emit_text = text
@@ -35152,14 +35982,16 @@ def create_app(state: ServerState) -> FastAPI:
                         )
                     return chunks
 
-                def emit_read_only_force_answer_visible_text(text: str) -> list[str]:
+                def emit_read_only_force_answer_visible_text(
+                    text: str,
+                ) -> list[dict[str, Any]]:
                     nonlocal read_only_force_answer_stream_buffer
                     nonlocal read_only_force_answer_stream_started
                     if not text:
                         return []
                     read_only_force_answer_stream_buffer = ""
                     read_only_force_answer_stream_started = True
-                    chunks: list[str] = []
+                    chunks: list[dict[str, Any]] = []
                     for part in read_only_force_answer_text_slices(text):
                         chunks.extend(
                             stream_content_delta_chunks(
@@ -35174,10 +36006,10 @@ def create_app(state: ServerState) -> FastAPI:
                 def finish_translated_stream_chunks(
                     *,
                     defer_content_resolution: bool = False,
-                ) -> list[str]:
+                ) -> list[dict[str, Any]]:
                     nonlocal streamed_assistant_tool_calls
                     nonlocal streamed_tool_deltas_emitted
-                    chunks: list[str] = []
+                    chunks: list[dict[str, Any]] = []
                     if early_tool_cancel_used and streamed_assistant_tool_calls:
                         return chunks
                     if content_tool_translator is not None:
@@ -35194,6 +36026,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     content_tool_translator.tool_calls
                                     or streamed_assistant_tool_calls
                                 )
+                                remember_tool_call_delta(delta)
                             chunks.append(delta_payload_chunk(delta))
                     return chunks
 
@@ -35259,7 +36092,7 @@ def create_app(state: ServerState) -> FastAPI:
                 for field, text in splitter.start():
                     if text:
                         for chunk in stream_content_delta_chunks(field, text):
-                            yield mark_sse_sent(chunk)
+                            mark_stream_activity(chunk)
 
                 try:
                     while True:
@@ -35320,7 +36153,7 @@ def create_app(state: ServerState) -> FastAPI:
                                         else "stream_cancelled"
                                     )
                                 if not client_disconnected_now:
-                                    yield mark_sse_sent(
+                                    mark_stream_activity(
                                         error_chunk(
                                             RuntimeError(
                                                 "request cancelled via "
@@ -35331,7 +36164,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             )
                                         )
                                     )
-                                    yield mark_sse_sent("data: [DONE]\n\n")
+                                    mark_stream_activity(None)
                                 return
                             now_s = time.perf_counter()
                             if (
@@ -35376,7 +36209,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     session.abort_pending_postcommit(
                                         "stream_stall_watchdog"
                                     )
-                                yield mark_sse_sent(
+                                mark_stream_activity(
                                     error_chunk(
                                         TimeoutError(
                                             "model owner made no progress for "
@@ -35387,7 +36220,7 @@ def create_app(state: ServerState) -> FastAPI:
                                         )
                                     )
                                 )
-                                yield mark_sse_sent("data: [DONE]\n\n")
+                                mark_stream_activity(None)
                                 return
                             if (
                                 sse_keepalive_interval_s is not None
@@ -35405,14 +36238,16 @@ def create_app(state: ServerState) -> FastAPI:
                                 # over. At the default cadence (5s < 10s)
                                 # this also keeps the progress-chunk check
                                 # below idle until decode starts.
-                                yield mark_sse_sent(SSE_KEEPALIVE_COMMENT)
+                                last_sse_sent_s = now_s
+                                with suppress(RuntimeError):
+                                    _generation_turn.emit(TurnKeepAlive())
                             if (
                                 not generation_future.done()
-                                and now_s - last_sse_sent_s
+                                and now_s - last_event_sent_s
                                 >= STREAM_HEARTBEAT_INTERVAL_S
                             ):
                                 maybe_log_stream_silence(now_s)
-                                yield mark_sse_sent(
+                                mark_stream_activity(
                                     progress_chunk(
                                         _stream_heartbeat_payload(
                                             completion_tokens=streamed_progress_tokens,
@@ -35432,7 +36267,6 @@ def create_app(state: ServerState) -> FastAPI:
                             else:
                                 stream_tokens = list(item or [])
                                 token_timestamp_s = time.perf_counter()
-                            latest_token_enqueue_s = token_timestamp_s
                             if stream_tokens:
                                 streamed_token_ids.extend(int(t) for t in stream_tokens)
                                 streamed_token_times.extend(
@@ -35472,7 +36306,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     published_progress is not None
                                     and not buffer_read_only_force_answer_stream
                                 ):
-                                    yield mark_sse_sent(
+                                    mark_stream_activity(
                                         progress_chunk(published_progress)
                                     )
                             if not buffer_read_only_force_answer_stream:
@@ -35511,13 +36345,13 @@ def create_app(state: ServerState) -> FastAPI:
                                     for chunk in stream_content_delta_chunks(
                                         field, text
                                     ):
-                                        yield mark_sse_sent(chunk)
+                                        mark_stream_activity(chunk)
                             else:
                                 for _field, text in drain_stream_tokens(stream_tokens):
                                     for chunk in stream_read_only_force_answer_text(
                                         text
                                     ):
-                                        yield mark_sse_sent(chunk)
+                                        mark_stream_activity(chunk)
                             if (
                                 content_tool_translator is not None
                                 and content_tool_translator.buffering_tool_call
@@ -35540,7 +36374,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     and hidden_elapsed_s >= STREAM_HIDDEN_TOOL_GUARD_S
                                 ):
                                     for chunk in finish_translated_stream_chunks():
-                                        yield mark_sse_sent(chunk)
+                                        mark_stream_activity(chunk)
                                     if streamed_assistant_tool_calls:
                                         early_tool_cancel_used = True
                                         _cancel_stream_generation(
@@ -35566,7 +36400,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             generation_future,
                                             origin="hidden_tool_guard",
                                         )
-                                        yield mark_sse_sent(
+                                        mark_stream_activity(
                                             error_chunk(
                                                 HTTPException(
                                                     status_code=422,
@@ -35577,7 +36411,15 @@ def create_app(state: ServerState) -> FastAPI:
                                                 )
                                             )
                                         )
-                                        yield mark_sse_sent("data: [DONE]\n\n")
+                                        with suppress(RuntimeError):
+                                            _generation_turn.fail(TurnFailed(
+                                                error=(
+                                                    "malformed tool_call: "
+                                                    "unterminated stream"
+                                                ),
+                                                code="tool_parse_error",
+                                            ))
+                                        mark_stream_activity(None)
                                         return
                             else:
                                 hidden_tool_guard_started_s = None
@@ -35616,7 +36458,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     for chunk in stream_read_only_force_answer_text(
                                         text
                                     ):
-                                        yield mark_sse_sent(chunk)
+                                        mark_stream_activity(chunk)
                                 tail = decoder.finish()
                                 if tail:
                                     for _field, text in splitter.feed(tail):
@@ -35626,7 +36468,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             ) in stream_read_only_force_answer_text(
                                                 text
                                             ):
-                                                yield mark_sse_sent(chunk)
+                                                mark_stream_activity(chunk)
                                 visible_text, stripped_chars = (
                                     _read_only_force_answer_visible_text(
                                         str(generated.get("text") or "")
@@ -35680,14 +36522,14 @@ def create_app(state: ServerState) -> FastAPI:
                                                     use_orphan_guard=False,
                                                     use_tool_translator=False,
                                                 ):
-                                                    yield mark_sse_sent(chunk)
+                                                    mark_stream_activity(chunk)
                                     else:
                                         for (
                                             chunk
                                         ) in emit_read_only_force_answer_visible_text(
                                             visible_text
                                         ):
-                                            yield mark_sse_sent(chunk)
+                                            mark_stream_activity(chunk)
                                     stats[
                                         "read_only_force_answer_marker_stream_started"
                                     ] = bool(read_only_force_answer_stream_started)
@@ -35701,7 +36543,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     for chunk in stream_content_delta_chunks(
                                         field, text
                                     ):
-                                        yield mark_sse_sent(chunk)
+                                        mark_stream_activity(chunk)
                                 tail = decoder.finish()
                                 if tail:
                                     for field, text in splitter.feed(tail):
@@ -35709,7 +36551,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             for chunk in stream_content_delta_chunks(
                                                 field, text
                                             ):
-                                                yield mark_sse_sent(chunk)
+                                                mark_stream_activity(chunk)
                                 recover_unclosed_reasoning = (
                                     str(generated.get("finish_reason") or "") == "stop"
                                     and not tools_active
@@ -35724,9 +36566,9 @@ def create_app(state: ServerState) -> FastAPI:
                                         for chunk in stream_content_delta_chunks(
                                             field, text
                                         ):
-                                            yield mark_sse_sent(chunk)
+                                            mark_stream_activity(chunk)
                                 for chunk in finish_orphan_stream_guards():
-                                    yield mark_sse_sent(chunk)
+                                    mark_stream_activity(chunk)
                                 if (
                                     stop_monitor is not None
                                     and not stop_monitor.stopped
@@ -35739,11 +36581,11 @@ def create_app(state: ServerState) -> FastAPI:
                                             use_orphan_guard=False,
                                             monitor_stop=False,
                                         ):
-                                            yield mark_sse_sent(chunk)
+                                            mark_stream_activity(chunk)
                                 for chunk in finish_translated_stream_chunks(
                                     defer_content_resolution=True,
                                 ):
-                                    yield mark_sse_sent(chunk)
+                                    mark_stream_activity(chunk)
                             raw_generated_text = (
                                 _strip_mtplx_internal_continuation_markers(
                                     _strip_generated_chat_template_sentinels(
@@ -35799,7 +36641,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             use_orphan_guard=False,
                                             use_tool_translator=False,
                                         ):
-                                            yield mark_sse_sent(chunk)
+                                            mark_stream_activity(chunk)
                             if content_tool_translator is not None:
                                 for (
                                     delta
@@ -35807,7 +36649,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     has_tool_calls=bool(assistant_tool_calls),
                                 ):
                                     remember_stream_delta(delta)
-                                    yield mark_sse_sent(delta_payload_chunk(delta))
+                                    mark_stream_activity(delta_payload_chunk(delta))
                             stats = generated.setdefault("stats", {})
                             stats["openai_bridge_mode"] = "omlx_style"
                             stats["legacy_bridge_used"] = False
@@ -35853,7 +36695,7 @@ def create_app(state: ServerState) -> FastAPI:
                                 ):
                                     delta = {"content": fallback_visible_text}
                                     remember_stream_delta(delta)
-                                    yield mark_sse_sent(delta_payload_chunk(delta))
+                                    mark_stream_activity(delta_payload_chunk(delta))
                                 if (
                                     extraction.status == "malformed_as_content"
                                     and not assistant_tool_calls
@@ -35883,7 +36725,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     ):
                                         delta = {"content": unknown_tool_notice}
                                         remember_stream_delta(delta)
-                                        yield mark_sse_sent(
+                                        mark_stream_activity(
                                             delta_payload_chunk(delta)
                                         )
                                         stats["unexecuted_tool_call_notice"] = True
@@ -35910,7 +36752,7 @@ def create_app(state: ServerState) -> FastAPI:
                                 ):
                                     delta = {"content": no_tools_notice}
                                     remember_stream_delta(delta)
-                                    yield mark_sse_sent(delta_payload_chunk(delta))
+                                    mark_stream_activity(delta_payload_chunk(delta))
                                     stats["unexecuted_tool_call_notice"] = True
                                     # Parity with the non-stream #160 strip,
                                     # which stamps this on every no-tools
@@ -35963,7 +36805,7 @@ def create_app(state: ServerState) -> FastAPI:
                                         use_tool_translator=False,
                                         monitor_stop=False,
                                     ):
-                                        yield mark_sse_sent(chunk)
+                                        mark_stream_activity(chunk)
                                     stats[
                                         "stream_tool_preamble_recovered_as_content"
                                     ] = True
@@ -35972,7 +36814,14 @@ def create_app(state: ServerState) -> FastAPI:
                                         assistant_tool_calls,
                                         argument_chunk_chars=stream_interval,
                                     ):
-                                        yield mark_sse_sent(delta_payload_chunk(delta))
+                                        remember_tool_call_delta(delta)
+                                        mark_stream_activity(delta_payload_chunk(delta))
+                                elif not turn_tool_deltas_emitted:
+                                    for delta in _stream_tool_call_deltas(
+                                        assistant_tool_calls,
+                                        argument_chunk_chars=stream_interval,
+                                    ):
+                                        remember_tool_call_delta(delta)
                                 _record_tool_parse_event(
                                     state,
                                     event="tool_parse_success",
@@ -36105,7 +36954,7 @@ def create_app(state: ServerState) -> FastAPI:
                                                 session.abort_pending_postcommit(
                                                     "stream_stall_watchdog"
                                                 )
-                                            yield mark_sse_sent(
+                                            mark_stream_activity(
                                                 error_chunk(
                                                     TimeoutError(
                                                         "model owner made no "
@@ -36120,16 +36969,16 @@ def create_app(state: ServerState) -> FastAPI:
                                                     )
                                                 )
                                             )
-                                            yield mark_sse_sent(
-                                                "data: [DONE]\n\n"
+                                            mark_stream_activity(
+                                                None
                                             )
                                             return
                                         if (
-                                            now_s - last_sse_sent_s
+                                            now_s - last_event_sent_s
                                             >= STREAM_HEARTBEAT_INTERVAL_S
                                         ):
                                             maybe_log_stream_silence(now_s)
-                                            yield mark_sse_sent(
+                                            mark_stream_activity(
                                                 progress_chunk(
                                                     _stream_heartbeat_payload(
                                                         completion_tokens=(
@@ -36148,8 +36997,8 @@ def create_app(state: ServerState) -> FastAPI:
                                 if commit_kind == "committed":
                                     generated = commit_item
                                 elif commit_kind == "error":
-                                    yield mark_sse_sent(error_chunk(commit_item))
-                                    yield mark_sse_sent("data: [DONE]\n\n")
+                                    mark_stream_activity(error_chunk(commit_item))
+                                    mark_stream_activity(None)
                                     return
                                 elif commit_kind == "released":
                                     release = (
@@ -36281,14 +37130,14 @@ def create_app(state: ServerState) -> FastAPI:
                                         "session_postcommit_snapshot"
                                     ] = postcommit_snapshot
                                 else:
-                                    yield mark_sse_sent(
+                                    mark_stream_activity(
                                         error_chunk(
                                             RuntimeError(
                                                 f"unexpected commit event: {commit_kind}"
                                             )
                                         )
                                     )
-                                    yield mark_sse_sent("data: [DONE]\n\n")
+                                    mark_stream_activity(None)
                                     return
                             generated = attach_response_observability(generated)
                             _attach_dashboard_progress_stats(
@@ -36350,7 +37199,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     f"\n\n{footer}",
                                     monitor_stop=False,
                                 ):
-                                    yield mark_sse_sent(chunk)
+                                    mark_stream_activity(chunk)
                             break
                         elif kind == "reset_orphan_stream_guards":
                             reset_orphan_stream_guards()
@@ -36379,7 +37228,7 @@ def create_app(state: ServerState) -> FastAPI:
                                 continue
                             for field, text in drain_stream_tokens([], force=True):
                                 for chunk in stream_content_delta_chunks(field, text):
-                                    yield mark_sse_sent(chunk)
+                                    mark_stream_activity(chunk)
                             tail = decoder.finish()
                             if tail:
                                 for field, text in splitter.feed(tail):
@@ -36387,20 +37236,22 @@ def create_app(state: ServerState) -> FastAPI:
                                         for chunk in stream_content_delta_chunks(
                                             field, text
                                         ):
-                                            yield mark_sse_sent(chunk)
+                                            mark_stream_activity(chunk)
                             for field, text in splitter.feed(THINK_CLOSE):
                                 if text:
                                     for chunk in stream_content_delta_chunks(
                                         field, text
                                     ):
-                                        yield mark_sse_sent(chunk)
+                                        mark_stream_activity(chunk)
                             decoder = _IncrementalTokenDecoder(state.runtime.tokenizer)
                             continue
                         elif kind == "error":
                             if isinstance(item, BaseException):
                                 stream_error_item = item
-                            yield mark_sse_sent(error_chunk(item))
-                            yield mark_sse_sent("data: [DONE]\n\n")
+                            with suppress(RuntimeError):
+                                _generation_turn.fail(TurnFailed(error=str(item)))
+                            mark_stream_activity(error_chunk(item))
+                            mark_stream_activity(None)
                             return
                         elif kind == "cancelled":
                             if stop_monitor is not None and stop_monitor.stopped:
@@ -36477,14 +37328,14 @@ def create_app(state: ServerState) -> FastAPI:
                                     state, generated["stats"]
                                 )
                                 break
+                            with suppress(RuntimeError):
+                                _generation_turn.cancel(TurnCancelled(
+                                    reason=str(item),
+                                ))
                             if await raw_request.is_disconnected():
                                 stream_cancelled_by_client = True
                             else:
-                                # Explicit cancel acknowledged by the worker
-                                # with the transport still up: end the stream
-                                # with a visible terminal frame + [DONE]
-                                # instead of silently closing (#F36).
-                                yield mark_sse_sent(
+                                mark_stream_activity(
                                     error_chunk(
                                         RuntimeError(
                                             "request cancelled via "
@@ -36494,15 +37345,19 @@ def create_app(state: ServerState) -> FastAPI:
                                         )
                                     )
                                 )
-                                yield mark_sse_sent("data: [DONE]\n\n")
+                                mark_stream_activity(None)
                             return
                         else:
-                            yield mark_sse_sent(
+                            with suppress(RuntimeError):
+                                _generation_turn.fail(TurnFailed(
+                                    error=f"unexpected stream event: {kind}",
+                                ))
+                            mark_stream_activity(
                                 error_chunk(
                                     RuntimeError(f"unexpected stream event: {kind}")
                                 )
                             )
-                            yield mark_sse_sent("data: [DONE]\n\n")
+                            mark_stream_activity(None)
                             return
                 except asyncio.CancelledError:
                     stream_cancelled_by_client = True
@@ -36511,20 +37366,20 @@ def create_app(state: ServerState) -> FastAPI:
                     )
                     raise
                 except GeneratorExit:
-                    # Starlette closes the async generator when the client
-                    # disconnects mid-stream. The old catch-all below yielded
-                    # after GeneratorExit ("async generator ignored
-                    # GeneratorExit" RuntimeError noise) and mis-tagged the
-                    # cancellation metric "stream_cancelled"; re-raise and let
-                    # the finally record the truthful client_disconnected
-                    # reason (#F36).
                     stream_cancelled_by_client = True
                     raise
                 except BaseException as exc:
-                    yield mark_sse_sent(error_chunk(exc))
-                    yield mark_sse_sent("data: [DONE]\n\n")
+                    with suppress(RuntimeError):
+                        _generation_turn.fail(TurnFailed(error=str(exc)))
+                    mark_stream_activity(error_chunk(exc))
+                    mark_stream_activity(None)
                     return
                 finally:
+                    if stream_cancelled_by_client:
+                        with suppress(RuntimeError):
+                            _generation_turn.cancel(
+                                TurnCancelled(reason="client_disconnected")
+                            )
                     nonlocal_cancel_reason = (
                         "client_disconnected"
                         if stream_cancelled_by_client
@@ -36594,10 +37449,14 @@ def create_app(state: ServerState) -> FastAPI:
                     state.dashboard.progress_events.forget(response_id)
 
                 if generated is None:
-                    yield mark_sse_sent(
+                    with suppress(RuntimeError):
+                        _generation_turn.fail(TurnFailed(
+                            error="generation ended without a result",
+                        ))
+                    mark_stream_activity(
                         error_chunk(RuntimeError("generation ended without a result"))
                     )
-                    yield mark_sse_sent("data: [DONE]\n\n")
+                    mark_stream_activity(None)
                     return
                 finish_reason = generated.get("finish_reason") or "stop"
                 generated["finish_reason"] = finish_reason
@@ -36605,26 +37464,27 @@ def create_app(state: ServerState) -> FastAPI:
                 _merge_final_bridge_stats_into_latest_metrics(
                     state, {"finish_reason": finish_reason}
                 )
-                done = {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": finish_reason,
-                        }
-                    ],
-                    "usage": _usage_payload(generated),
-                    "mtplx_stats": _public_mtplx_stats(generated),
-                    "timings": _build_timings(generated),
-                }
-                yield mark_sse_sent(f"data: {json.dumps(done)}\n\n")
-                yield mark_sse_sent("data: [DONE]\n\n")
-
-            return StreamingResponse(event_stream(), media_type="text/event-stream")
+                with suppress(RuntimeError):
+                    usage_update = UsageUpdate(
+                        prompt_tokens=int(generated.get("prompt_tokens") or 0),
+                        completion_tokens=int(
+                            generated.get("completion_tokens") or 0
+                        ),
+                    )
+                    _generation_turn.emit(usage_update)
+                    _generation_turn.complete(TurnCompleted(
+                        finish_reason=finish_reason,
+                        usage=usage_update,
+                        mtplx_stats=_public_mtplx_stats(generated),
+                        timings=_build_timings(generated),
+                    ))
+            turn_stream = _GenerationTurnStream(_generation_turn, drive_turn)
+            if return_turn:
+                return turn_stream
+            return StreamingResponse(
+                _chat_stream_from_turn_events(turn_stream.events()),
+                media_type="text/event-stream",
+            )
 
         def run_nonstream_generation() -> dict[str, Any]:
             return run_generation_for_response()
@@ -36639,6 +37499,8 @@ def create_app(state: ServerState) -> FastAPI:
             prompt_tokens=len(prompt_ids),
         )
         state.dashboard.in_flight.register(nonstream_handle)
+        if bind_cancel is not None:
+            bind_cancel(nonstream_cancel_event.set)
         _flight(state).begin(
             response_id,
             session_id=session_id,
@@ -36972,68 +37834,229 @@ def create_app(state: ServerState) -> FastAPI:
             }
         )
 
-    @app.post("/v1/responses")
-    async def responses(
-        raw_request: Request, request: responses_api.ResponsesRequest
+    @app.post("/v1/chat/completions")
+    async def chat_completions(
+        raw_request: Request, request: ChatCompletionRequest
     ) -> Any:
-        """Translate the local, stateless client-tool Responses subset.
+        return await _chat_completions_impl(
+            raw_request,
+            request,
+            return_turn=False,
+        )
 
-        The chat endpoint remains the sole owner of prompt rendering, sampling,
-        tool parsing, session/cache policy, and cancellation.  This adapter is
-        intentionally not a second inference path.
-
-        Server-hosted tools are rejected because accepting them would tell
-        Codex a tool can run when this local daemon cannot execute it.
-        """
+    @app.post("/v1/responses")
+    async def responses(raw_request: Request, request: ResponsesRequest) -> Any:
+        """Render one existing Chat turn with bounded local Responses state."""
 
         try:
-            conversion = responses_api.translate_request(request)
-        except responses_api.ResponsesProtocolError as exc:
-            raise HTTPException(
-                status_code=400, detail=f"Responses API: {exc}"
-            ) from exc
-        chat_data = dict(conversion.chat)
-        chat_messages = chat_data.pop("messages")
-        chat_request = ChatCompletionRequest(
-            messages=[ChatMessage.model_validate(message) for message in chat_messages],
-            **chat_data,
+            chat_kwargs = responses_request_to_chat(request)
+            current_messages = list(chat_kwargs["messages"])
+            instruction_messages: list[dict[str, Any]] = []
+            if (
+                request.instructions
+                and current_messages
+                and current_messages[0]
+                == {"role": "system", "content": request.instructions}
+            ):
+                instruction_messages = [current_messages.pop(0)]
+            parent_messages = (
+                response_registry.parent_messages(request.previous_response_id)
+                if request.previous_response_id is not None
+                else []
+            )
+            materialized_messages = [*parent_messages, *current_messages]
+            chat_kwargs["messages"] = [
+                *instruction_messages,
+                *materialized_messages,
+            ]
+            chat_request = ChatCompletionRequest.model_validate(chat_kwargs)
+        except ResponsesProtocolError as exc:
+            return JSONResponse(exc.payload(), status_code=400)
+        except ResponseStoreError as exc:
+            return JSONResponse(exc.payload(), status_code=exc.status_code)
+
+        headers = dict(raw_request.headers)
+        response_hint = _response_id_from_client_hint(
+            prefix="resp",
+            headers=headers,
+            metadata=_request_metadata(chat_request),
         )
-        response_id = "resp_" + uuid.uuid4().hex
-        chat_response = await chat_completions(raw_request, chat_request)
-        if not isinstance(chat_response, (JSONResponse, StreamingResponse)):
+        response_id = response_registry.allocate_id(
+            response_hint if request.store is not True else None
+        )
+        created_at = int(time.time())
+
+        try:
+            response_registry.begin(
+                response_id,
+                store=request.store is True,
+                materialized_messages=materialized_messages,
+            )
+        except ResponseStoreError as exc:
+            return JSONResponse(exc.payload(), status_code=exc.status_code)
+
+        def commit_terminal(envelope: dict[str, Any]) -> None:
+            response_registry.commit(
+                response_id,
+                envelope,
+                materialized_messages=[
+                    *materialized_messages,
+                    *response_output_to_chat_messages(envelope.get("output") or []),
+                ],
+            )
+
+        def commit_bridge_failure(response: Any) -> dict[str, Any]:
+            message = "response generation failed"
+            code = "generation_error"
+            cancelled = False
+            if isinstance(response, BaseException):
+                message = str(response) or type(response).__name__
+            elif isinstance(response, JSONResponse):
+                try:
+                    payload = json.loads(response.body)
+                    error = payload.get("error") or payload.get("detail")
+                    if isinstance(error, dict):
+                        code = str(error.get("code") or code)
+                        cancelled = code == "request_cancelled"
+                    message = (
+                        str(error.get("message") or error)
+                        if isinstance(error, dict)
+                        else str(error or message)
+                    )
+                except Exception:
+                    pass
+            envelope = response_failure_envelope(
+                request=request,
+                response_id=response_id,
+                model=state.model_id,
+                created_at=created_at,
+                message=message,
+                code=code,
+            )
+            if cancelled:
+                envelope["status"] = "cancelled"
+            commit_terminal(envelope)
+            return envelope
+
+        if request.stream:
+            try:
+                chat_response = await _chat_completions_impl(
+                    raw_request,
+                    chat_request,
+                    return_turn=True,
+                    bind_cancel=lambda cancel: response_registry.bind_cancel(
+                        response_id, cancel
+                    ),
+                )
+            except BaseException as exc:
+                commit_bridge_failure(exc)
+                raise
+            if not _is_turn_stream(chat_response):
+                commit_bridge_failure(chat_response)
+                return chat_response
+            async def response_events() -> AsyncIterator[str]:
+                try:
+                    async for frame in responses_stream_from_turn_events(
+                        chat_response.events(),
+                        request=request,
+                        response_id=response_id,
+                        model=state.model_id,
+                        created_at=created_at,
+                        on_terminal=commit_terminal,
+                    ):
+                        yield frame
+                finally:
+                    if response_registry.is_in_flight(response_id):
+                        commit_terminal(
+                            response_failure_envelope(
+                                request=request,
+                                response_id=response_id,
+                                model=state.model_id,
+                                created_at=created_at,
+                                message="response renderer disconnected",
+                                code="request_cancelled",
+                            )
+                        )
+
+            return StreamingResponse(
+                response_events(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        try:
+            chat_response = await _chat_completions_impl(
+                raw_request,
+                chat_request,
+                return_turn=False,
+                bind_cancel=lambda cancel: response_registry.bind_cancel(
+                    response_id, cancel
+                ),
+            )
+        except BaseException as exc:
+            commit_bridge_failure(exc)
+            raise
+        if not isinstance(chat_response, JSONResponse):
+            commit_bridge_failure(chat_response)
             return chat_response
         if chat_response.status_code >= 400:
-            return chat_response
-        if request.stream:
-            if not isinstance(chat_response, StreamingResponse):
-                return chat_response
-            return StreamingResponse(
-                responses_api.stream_from_chat_sse(
-                    chat_response.body_iterator,
-                    response_id=response_id,
-                    model=state.model_id,
-                    response_fields=conversion.response_fields,
-                    custom_tool_names=conversion.custom_tool_names,
-                    namespace_functions=conversion.namespace_functions,
-                ),
-                media_type="text/event-stream",
+            terminal = commit_bridge_failure(chat_response)
+            return JSONResponse(
+                terminal,
+                status_code=chat_response.status_code,
             )
-        if not isinstance(chat_response, JSONResponse):
-            return chat_response
         try:
             chat_payload = json.loads(chat_response.body)
         except Exception as exc:
+            commit_bridge_failure(exc)
             raise HTTPException(
-                status_code=500, detail=f"failed to translate chat response: {exc}"
+                status_code=500, detail=f"failed to translate response: {exc}"
             ) from exc
-        payload = responses_api.payload_from_chat(
+        envelope = response_from_chat_completion(
             chat_payload,
+            request=request,
             response_id=response_id,
-            response_fields=conversion.response_fields,
-            custom_tool_names=conversion.custom_tool_names,
-            namespace_functions=conversion.namespace_functions,
+            created_at=created_at,
         )
-        return JSONResponse(payload, status_code=chat_response.status_code)
+        commit_terminal(envelope)
+        return JSONResponse(envelope, status_code=chat_response.status_code)
+
+    @app.get("/v1/responses/{response_id}")
+    async def get_response(response_id: str) -> JSONResponse:
+        try:
+            return JSONResponse(response_registry.get(response_id))
+        except ResponseStoreError as exc:
+            return JSONResponse(exc.payload(), status_code=exc.status_code)
+
+    @app.delete("/v1/responses/{response_id}")
+    async def delete_response(response_id: str) -> JSONResponse:
+        try:
+            return JSONResponse(response_registry.delete(response_id))
+        except ResponseStoreError as exc:
+            return JSONResponse(exc.payload(), status_code=exc.status_code)
+
+    @app.post("/v1/responses/{response_id}/cancel")
+    async def cancel_response(response_id: str) -> JSONResponse:
+        try:
+            inflight = response_registry.request_cancel(response_id)
+        except ResponseStoreError as exc:
+            return JSONResponse(exc.payload(), status_code=exc.status_code)
+        terminal = await asyncio.to_thread(
+            response_registry.wait_terminal, inflight, 2.0
+        )
+        if terminal is None:
+            return JSONResponse(
+                {
+                    "id": response_id,
+                    "object": "response",
+                    "status": "in_progress",
+                    "cancellation_requested": True,
+                },
+                status_code=202,
+            )
+        return JSONResponse(terminal)
 
     @app.post("/v1/messages")
     async def anthropic_messages(
@@ -37043,17 +38066,20 @@ def create_app(state: ServerState) -> FastAPI:
             raise HTTPException(status_code=400, detail="messages must not be empty")
         chat_request = _anthropic_to_chat_request(request)
         chat_request.stream = bool(request.stream)
-        response = await chat_completions(raw_request, chat_request)
         if request.stream:
-            if not isinstance(response, StreamingResponse):
+            response = await _chat_completions_impl(
+                raw_request, chat_request, return_turn=True
+            )
+            if not _is_turn_stream(response):
                 return response
             return StreamingResponse(
-                _anthropic_stream_from_openai_sse(
-                    response.body_iterator,
+                _anthropic_stream_from_turn_events(
+                    response.events(),
                     model=state.model_id,
                 ),
                 media_type="text/event-stream",
             )
+        response = await chat_completions(raw_request, chat_request)
         if not isinstance(response, JSONResponse):
             return response
         try:
@@ -38565,6 +39591,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="stats_footer",
         help="Do not append the visible MTPLX TPS footer to returned text.",
     )
+    add_web_argument(parser)
     parser.add_argument(
         "--session-postcommit-mode",
         choices=["inline", "async"],
@@ -38908,6 +39935,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args._cli_flags = canonicalize_flag_tokens(
         _explicit_server_flags(raw_args), parser, args
     )
+    # --model accepts a repo id, not only a directory: every downstream load
+    # path (config sniffing, backend defaults, weight mapping) expects a real
+    # local directory, so the id must be resolved exactly once, before any of
+    # them run. resolve_model_path covers the MTPLX cache, branded builds and
+    # the shared huggingface hub cache, and stays offline-safe. Only an
+    # explicit --model is resolved here: the parser default is a public HF id
+    # that callers (tests, app launch, onboarding) read back verbatim, and a
+    # host without that model cached must still be able to parse its flags.
+    # A missing local path is left alone: the load step reports it exactly as
+    # it always has, and tests drive that step with placeholder directories.
+    if getattr(args, "model", None) and _server_flag_present(
+        args._cli_flags, "model"
+    ):
+        _model_local = Path(str(args.model)).expanduser()
+        if not _model_local.exists():
+            from mtplx.hf_loader import repo_id_from_model_ref as _repo_id_from_ref
+            from mtplx.hf_loader import resolve_model_path as _resolve_model_path
+
+            if _repo_id_from_ref(str(args.model)) is not None:
+                try:
+                    args.model = str(_resolve_model_path(str(args.model)))
+                except FileNotFoundError as exc:
+                    parser.error(str(exc))
     try:
         resolved_key = resolve_api_key(
             explicit_api_key=getattr(args, "api_key", None),
@@ -39041,6 +40091,8 @@ def main(argv: list[str] | None = None) -> None:
         _startup_line("Chat UI: " + chat_url)
         _startup_line("OpenAI API Base URL: " + _startup_openai_base_url(args))
     _startup_line("Model: " + str(args.model_id))
+    if getattr(args, "web", False):
+        _startup_line("Web tools: hosted web_search + fetch_url")
     _startup_line(
         "Reasoning history: "
         + {

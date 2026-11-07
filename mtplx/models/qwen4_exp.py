@@ -6764,6 +6764,12 @@ class Model(nn.Module):
                 continue
             if k.startswith("mtp."):
                 continue
+            if getattr(self.language_model.args, "ngram_sidecar", False) and (
+                ".ngram_embedding.shards." in k
+                or ".ngram_embedding.shard_" in k
+                or k.endswith(".ngram_embedding.weight_scale")
+            ):
+                continue
             if k.startswith("model.language_model."):
                 k = k.replace("model.language_model.", "language_model.model.", 1)
             elif k == "lm_head.weight":

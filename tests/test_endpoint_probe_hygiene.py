@@ -33,7 +33,12 @@ def _generation_ready_state():
 
 def test_empty_bodies_get_clean_400s():
     client = _client(_generation_ready_state())
-    for path in ("/v1/chat/completions", "/v1/completions", "/v1/messages"):
+    for path in (
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/messages",
+        "/v1/responses",
+    ):
         r = client.post(path, json={})
         assert r.status_code == 400, (path, r.status_code, r.text)
         assert "must not be empty" in r.text
@@ -67,12 +72,10 @@ def test_responses_endpoint_probe_is_registered_without_inference(monkeypatch):
     assert response.status_code == 400
     assert response.json() == {
         "error": {
-            "message": (
-                "Responses API: input must be a non-empty text string or item list"
-            ),
+            "message": "input must not be empty",
             "type": "invalid_request_error",
-            "code": "HTTPException",
-            "param": None,
+            "code": "invalid_value",
+            "param": "input",
         }
     }
     assert inference_called is False
